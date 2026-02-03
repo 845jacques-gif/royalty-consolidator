@@ -20,7 +20,7 @@ from consolidator import (
 
 app = Flask(__name__)
 app.secret_key = 'royalty-consolidator-2026'
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
 
 WORK_DIR = os.path.join(tempfile.gettempdir(), 'royalty_consolidator', 'current')
 os.makedirs(WORK_DIR, exist_ok=True)
