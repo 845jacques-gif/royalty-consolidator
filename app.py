@@ -710,7 +710,7 @@ function addPayor() {
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <div>
                     <div style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ ps.name }}</div>
-                    <div style="font-size:11px; color:var(--text-dim);">{{ ps.code }} &middot; {{ ps.files }} files &middot; {{ ps.isrcs }} ISRCs &middot; fee {{ ps.fee }}</div>
+                    <div style="font-size:11px; color:var(--text-dim);">{{ ps.code }} &middot; {{ ps.files }} files &middot; {{ ps.isrcs }} ISRCs &middot; fee {{ ps.fee }} &middot; <span style="color:var(--yellow);">{{ ps.detected_currency }}</span></div>
                 </div>
                 <div class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);">&euro;{{ ps.total_gross }}</div>
             </div>

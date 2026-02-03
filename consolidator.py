@@ -50,6 +50,7 @@ class PayorResult:
     pivot_gross: pd.DataFrame  # Pivot: rows=ISRC, cols=period, vals=gross
     by_distributor: pd.DataFrame
     file_count: int
+    detected_currencies: List[str] = field(default_factory=list)  # Currencies found in files
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,31 @@ COLUMN_PATTERNS = {
 }
 
 
+CURRENCY_HINTS = {
+    'EUR': ['eur', 'euro', '€'],
+    'USD': ['usd', 'dollar', '$', 'us '],
+    'GBP': ['gbp', 'pound', '£', 'sterling'],
+    'CAD': ['cad', 'canadian'],
+    'AUD': ['aud', 'australian'],
+    'JPY': ['jpy', 'yen', '¥'],
+    'SEK': ['sek', 'krona'],
+    'NOK': ['nok'],
+    'DKK': ['dkk'],
+    'CHF': ['chf', 'franc'],
+    'BRL': ['brl', 'real'],
+}
+
+
+def _detect_currency(df_columns):
+    """Detect currency from column names. Returns currency code or 'Unknown'."""
+    all_cols = ' '.join(str(c).lower() for c in df_columns)
+    for code, hints in CURRENCY_HINTS.items():
+        for hint in hints:
+            if hint in all_cols:
+                return code
+    return 'Unknown'
+
+
 def _fuzzy_match_columns(df_columns):
     """Match source column names to our standard schema.
 
@@ -171,26 +197,28 @@ def _read_raw_dataframe(filepath, filename):
 def parse_file_universal(filepath, filename, fmt='auto'):
     """Parse any statement file into the standard schema.
 
+    Returns (DataFrame, detected_currency) or (None, None).
     fmt='auto' uses column auto-detection.
     fmt='believe' / 'recordjet' use the legacy column mappings as a hint
     but still fall through to auto-detect if needed.
     """
     df = _read_raw_dataframe(filepath, filename)
     if df is None or df.empty:
-        return None
+        return None, None
 
     df.columns = [str(c).strip() for c in df.columns]
+    detected_currency = _detect_currency(df.columns)
 
     # --- Legacy format shortcuts (exact column names we know) ---
     if fmt == 'believe':
         lc = {c.strip().lower(): c for c in df.columns}
         if 'identifier' in lc and 'ppu total' in lc:
-            return _apply_believe_mapping(df, filename)
+            return _apply_believe_mapping(df, filename), detected_currency
 
     if fmt == 'recordjet':
         lc = {c.strip().lower(): c for c in df.columns}
         if 'isrc' in lc and ('earning gross eur' in lc or 'earning_gross_eur' in lc):
-            return _apply_recordjet_mapping(df, filename)
+            return _apply_recordjet_mapping(df, filename), detected_currency
 
     # --- Auto-detect columns ---
     col_map = _fuzzy_match_columns(df.columns)
@@ -199,14 +227,14 @@ def parse_file_universal(filepath, filename, fmt='auto'):
         # Not enough columns recognized — try legacy mappings as fallback
         lc = {c.strip().lower(): c for c in df.columns}
         if 'identifier' in lc and 'ppu total' in lc:
-            return _apply_believe_mapping(df, filename)
+            return _apply_believe_mapping(df, filename), detected_currency
         if 'isrc' in lc and ('earning gross eur' in lc or 'earning_gross_eur' in lc):
-            return _apply_recordjet_mapping(df, filename)
+            return _apply_recordjet_mapping(df, filename), detected_currency
 
         cols_found = list(df.columns)
         print(f"    WARNING: Could not detect columns in {filename}. "
               f"Found: {cols_found[:15]}", flush=True)
-        return None
+        return None, None
 
     # Derive period
     if 'period' in col_map:
@@ -260,7 +288,7 @@ def parse_file_universal(filepath, filename, fmt='auto'):
 
     # If net is all zeros but gross isn't, net might be in a different column we missed
     # or the file only has one revenue column — that's fine, leave it.
-    return result
+    return result, detected_currency
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +368,7 @@ def load_payor_statements(config: PayorConfig) -> Optional[PayorResult]:
     meta_chunks = []
     dist_chunks = []
     file_count = 0
+    currencies_seen = set()
 
     SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.pdf')
 
@@ -351,11 +380,14 @@ def load_payor_statements(config: PayorConfig) -> Optional[PayorResult]:
             if ext not in SUPPORTED_EXT:
                 continue
             filepath = os.path.join(root, f)
-            df = parse_file_universal(filepath, f, fmt=config.fmt)
+            df, file_currency = parse_file_universal(filepath, f, fmt=config.fmt)
 
             if df is None:
                 print(f"    WARNING: Could not parse {f}, skipping.", flush=True)
                 continue
+
+            if file_currency and file_currency != 'Unknown':
+                currencies_seen.add(file_currency)
 
             # Apply FX conversion
             if config.fx_rate != 1.0:
@@ -459,8 +491,10 @@ def load_payor_statements(config: PayorConfig) -> Optional[PayorResult]:
     isrc_meta['total_gross'] = isrc_meta['identifier'].map(pivot_gross.sum(axis=1))
     isrc_meta = isrc_meta.sort_values('total_gross', ascending=False).reset_index(drop=True)
 
+    currency_str = ', '.join(sorted(currencies_seen)) if currencies_seen else config.fx_currency
     print(f"    {config.name}: {file_count} files, {len(isrc_meta):,} ISRCs, "
-          f"${isrc_meta['total_gross'].sum():,.2f} total gross", flush=True)
+          f"${isrc_meta['total_gross'].sum():,.2f} total gross, "
+          f"currency: {currency_str}", flush=True)
 
     return PayorResult(
         config=config,
@@ -470,6 +504,7 @@ def load_payor_statements(config: PayorConfig) -> Optional[PayorResult]:
         pivot_gross=pivot_gross,
         by_distributor=by_distributor,
         file_count=file_count,
+        detected_currencies=sorted(currencies_seen) if currencies_seen else [config.fx_currency],
     )
 
 
@@ -952,6 +987,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult]) -> dict:
             'total_gross': f"{pr.isrc_meta['total_gross'].sum():,.2f}",
             'fee': f"{pr.config.fee:.0%}",
             'fx': pr.config.fx_currency,
+            'detected_currency': ', '.join(pr.detected_currencies),
         })
 
     # --- Monthly trend (all payors combined, for charts) ---
