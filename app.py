@@ -418,7 +418,7 @@ DASHBOARD_HTML = r"""
             <button type="button" class="nav-btn" onclick="addPayor()">+ Add Payor</button>
         </div>
         <p style="font-size:12px; color:var(--text-dim); margin-bottom:20px;">
-            Configure each payor with a code, name, format, fee, and upload their statement files (.zip, .xlsx, or .csv).
+            Configure each payor. Provide a <strong style="color:var(--text-secondary);">local directory path</strong> or <strong style="color:var(--text-secondary);">upload files</strong> (one or the other).
         </p>
 
         <div id="payorList">
@@ -464,9 +464,14 @@ DASHBOARD_HTML = r"""
                         <span style="font-size:10px; color:var(--text-dim);">1.0 = no conversion</span>
                     </div>
                 </div>
+                <div class="form-group" style="margin-bottom:8px;">
+                    <label class="form-label">Local Directory Path</label>
+                    <input class="form-input" type="text" name="payor_dir_0" placeholder="C:\Users\jacques\Downloads\RecordJet_extracted">
+                    <span style="font-size:10px; color:var(--text-dim);">Paste the folder path containing statement files (walks subfolders automatically)</span>
+                </div>
                 <div class="form-group" style="margin-bottom:0;">
-                    <label class="form-label">Statement Files</label>
-                    <input class="form-input" type="file" name="payor_files_0" multiple accept=".zip,.xlsx,.xls,.csv,.pdf" required>
+                    <label class="form-label">Or Upload Files</label>
+                    <input class="form-input" type="file" name="payor_files_0" multiple accept=".zip,.xlsx,.xls,.csv,.pdf">
                 </div>
             </div>
         </div>
@@ -524,9 +529,14 @@ function addPayor() {
                 <input class="form-input" type="number" name="payor_fxrate_${n}" value="1.0" min="0" step="0.0001">
             </div>
         </div>
+        <div class="form-group" style="margin-bottom:8px;">
+            <label class="form-label">Local Directory Path</label>
+            <input class="form-input" type="text" name="payor_dir_${n}" placeholder="C:\\path\\to\\statements">
+            <span style="font-size:10px; color:var(--text-dim);">Paste folder path (walks subfolders automatically)</span>
+        </div>
         <div class="form-group" style="margin-bottom:0;">
-            <label class="form-label">Statement Files</label>
-            <input class="form-input" type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.csv,.pdf" required>
+            <label class="form-label">Or Upload Files</label>
+            <input class="form-input" type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.csv,.pdf">
         </div>
     </div>`;
     document.getElementById('payorList').insertAdjacentHTML('beforeend', html);
@@ -975,25 +985,39 @@ def run_custom():
                 break
 
             name = request.form.get(f'payor_name_{idx}', code)
-            fmt = request.form.get(f'payor_fmt_{idx}', 'believe')
+            fmt = request.form.get(f'payor_fmt_{idx}', 'auto')
             fee = float(request.form.get(f'payor_fee_{idx}', 15)) / 100.0
             fx_currency = request.form.get(f'payor_fx_{idx}', 'EUR')
             fx_rate = float(request.form.get(f'payor_fxrate_{idx}', 1.0))
 
-            payor_dir = os.path.join(work_dir, f'statements_{code.strip()}')
-            os.makedirs(payor_dir, exist_ok=True)
+            # Check for local directory path first
+            local_dir = request.form.get(f'payor_dir_{idx}', '').strip()
 
-            files = request.files.getlist(f'payor_files_{idx}')
-            for f in files:
-                if not f.filename:
-                    continue
-                if f.filename.endswith('.zip'):
-                    zip_path = os.path.join(payor_dir, f.filename)
-                    f.save(zip_path)
-                    with zipfile.ZipFile(zip_path, 'r') as zf:
-                        zf.extractall(payor_dir)
-                else:
-                    f.save(os.path.join(payor_dir, f.filename))
+            if local_dir and os.path.isdir(local_dir):
+                # Use the local directory directly
+                payor_dir = local_dir
+            else:
+                # Fall back to uploaded files
+                payor_dir = os.path.join(work_dir, f'statements_{code.strip()}')
+                os.makedirs(payor_dir, exist_ok=True)
+
+                files = request.files.getlist(f'payor_files_{idx}')
+                has_files = False
+                for f in files:
+                    if not f.filename:
+                        continue
+                    has_files = True
+                    if f.filename.endswith('.zip'):
+                        zip_path = os.path.join(payor_dir, f.filename)
+                        f.save(zip_path)
+                        with zipfile.ZipFile(zip_path, 'r') as zf:
+                            zf.extractall(payor_dir)
+                    else:
+                        f.save(os.path.join(payor_dir, f.filename))
+
+                if not has_files and not local_dir:
+                    idx += 1
+                    continue  # Skip payors with no data source
 
             payor_configs.append(PayorConfig(
                 code=code.strip(),
