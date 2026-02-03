@@ -28,6 +28,16 @@ except ImportError:
 # Data classes
 # ---------------------------------------------------------------------------
 
+STATEMENT_TYPES = {
+    'masters': 'Masters',
+    'publishing': 'Publishing',
+    'neighboring': 'Neighboring Rights',
+    'pro': 'PRO (Performance)',
+    'sync': 'Sync',
+    'other': 'Other',
+}
+
+
 @dataclass
 class PayorConfig:
     """Configuration for a single payor."""
@@ -38,6 +48,7 @@ class PayorConfig:
     fee: float             # Distribution fee as decimal (0.15 = 15%)
     fx_currency: str = 'USD'
     fx_rate: float = 1.0   # Multiply local currency amounts by this to get USD
+    statement_type: str = 'masters'  # masters, publishing, neighboring, pro, sync, other
 
 
 @dataclass
@@ -988,6 +999,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult]) -> dict:
             'fee': f"{pr.config.fee:.0%}",
             'fx': pr.config.fx_currency,
             'detected_currency': ', '.join(pr.detected_currencies),
+            'statement_type': STATEMENT_TYPES.get(pr.config.statement_type, pr.config.statement_type),
         })
 
     # --- Monthly trend (all payors combined, for charts) ---

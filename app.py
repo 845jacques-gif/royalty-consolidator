@@ -28,6 +28,7 @@ os.makedirs(WORK_DIR, exist_ok=True)
 # Cache results in memory so we don't re-parse on every page load
 _cached_results = {}
 _cached_analytics = {}
+_cached_deal_name = ''
 
 # ---------------------------------------------------------------------------
 # HTML Dashboard Template
@@ -39,7 +40,7 @@ DASHBOARD_HTML = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PLYGRND Royalty Dashboard</title>
+    <title>{{ deal_name or 'Royalty Consolidator' }}</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -361,8 +362,8 @@ DASHBOARD_HTML = r"""
 
 <nav class="nav">
     <div class="nav-left">
-        <div class="nav-logo">P</div>
-        <span class="nav-title">PLYGRND</span>
+        <div class="nav-logo">R</div>
+        <span class="nav-title">{{ deal_name or 'Royalty Consolidator' }}</span>
         <div class="nav-links">
             <a href="/" class="{{ 'active' if page == 'dashboard' }}">Dashboard</a>
             <a href="/upload" class="{{ 'active' if page == 'upload' }}">Upload</a>
@@ -413,6 +414,14 @@ DASHBOARD_HTML = r"""
 {# ---- Custom payor upload form ---- #}
 <form method="POST" action="/run-custom" enctype="multipart/form-data" id="uploadForm">
     <div class="card" style="margin-bottom:16px;">
+        <div class="card-header"><span class="card-title">Deal</span></div>
+        <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label">Deal / Project Name</label>
+            <input class="form-input" type="text" name="deal_name" placeholder="e.g. PLYGRND, Artist X Catalog, Label Y Acquisition..." value="{{ deal_name or '' }}">
+        </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
         <div class="card-header">
             <span class="card-title">Payors</span>
             <button type="button" class="nav-btn" onclick="addPayor()">+ Add Payor</button>
@@ -446,6 +455,17 @@ DASHBOARD_HTML = r"""
                     </div>
                 </div>
                 <div class="form-row" style="margin-bottom:10px;">
+                    <div class="form-group">
+                        <label class="form-label">Statement Type</label>
+                        <select class="form-input" name="payor_stype_0">
+                            <option value="masters">Masters</option>
+                            <option value="publishing">Publishing</option>
+                            <option value="neighboring">Neighboring Rights</option>
+                            <option value="pro">PRO (Performance)</option>
+                            <option value="sync">Sync</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
                     <div class="form-group">
                         <label class="form-label">Fee %</label>
                         <input class="form-input" type="number" name="payor_fee_0" value="15" min="0" max="100" step="0.1">
@@ -513,6 +533,17 @@ function addPayor() {
         </div>
         <div class="form-row" style="margin-bottom:10px;">
             <div class="form-group">
+                <label class="form-label">Statement Type</label>
+                <select class="form-input" name="payor_stype_${n}">
+                    <option value="masters">Masters</option>
+                    <option value="publishing">Publishing</option>
+                    <option value="neighboring">Neighboring Rights</option>
+                    <option value="pro">PRO (Performance)</option>
+                    <option value="sync">Sync</option>
+                    <option value="other">Other</option>
+                </select>
+            </div>
+            <div class="form-group">
                 <label class="form-label">Fee %</label>
                 <input class="form-input" type="number" name="payor_fee_${n}" value="15" min="0" max="100" step="0.1">
             </div>
@@ -546,7 +577,7 @@ function addPayor() {
 {% elif page == 'dashboard' and results %}
 {# ==================== DASHBOARD ==================== #}
 <div class="page-header">
-    <h1>Royalty Analytics</h1>
+    <h1>{% if deal_name %}{{ deal_name }}{% else %}Royalty Analytics{% endif %}</h1>
     <p>{{ results.period_range }} &middot; {{ results.total_files }} files &middot; {{ results.isrc_count }} ISRCs</p>
 </div>
 
@@ -710,7 +741,7 @@ function addPayor() {
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <div>
                     <div style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ ps.name }}</div>
-                    <div style="font-size:11px; color:var(--text-dim);">{{ ps.code }} &middot; {{ ps.files }} files &middot; {{ ps.isrcs }} ISRCs &middot; fee {{ ps.fee }} &middot; <span style="color:var(--yellow);">{{ ps.detected_currency }}</span></div>
+                    <div style="font-size:11px; color:var(--text-dim);">{{ ps.code }} &middot; {{ ps.statement_type }} &middot; {{ ps.files }} files &middot; {{ ps.isrcs }} ISRCs &middot; fee {{ ps.fee }} &middot; <span style="color:var(--yellow);">{{ ps.detected_currency }}</span></div>
                 </div>
                 <div class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);">&euro;{{ ps.total_gross }}</div>
             </div>
@@ -935,6 +966,7 @@ def index():
         payor_names=[pr.config.name for pr in _cached_results.values()] if _cached_results else [],
         payor_codes=list(_cached_results.keys()) if _cached_results else [],
         default_payors=[],
+        deal_name=_cached_deal_name,
     )
 
 
@@ -950,6 +982,7 @@ def upload_page():
         payor_names=[],
         payor_codes=[],
         default_payors=configs,
+        deal_name=_cached_deal_name,
     )
 
 
@@ -971,7 +1004,10 @@ def run_default():
 @app.route('/run-custom', methods=['POST'])
 def run_custom():
     """Run consolidation from uploaded files with dynamic payor configs."""
+    global _cached_deal_name
     try:
+        _cached_deal_name = request.form.get('deal_name', '').strip()
+
         work_dir = os.path.join(WORK_DIR, 'custom')
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir)
@@ -989,15 +1025,14 @@ def run_custom():
             fee = float(request.form.get(f'payor_fee_{idx}', 15)) / 100.0
             fx_currency = request.form.get(f'payor_fx_{idx}', 'EUR')
             fx_rate = float(request.form.get(f'payor_fxrate_{idx}', 1.0))
+            statement_type = request.form.get(f'payor_stype_{idx}', 'masters')
 
             # Check for local directory path first
             local_dir = request.form.get(f'payor_dir_{idx}', '').strip()
 
             if local_dir and os.path.isdir(local_dir):
-                # Use the local directory directly
                 payor_dir = local_dir
             else:
-                # Fall back to uploaded files
                 payor_dir = os.path.join(work_dir, f'statements_{code.strip()}')
                 os.makedirs(payor_dir, exist_ok=True)
 
@@ -1017,7 +1052,7 @@ def run_custom():
 
                 if not has_files and not local_dir:
                     idx += 1
-                    continue  # Skip payors with no data source
+                    continue
 
             payor_configs.append(PayorConfig(
                 code=code.strip(),
@@ -1027,6 +1062,7 @@ def run_custom():
                 fx_currency=fx_currency,
                 fx_rate=fx_rate,
                 statements_dir=payor_dir,
+                statement_type=statement_type,
             ))
             idx += 1
 
@@ -1088,7 +1124,7 @@ def api_analytics():
 
 
 if __name__ == '__main__':
-    print("\n  PLYGRND Royalty Dashboard")
+    print("\n  Royalty Consolidator")
     print("  Open in your browser: http://localhost:5000")
     print("  Press Ctrl+C to stop.\n")
     app.run(host='0.0.0.0', port=5000, debug=False)
