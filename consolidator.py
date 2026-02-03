@@ -1,7 +1,7 @@
 """
 Royalty Statement Consolidator - Multi-Payor Edition
-Ingests royalty statements from multiple payors (Believe Excel, RecordJet CSV),
-consolidates them, and populates a multi-tab financial model.
+Ingests royalty statements from any payor (PDF, CSV, Excel),
+auto-detects columns, consolidates, and populates a multi-tab financial model.
 """
 
 import argparse
@@ -17,6 +17,12 @@ from typing import Dict, List, Optional
 import pandas as pd
 import openpyxl
 
+try:
+    import pdfplumber
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -28,7 +34,7 @@ class PayorConfig:
     code: str              # Short code: B1, B2, RJ — maps to {code}_Model tab
     name: str              # Display name: "Believe 15%", "RecordJet"
     statements_dir: str    # Directory containing statement files
-    fmt: str               # 'believe' or 'recordjet'
+    fmt: str               # 'auto', 'believe', or 'recordjet'
     fee: float             # Distribution fee as decimal (0.15 = 15%)
     fx_currency: str = 'USD'
     fx_rate: float = 1.0   # Multiply local currency amounts by this to get USD
@@ -77,15 +83,193 @@ def parse_period_from_filename(filename):
 
 
 # ---------------------------------------------------------------------------
-# Parsers: one per statement format
+# Universal column auto-detection
 # ---------------------------------------------------------------------------
 
-def parse_believe_file(filepath, filename):
-    """Parse a single Believe distributor Excel statement."""
-    df = pd.read_excel(filepath, sheet_name=0)
-    df.columns = [c.strip().lower() for c in df.columns]
+# Each key is the standard schema field; the list has lowercase substrings to
+# match against the source column name (checked in order — first match wins).
+COLUMN_PATTERNS = {
+    'identifier': ['isrc', 'identifier', 'upc', 'product code', 'catalog', 'track id',
+                    'asset id', 'recording id', 'track code'],
+    'title': ['title', 'track', 'song name', 'song', 'track name'],
+    'artist': ['artist', 'performer', 'act', 'band', 'creator'],
+    'product_title': ['product title', 'album', 'release', 'product', 'bundle',
+                      'album name', 'release title', 'ean'],
+    'distributor': ['distributor', 'store', 'platform', 'dsp', 'service',
+                    'retailer', 'partner', 'channel', 'source'],
+    'sales': ['sales', 'quantity', 'units', 'streams', 'plays', 'count',
+              'qty', 'volume', 'number of', 'total units'],
+    'download_type': ['download type', 'usage type', 'transaction type',
+                      'content type', 'sale type', 'revenue type', 'type'],
+    'gross': ['gross', 'ppu total', 'revenue', 'earning gross', 'total revenue',
+              'gross revenue', 'earnings', 'amount', 'total amount',
+              'earning_gross', 'price', 'retail'],
+    'net': ['net', 'royalty', 'earning net', 'payout', 'net revenue', 'your share',
+            'payable', 'earning_net', 'net amount', 'royalties'],
+    'period': ['period', 'reporting period', 'statement period', 'sale period',
+               'accounting period', 'royalty period', 'month'],
+    'country': ['country', 'territory', 'region', 'market'],
+}
+
+
+def _fuzzy_match_columns(df_columns):
+    """Match source column names to our standard schema.
+
+    Returns a dict mapping standard field -> source column name.
+    """
+    mapped = {}
+    used = set()
+    lower_cols = {c: c.strip().lower() for c in df_columns}
+
+    # Sort patterns so more specific matches come first
+    for field, patterns in COLUMN_PATTERNS.items():
+        for pattern in patterns:
+            for orig, low in lower_cols.items():
+                if orig in used:
+                    continue
+                if pattern == low or pattern in low:
+                    mapped[field] = orig
+                    used.add(orig)
+                    break
+            if field in mapped:
+                break
+
+    return mapped
+
+
+def _read_raw_dataframe(filepath, filename):
+    """Read any file (PDF, CSV, Excel) into a raw DataFrame."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext == '.csv':
+        return pd.read_csv(filepath)
+
+    elif ext in ('.xlsx', '.xls'):
+        return pd.read_excel(filepath, sheet_name=0)
+
+    elif ext == '.pdf':
+        if not HAS_PDF:
+            print(f"    WARNING: pdfplumber not installed, skipping {filename}", flush=True)
+            return None
+        frames = []
+        with pdfplumber.open(filepath) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    header = [str(c).strip() if c else f'col_{i}' for i, c in enumerate(table[0])]
+                    rows = table[1:]
+                    frames.append(pd.DataFrame(rows, columns=header))
+        if not frames:
+            return None
+        return pd.concat(frames, ignore_index=True)
+
+    return None
+
+
+def parse_file_universal(filepath, filename, fmt='auto'):
+    """Parse any statement file into the standard schema.
+
+    fmt='auto' uses column auto-detection.
+    fmt='believe' / 'recordjet' use the legacy column mappings as a hint
+    but still fall through to auto-detect if needed.
+    """
+    df = _read_raw_dataframe(filepath, filename)
+    if df is None or df.empty:
+        return None
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # --- Legacy format shortcuts (exact column names we know) ---
+    if fmt == 'believe':
+        lc = {c.strip().lower(): c for c in df.columns}
+        if 'identifier' in lc and 'ppu total' in lc:
+            return _apply_believe_mapping(df, filename)
+
+    if fmt == 'recordjet':
+        lc = {c.strip().lower(): c for c in df.columns}
+        if 'isrc' in lc and ('earning gross eur' in lc or 'earning_gross_eur' in lc):
+            return _apply_recordjet_mapping(df, filename)
+
+    # --- Auto-detect columns ---
+    col_map = _fuzzy_match_columns(df.columns)
+
+    if 'identifier' not in col_map and 'gross' not in col_map:
+        # Not enough columns recognized — try legacy mappings as fallback
+        lc = {c.strip().lower(): c for c in df.columns}
+        if 'identifier' in lc and 'ppu total' in lc:
+            return _apply_believe_mapping(df, filename)
+        if 'isrc' in lc and ('earning gross eur' in lc or 'earning_gross_eur' in lc):
+            return _apply_recordjet_mapping(df, filename)
+
+        cols_found = list(df.columns)
+        print(f"    WARNING: Could not detect columns in {filename}. "
+              f"Found: {cols_found[:15]}", flush=True)
+        return None
 
     # Derive period
+    if 'period' in col_map:
+        raw_period = df[col_map['period']]
+        # Try to parse YYYYMM from the period column
+        period_vals = raw_period.astype(str).str.replace(r'[^0-9]', '', regex=True)
+        # Keep only 6-digit periods; for longer strings take first 6 chars
+        period_vals = period_vals.apply(
+            lambda x: int(x[:6]) if len(x) >= 6 and x[:6].isdigit() else 0
+        )
+        df['_period'] = period_vals
+    else:
+        period = parse_period_from_filename(filename)
+        if period is None:
+            # Try to find a date-like column
+            for c in df.columns:
+                sample = str(df[c].dropna().iloc[0]) if len(df[c].dropna()) > 0 else ''
+                m = re.search(r'(\d{4})[\s._/-]?(\d{2})', sample)
+                if m:
+                    period = int(f"{m.group(1)}{m.group(2)}")
+                    break
+        if period is None:
+            print(f"    WARNING: No period found for {filename}, skipping.", flush=True)
+            return None
+        df['_period'] = period
+
+    n = len(df)
+
+    def _get(field, default_val=''):
+        if field in col_map:
+            return df[col_map[field]]
+        return pd.Series([default_val] * n)
+
+    def _get_numeric(field):
+        if field in col_map:
+            return pd.to_numeric(df[col_map[field]], errors='coerce').fillna(0)
+        return pd.Series([0.0] * n)
+
+    result = pd.DataFrame({
+        'identifier': _get('identifier'),
+        'title': _get('title'),
+        'artist': _get('artist'),
+        'product_title': _get('product_title'),
+        'distributor': _get('distributor'),
+        'download_type': _get('download_type'),
+        'period': df['_period'],
+        'gross': _get_numeric('gross'),
+        'net': _get_numeric('net'),
+        'sales': _get_numeric('sales'),
+    })
+
+    # If net is all zeros but gross isn't, net might be in a different column we missed
+    # or the file only has one revenue column — that's fine, leave it.
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Legacy mapping helpers (kept for exact-match Believe / RecordJet files)
+# ---------------------------------------------------------------------------
+
+def _apply_believe_mapping(df, filename):
+    """Apply the known Believe column mapping."""
+    df.columns = [c.strip().lower() for c in df.columns]
     if 'period' in df.columns:
         df['period'] = df['period'].astype(int)
     else:
@@ -94,7 +278,6 @@ def parse_believe_file(filepath, filename):
             return None
         df['period'] = period
 
-    # Standardize to common schema
     return pd.DataFrame({
         'identifier': df['identifier'],
         'title': df['title'],
@@ -109,20 +292,13 @@ def parse_believe_file(filepath, filename):
     })
 
 
-def parse_recordjet_file(filepath, filename):
-    """Parse a single RecordJet CSV statement."""
-    df = pd.read_csv(filepath)
-    df.columns = [c.strip() for c in df.columns]
-
-    # Derive period from filename: classic-royalty-report-YYYY-MM.csv
-    m = re.search(r'(\d{4})-(\d{2})', filename)
-    if m:
-        period = int(f"{m.group(1)}{m.group(2)}")
-    else:
+def _apply_recordjet_mapping(df, filename):
+    """Apply the known RecordJet column mapping."""
+    col_map = {c.strip().lower(): c for c in df.columns}
+    m = re.search(r'(\d{4})[\s._-]?(\d{2})', filename)
+    period = int(f"{m.group(1)}{m.group(2)}") if m else parse_period_from_filename(filename)
+    if period is None:
         return None
-
-    # Column names vary — find earnings columns case-insensitively
-    col_map = {c.lower(): c for c in df.columns}
 
     gross_col = col_map.get('earning gross eur', col_map.get('earning_gross_eur'))
     net_col = col_map.get('earning net eur', col_map.get('earning_net_eur'))
@@ -137,7 +313,7 @@ def parse_recordjet_file(filepath, filename):
     if not gross_col or not isrc_col:
         return None
 
-    result = pd.DataFrame({
+    return pd.DataFrame({
         'identifier': df[isrc_col] if isrc_col else '',
         'title': df[title_col] if title_col else '',
         'artist': df[artist_col] if artist_col else '',
@@ -149,7 +325,6 @@ def parse_recordjet_file(filepath, filename):
         'net': pd.to_numeric(df[net_col], errors='coerce').fillna(0) if net_col else 0,
         'sales': pd.to_numeric(df[qty_col], errors='coerce').fillna(0) if qty_col else 0,
     })
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -166,21 +341,17 @@ def load_payor_statements(config: PayorConfig) -> Optional[PayorResult]:
     dist_chunks = []
     file_count = 0
 
+    SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.pdf')
+
     for root, dirs, files in os.walk(config.statements_dir):
         for f in sorted(files):
-            # Pick correct parser based on format
-            if config.fmt == 'believe':
-                if not f.endswith('.xlsx') or f.startswith('~$'):
-                    continue
-                filepath = os.path.join(root, f)
-                df = parse_believe_file(filepath, f)
-            elif config.fmt == 'recordjet':
-                if not f.endswith('.csv') or f.startswith('~$'):
-                    continue
-                filepath = os.path.join(root, f)
-                df = parse_recordjet_file(filepath, f)
-            else:
+            if f.startswith('~$'):
                 continue
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in SUPPORTED_EXT:
+                continue
+            filepath = os.path.join(root, f)
+            df = parse_file_universal(filepath, f, fmt=config.fmt)
 
             if df is None:
                 print(f"    WARNING: Could not parse {f}, skipping.", flush=True)
@@ -390,6 +561,26 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path)
         top.to_excel(writer, sheet_name='Top 50 Songs', index=False)
 
     print(f"  Done. {len(combined_clean):,} rows in 'Consolidated'.", flush=True)
+    return combined_clean
+
+
+def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path):
+    """Write consolidated detail as a single CSV file (standard schema)."""
+    print(f"\n  Writing consolidated CSV to: {output_path}", flush=True)
+
+    all_clean = []
+    for code, pr in payor_results.items():
+        clean = pr.detail[['statement_date', 'identifier', 'artist', 'title', 'product_title',
+                           'distributor', 'download_type', 'gross', 'net']].copy()
+        clean.columns = ['Statement Date', 'ISRC', 'Artist', 'Title', 'Product Title',
+                         'Distributor', 'Download Type', 'Gross Royalties', 'Net Royalties']
+        clean.insert(0, 'Payor', pr.config.name)
+        all_clean.append(clean)
+
+    combined = pd.concat(all_clean, ignore_index=True).sort_values(['Statement Date', 'Payor', 'ISRC'])
+    combined.to_csv(output_path, index=False)
+    print(f"  Done. {len(combined):,} rows.", flush=True)
+    return combined
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import zipfile
 from flask import Flask, render_template_string, request, send_file, flash, redirect, url_for, jsonify
 
 from consolidator import (
-    PayorConfig, load_all_payors, write_consolidated_excel,
+    PayorConfig, load_all_payors, write_consolidated_excel, write_consolidated_csv,
     populate_template, load_supplemental_metadata, compute_analytics,
     DEFAULT_PAYORS,
 )
@@ -371,7 +371,8 @@ DASHBOARD_HTML = r"""
     <div class="nav-right">
         {% if results %}
         <a href="/refresh" class="nav-btn">Refresh Data</a>
-        <a href="/download/consolidated" class="nav-btn primary">Export .xlsx</a>
+        <a href="/download/consolidated" class="nav-btn">Export .xlsx</a>
+        <a href="/download/csv" class="nav-btn primary">Export .csv</a>
         {% endif %}
     </div>
 </nav>
@@ -438,6 +439,7 @@ DASHBOARD_HTML = r"""
                     <div class="form-group" style="flex:1;">
                         <label class="form-label">Format</label>
                         <select class="form-input" name="payor_fmt_0">
+                            <option value="auto">Auto-detect</option>
                             <option value="believe">Believe (Excel)</option>
                             <option value="recordjet">RecordJet (CSV)</option>
                         </select>
@@ -464,7 +466,7 @@ DASHBOARD_HTML = r"""
                 </div>
                 <div class="form-group" style="margin-bottom:0;">
                     <label class="form-label">Statement Files</label>
-                    <input class="form-input" type="file" name="payor_files_0" multiple accept=".zip,.xlsx,.xls,.csv" required>
+                    <input class="form-input" type="file" name="payor_files_0" multiple accept=".zip,.xlsx,.xls,.csv,.pdf" required>
                 </div>
             </div>
         </div>
@@ -498,6 +500,7 @@ function addPayor() {
             <div class="form-group" style="flex:1;">
                 <label class="form-label">Format</label>
                 <select class="form-input" name="payor_fmt_${n}">
+                    <option value="auto">Auto-detect</option>
                     <option value="believe">Believe (Excel)</option>
                     <option value="recordjet">RecordJet (CSV)</option>
                 </select>
@@ -523,7 +526,7 @@ function addPayor() {
         </div>
         <div class="form-group" style="margin-bottom:0;">
             <label class="form-label">Statement Files</label>
-            <input class="form-input" type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.csv" required>
+            <input class="form-input" type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.csv,.pdf" required>
         </div>
     </div>`;
     document.getElementById('payorList').insertAdjacentHTML('beforeend', html);
@@ -710,6 +713,10 @@ function addPayor() {
                 <span class="name">Consolidated Statements</span>
                 <span class="badge">.xlsx</span>
             </a>
+            <a href="/download/csv" class="dl-link">
+                <span class="name">Consolidated Statements</span>
+                <span class="badge">.csv</span>
+            </a>
         </div>
     </div>
 </div>
@@ -894,16 +901,19 @@ def run_consolidation(payor_configs, output_dir=None):
     if output_dir is None:
         output_dir = WORK_DIR
 
-    consolidated_path = os.path.join(output_dir, 'Consolidated_All_Payors.xlsx')
-    write_consolidated_excel(payor_results, consolidated_path)
+    consolidated_xlsx = os.path.join(output_dir, 'Consolidated_All_Payors.xlsx')
+    consolidated_csv = os.path.join(output_dir, 'Consolidated_All_Payors.csv')
+    write_consolidated_excel(payor_results, consolidated_xlsx)
+    write_consolidated_csv(payor_results, consolidated_csv)
 
     analytics = compute_analytics(payor_results)
 
     _cached_results = payor_results
     _cached_analytics = analytics
-    app.config['CONSOLIDATED_PATH'] = consolidated_path
+    app.config['CONSOLIDATED_PATH'] = consolidated_xlsx
+    app.config['CONSOLIDATED_CSV_PATH'] = consolidated_csv
 
-    return payor_results, analytics, consolidated_path
+    return payor_results, analytics, consolidated_xlsx
 
 
 @app.route('/')
@@ -1033,6 +1043,8 @@ def refresh():
 def download(filetype):
     if filetype == 'consolidated':
         path = app.config.get('CONSOLIDATED_PATH')
+    elif filetype == 'csv':
+        path = app.config.get('CONSOLIDATED_CSV_PATH')
     elif filetype == 'model':
         path = app.config.get('MODEL_PATH')
     else:
