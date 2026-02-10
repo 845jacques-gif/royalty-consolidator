@@ -1,0 +1,622 @@
+"""
+Release Date Enrichment Engine
+3-tier lookup (MusicBrainz, Genius, Gemini) with persistent JSON cache,
+deduplication, and progress callbacks.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from typing import Callable, Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrackLookupItem:
+    """A single track to look up."""
+    isrc: str = ''
+    title: str = ''
+    artist: str = ''
+    existing_release_date: str = ''
+    row_indices: list = field(default_factory=list)  # indices into detail_df
+
+
+@dataclass
+class EnrichmentResult:
+    """Result of the enrichment process."""
+    lookups: Dict[str, dict] = field(default_factory=dict)  # key -> {release_date, source, track_name, artist_name, looked_up}
+    stats: Dict[str, int] = field(default_factory=dict)
+    tracks_without_dates: List[dict] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Cache layer — separate from consolidator's isrc_cache.json
+# ---------------------------------------------------------------------------
+
+_enrichment_cache = {}
+_enrichment_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'release_date_cache.json')
+
+
+def _load_cache():
+    global _enrichment_cache
+    if os.path.exists(_enrichment_cache_path):
+        try:
+            with open(_enrichment_cache_path, 'r', encoding='utf-8') as f:
+                _enrichment_cache = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            _enrichment_cache = {}
+
+
+def _save_cache():
+    try:
+        with open(_enrichment_cache_path, 'w', encoding='utf-8') as f:
+            json.dump(_enrichment_cache, f, indent=2, ensure_ascii=False)
+    except IOError:
+        pass
+
+
+def _cache_key_isrc(isrc: str) -> str:
+    return isrc.strip().upper()
+
+
+def _cache_key_title_artist(title: str, artist: str) -> str:
+    t = re.sub(r'\s+', ' ', title.strip().upper())
+    a = re.sub(r'\s+', ' ', artist.strip().upper())
+    return f"{t}::{a}"
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def deduplicate_tracks(detail_df: pd.DataFrame) -> List[TrackLookupItem]:
+    """Group detail rows into unique tracks for lookup.
+
+    Groups by ISRC first; rows without ISRC group by (Title, Artist).
+    Tracks that already have a release_date from source data are tagged SRC.
+    """
+    items = []
+    seen_isrcs = set()
+    seen_title_artist = set()
+
+    # Ensure columns exist
+    for col in ['ISRC', 'Title', 'Artist', 'Release Date']:
+        if col not in detail_df.columns:
+            # Try lowercase variants
+            for alt in [col.lower(), col.replace(' ', '_').lower()]:
+                if alt in detail_df.columns:
+                    detail_df = detail_df.rename(columns={alt: col})
+                    break
+            else:
+                detail_df[col] = ''
+
+    for idx, row in detail_df.iterrows():
+        isrc = str(row.get('ISRC', '')).strip()
+        title = str(row.get('Title', '')).strip()
+        artist = str(row.get('Artist', '')).strip()
+        rd = str(row.get('Release Date', '')).strip()
+
+        if isrc and isrc not in ('', 'nan', 'None'):
+            if isrc.upper() not in seen_isrcs:
+                seen_isrcs.add(isrc.upper())
+                item = TrackLookupItem(
+                    isrc=isrc.upper(),
+                    title=title,
+                    artist=artist,
+                    existing_release_date=rd if rd and rd not in ('', 'nan', 'None', 'NaT') else '',
+                    row_indices=[idx],
+                )
+                items.append(item)
+            else:
+                # Add row index to existing item
+                for it in items:
+                    if it.isrc == isrc.upper():
+                        it.row_indices.append(idx)
+                        break
+        elif title and artist:
+            key = _cache_key_title_artist(title, artist)
+            if key not in seen_title_artist:
+                seen_title_artist.add(key)
+                item = TrackLookupItem(
+                    title=title,
+                    artist=artist,
+                    existing_release_date=rd if rd and rd not in ('', 'nan', 'None', 'NaT') else '',
+                    row_indices=[idx],
+                )
+                items.append(item)
+            else:
+                for it in items:
+                    if not it.isrc and _cache_key_title_artist(it.title, it.artist) == key:
+                        it.row_indices.append(idx)
+                        break
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: MusicBrainz
+# ---------------------------------------------------------------------------
+
+def _lookup_musicbrainz_isrc(isrc: str) -> dict:
+    """Look up a single ISRC on MusicBrainz. Returns {release_date, track_name, artist_name}."""
+    url = f"https://musicbrainz.org/ws/2/recording?query=isrc:{isrc}&fmt=json"
+    req = Request(url, headers={"User-Agent": "RoyaltyConsolidator/2.0 (contact@example.com)"})
+
+    result = {'release_date': '', 'track_name': '', 'artist_name': ''}
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        recordings = data.get("recordings", [])
+        if recordings:
+            # Pick earliest release date across all recordings
+            best_date = None
+            best_rec = recordings[0]
+            for rec in recordings:
+                frd = rec.get("first-release-date", "")
+                if frd and (best_date is None or frd < best_date):
+                    best_date = frd
+                    best_rec = rec
+
+            artist_credit = best_rec.get("artist-credit", [{}])
+            artist_name = artist_credit[0].get("name", "") if artist_credit else ""
+            result = {
+                'release_date': best_date or '',
+                'track_name': best_rec.get("title", ""),
+                'artist_name': artist_name,
+            }
+    except (HTTPError, URLError) as e:
+        if hasattr(e, 'code') and e.code == 503:
+            time.sleep(2)
+    except Exception:
+        pass
+
+    return result
+
+
+def _lookup_musicbrainz_title_artist(title: str, artist: str) -> dict:
+    """Search MusicBrainz by title+artist. Returns {release_date, track_name, artist_name}."""
+    query = f'recording:"{title}" AND artist:"{artist}"'
+    url = f"https://musicbrainz.org/ws/2/recording?query={quote_plus(query)}&fmt=json&limit=5"
+    req = Request(url, headers={"User-Agent": "RoyaltyConsolidator/2.0 (contact@example.com)"})
+
+    result = {'release_date': '', 'track_name': '', 'artist_name': ''}
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        recordings = data.get("recordings", [])
+        if recordings:
+            best_date = None
+            best_rec = recordings[0]
+            for rec in recordings:
+                frd = rec.get("first-release-date", "")
+                if frd and (best_date is None or frd < best_date):
+                    best_date = frd
+                    best_rec = rec
+
+            artist_credit = best_rec.get("artist-credit", [{}])
+            artist_name = artist_credit[0].get("name", "") if artist_credit else ""
+            result = {
+                'release_date': best_date or '',
+                'track_name': best_rec.get("title", ""),
+                'artist_name': artist_name,
+            }
+    except (HTTPError, URLError):
+        pass
+    except Exception:
+        pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Genius API
+# ---------------------------------------------------------------------------
+
+def _lookup_genius(title: str, artist: str, token: str, min_confidence: float = 0.6) -> dict:
+    """Search Genius for a track and return release date if found with sufficient confidence."""
+    result = {'release_date': '', 'track_name': '', 'artist_name': ''}
+
+    if not token:
+        return result
+
+    query = f"{title} {artist}"
+    url = f"https://api.genius.com/search?q={quote_plus(query)}"
+    req = Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "RoyaltyConsolidator/2.0",
+    })
+
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        hits = data.get("response", {}).get("hits", [])
+        if not hits:
+            return result
+
+        # Fuzzy match on title + artist
+        best_score = 0.0
+        best_hit = None
+        target = f"{title} {artist}".lower()
+
+        for hit in hits[:5]:
+            song = hit.get("result", {})
+            candidate = f"{song.get('title', '')} {song.get('primary_artist', {}).get('name', '')}".lower()
+            score = SequenceMatcher(None, target, candidate).ratio()
+            if score > best_score:
+                best_score = score
+                best_hit = song
+
+        if best_hit and best_score >= min_confidence:
+            # Genius search results don't always include release_date directly,
+            # but the song endpoint does. Fetch it.
+            song_id = best_hit.get('id')
+            if song_id:
+                song_url = f"https://api.genius.com/songs/{song_id}"
+                song_req = Request(song_url, headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "RoyaltyConsolidator/2.0",
+                })
+                try:
+                    with urlopen(song_req, timeout=10) as song_resp:
+                        song_data = json.loads(song_resp.read())
+                    song_info = song_data.get("response", {}).get("song", {})
+                    rd = song_info.get("release_date") or ''
+                    result = {
+                        'release_date': rd,
+                        'track_name': song_info.get('title', best_hit.get('title', '')),
+                        'artist_name': song_info.get('primary_artist', {}).get('name', ''),
+                    }
+                except Exception:
+                    # Fall back to whatever we have
+                    result = {
+                        'release_date': '',
+                        'track_name': best_hit.get('title', ''),
+                        'artist_name': best_hit.get('primary_artist', {}).get('name', ''),
+                    }
+
+    except (HTTPError, URLError):
+        pass
+    except Exception:
+        pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Gemini API (batch)
+# ---------------------------------------------------------------------------
+
+def _lookup_gemini_batch(items: List[TrackLookupItem], api_key: str,
+                          batch_size: int = 20,
+                          progress_callback: Optional[Callable] = None,
+                          timeout_per_batch: int = 30) -> Dict[str, dict]:
+    """Use Gemini to look up release dates in batches. Returns {cache_key: result_dict}.
+
+    progress_callback: optional callable({phase, current, total, message}) for UI updates.
+    timeout_per_batch: seconds to wait for each Gemini API call before giving up (default 30).
+    """
+    results = {}
+
+    if not api_key or not items:
+        return results
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+    except Exception as exc:
+        print(f"[enrichment] Gemini init error: {exc}", file=sys.stderr, flush=True)
+        return results
+
+    total_batches = (len(items) + batch_size - 1) // batch_size
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    # Process in batches
+    for batch_num, batch_start in enumerate(range(0, len(items), batch_size)):
+        batch = items[batch_start:batch_start + batch_size]
+
+        if progress_callback:
+            progress_callback({
+                'phase': 'gemini',
+                'current': batch_start,
+                'total': len(items),
+                'message': f'Gemini: batch {batch_num + 1}/{total_batches} ({batch_start}/{len(items)} tracks)...',
+            })
+
+        # Build prompt
+        lines = []
+        for i, item in enumerate(batch):
+            if item.isrc:
+                lines.append(f"{i+1}. ISRC: {item.isrc} | Title: {item.title} | Artist: {item.artist}")
+            else:
+                lines.append(f"{i+1}. Title: {item.title} | Artist: {item.artist}")
+
+        prompt = (
+            "For each song below, provide the original release date in YYYY-MM-DD format. "
+            "If you don't know the exact date, provide YYYY-MM or YYYY. "
+            "If you cannot determine the release date, write 'UNKNOWN'.\n"
+            "Respond with ONLY numbered lines in the format: NUMBER. YYYY-MM-DD\n\n"
+            + "\n".join(lines)
+        )
+
+        try:
+            # Run generate_content with a timeout to avoid hanging indefinitely
+            future = executor.submit(model.generate_content, prompt)
+            response = future.result(timeout=timeout_per_batch)
+            response_text = response.text.strip()
+
+            # Parse response line by line
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                # Match "1. 2022-05-13" or "1. UNKNOWN"
+                m = re.match(r'^(\d+)\.\s*(.+)$', line)
+                if m:
+                    idx = int(m.group(1)) - 1
+                    date_str = m.group(2).strip()
+                    if idx < len(batch) and date_str.upper() != 'UNKNOWN':
+                        # Validate date format
+                        if re.match(r'^\d{4}(-\d{2})?(-\d{2})?$', date_str):
+                            item = batch[idx]
+                            key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
+                            results[key] = {
+                                'release_date': date_str,
+                                'source': 'GM',
+                                'track_name': item.title,
+                                'artist_name': item.artist,
+                                'looked_up': True,
+                            }
+        except FuturesTimeoutError:
+            print(f"[enrichment] Gemini batch {batch_num + 1}/{total_batches} timed out after {timeout_per_batch}s — skipping",
+                  file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[enrichment] Gemini batch {batch_num + 1}/{total_batches} error: {exc}",
+                  file=sys.stderr, flush=True)
+
+        # Small delay between batches
+        if batch_start + batch_size < len(items):
+            time.sleep(1)
+
+    executor.shutdown(wait=False)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+def enrich_release_dates(
+    detail_df: pd.DataFrame,
+    genius_token: str = '',
+    gemini_api_key: str = '',
+    skip_tiers: Optional[List[str]] = None,
+    progress_callback: Optional[Callable] = None,
+) -> EnrichmentResult:
+    """Run 3-tier release date enrichment on a detail DataFrame.
+
+    progress_callback: called with {phase, current, total, message}
+    skip_tiers: list of tier codes to skip ('MB', 'GN', 'GM')
+    """
+    skip_tiers = skip_tiers or []
+    _load_cache()
+
+    result = EnrichmentResult()
+    stats = {
+        'total': 0,
+        'from_source': 0,
+        'from_cache': 0,
+        'mb_found': 0,
+        'gn_found': 0,
+        'gm_found': 0,
+        'not_found': 0,
+    }
+
+    # Deduplicate tracks
+    items = deduplicate_tracks(detail_df)
+    stats['total'] = len(items)
+
+    if progress_callback:
+        progress_callback({'phase': 'dedup', 'current': 0, 'total': len(items),
+                           'message': f'Found {len(items)} unique tracks to look up'})
+
+    # Separate tracks that already have dates from source
+    need_lookup = []
+    for item in items:
+        key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
+
+        if item.existing_release_date:
+            result.lookups[key] = {
+                'release_date': item.existing_release_date,
+                'source': 'SRC',
+                'track_name': item.title,
+                'artist_name': item.artist,
+                'looked_up': False,
+            }
+            stats['from_source'] += 1
+        elif key in _enrichment_cache and _enrichment_cache[key].get('release_date'):
+            result.lookups[key] = _enrichment_cache[key]
+            stats['from_cache'] += 1
+        else:
+            need_lookup.append(item)
+
+    if progress_callback:
+        progress_callback({'phase': 'cache', 'current': stats['from_source'] + stats['from_cache'],
+                           'total': len(items),
+                           'message': f"{stats['from_source']} from source data, {stats['from_cache']} from cache, {len(need_lookup)} to look up"})
+
+    # Tier 1: MusicBrainz
+    still_need = []
+    if 'MB' not in skip_tiers and need_lookup:
+        for i, item in enumerate(need_lookup):
+            if progress_callback:
+                progress_callback({'phase': 'musicbrainz', 'current': i + 1, 'total': len(need_lookup),
+                                   'message': f'MusicBrainz: {i+1}/{len(need_lookup)} — {item.title or item.isrc}'})
+
+            if item.isrc:
+                mb_result = _lookup_musicbrainz_isrc(item.isrc)
+            else:
+                mb_result = _lookup_musicbrainz_title_artist(item.title, item.artist)
+
+            key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
+
+            if mb_result.get('release_date'):
+                entry = {
+                    'release_date': mb_result['release_date'],
+                    'source': 'MB',
+                    'track_name': mb_result.get('track_name', item.title),
+                    'artist_name': mb_result.get('artist_name', item.artist),
+                    'looked_up': True,
+                }
+                result.lookups[key] = entry
+                _enrichment_cache[key] = entry
+                stats['mb_found'] += 1
+            else:
+                # Cache the miss too
+                _enrichment_cache[key] = {
+                    'release_date': '',
+                    'source': '',
+                    'track_name': item.title,
+                    'artist_name': item.artist,
+                    'looked_up': True,
+                }
+                still_need.append(item)
+
+            time.sleep(1.1)  # MusicBrainz rate limit
+    else:
+        still_need = need_lookup
+
+    _save_cache()
+
+    # Tier 2: Genius
+    genius_still_need = []
+    if 'GN' not in skip_tiers and genius_token and still_need:
+        for i, item in enumerate(still_need):
+            if progress_callback:
+                progress_callback({'phase': 'genius', 'current': i + 1, 'total': len(still_need),
+                                   'message': f'Genius: {i+1}/{len(still_need)} — {item.title}'})
+
+            gn_result = _lookup_genius(item.title, item.artist, genius_token)
+            key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
+
+            if gn_result.get('release_date'):
+                entry = {
+                    'release_date': gn_result['release_date'],
+                    'source': 'GN',
+                    'track_name': gn_result.get('track_name', item.title),
+                    'artist_name': gn_result.get('artist_name', item.artist),
+                    'looked_up': True,
+                }
+                result.lookups[key] = entry
+                _enrichment_cache[key] = entry
+                stats['gn_found'] += 1
+            else:
+                genius_still_need.append(item)
+
+            time.sleep(0.3)  # Genius rate limit
+    else:
+        genius_still_need = still_need
+
+    _save_cache()
+
+    # Tier 3: Gemini
+    if 'GM' not in skip_tiers and gemini_api_key and genius_still_need:
+        if progress_callback:
+            progress_callback({'phase': 'gemini', 'current': 0, 'total': len(genius_still_need),
+                               'message': f'Gemini: Processing {len(genius_still_need)} tracks in batches...'})
+
+        gm_results = _lookup_gemini_batch(genius_still_need, gemini_api_key,
+                                           progress_callback=progress_callback)
+
+        for key, entry in gm_results.items():
+            result.lookups[key] = entry
+            _enrichment_cache[key] = entry
+            stats['gm_found'] += 1
+
+        # Mark remaining as not found
+        for item in genius_still_need:
+            key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
+            if key not in result.lookups:
+                stats['not_found'] += 1
+                result.tracks_without_dates.append({
+                    'isrc': item.isrc,
+                    'title': item.title,
+                    'artist': item.artist,
+                })
+    else:
+        # All remaining from Genius step are not found
+        for item in genius_still_need:
+            key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
+            if key not in result.lookups:
+                stats['not_found'] += 1
+                result.tracks_without_dates.append({
+                    'isrc': item.isrc,
+                    'title': item.title,
+                    'artist': item.artist,
+                })
+
+    _save_cache()
+
+    result.stats = stats
+
+    if progress_callback:
+        progress_callback({'phase': 'done', 'current': stats['total'], 'total': stats['total'],
+                           'message': f"Done! SRC:{stats['from_source']} Cache:{stats['from_cache']} MB:{stats['mb_found']} GN:{stats['gn_found']} GM:{stats['gm_found']} Not found:{stats['not_found']}"})
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Apply enrichment to detail DataFrame
+# ---------------------------------------------------------------------------
+
+def apply_enrichment_to_detail(detail_df: pd.DataFrame, lookups: Dict[str, dict]) -> pd.DataFrame:
+    """Apply enrichment lookup results back to the detail DataFrame.
+
+    Adds/updates 'Release Date' and 'Release Date Source' columns.
+    Matches by ISRC first, then Title::Artist fallback.
+    """
+    df = detail_df.copy()
+
+    if 'Release Date Source' not in df.columns:
+        df['Release Date Source'] = ''
+
+    for idx, row in df.iterrows():
+        isrc = str(row.get('ISRC', '')).strip().upper()
+        title = str(row.get('Title', '')).strip()
+        artist = str(row.get('Artist', '')).strip()
+
+        # Try ISRC key first
+        entry = None
+        if isrc and isrc not in ('', 'NAN', 'NONE'):
+            key = _cache_key_isrc(isrc)
+            entry = lookups.get(key)
+
+        # Fallback to title::artist
+        if not entry and title and artist:
+            key = _cache_key_title_artist(title, artist)
+            entry = lookups.get(key)
+
+        if entry and entry.get('release_date'):
+            current_rd = str(row.get('Release Date', '')).strip()
+            if not current_rd or current_rd in ('', 'nan', 'None', 'NaT'):
+                df.at[idx, 'Release Date'] = entry['release_date']
+            df.at[idx, 'Release Date Source'] = entry.get('source', '')
+
+    return df
