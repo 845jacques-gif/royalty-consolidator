@@ -3566,6 +3566,65 @@ function addEditPayor() {
 </div>
 {% endif %}
 
+{# ---- Audit Trail Card ---- #}
+{% if results.get('audit_summary') %}
+<div class="grid" style="margin-bottom:16px;">
+    <div class="card span-full">
+        <div class="card-header">
+            <span class="card-title">Audit Trail</span>
+            <span style="font-size:11px; color:var(--text-dim);">Column mapping decisions</span>
+        </div>
+        {% set asumm = results.audit_summary %}
+        <div style="display:flex; gap:24px; padding:8px 16px 4px; flex-wrap:wrap;">
+            <div style="text-align:center;">
+                <div class="mono" style="font-size:20px; font-weight:600; color:var(--green);">{{ asumm.auto_ingested_files }}</div>
+                <div style="font-size:10px; color:var(--text-muted); text-transform:uppercase;">Auto-ingested</div>
+            </div>
+            <div style="text-align:center;">
+                <div class="mono" style="font-size:20px; font-weight:600; color:var(--blue);">{{ asumm.manually_mapped_files }}</div>
+                <div style="font-size:10px; color:var(--text-muted); text-transform:uppercase;">Manually mapped</div>
+            </div>
+            <div style="text-align:center;">
+                <div class="mono" style="font-size:20px; font-weight:600; color:var(--text-primary);">{{ asumm.total_columns_mapped }}</div>
+                <div style="font-size:10px; color:var(--text-muted); text-transform:uppercase;">Columns mapped</div>
+            </div>
+            <div style="text-align:center;">
+                <div class="mono" style="font-size:20px; font-weight:600; color:var(--green);">{{ asumm.auto_accepted_columns }}</div>
+                <div style="font-size:10px; color:var(--text-muted); text-transform:uppercase;">Auto-accepted</div>
+            </div>
+            <div style="text-align:center;">
+                <div class="mono" style="font-size:20px; font-weight:600; color:var(--yellow);">{{ asumm.user_corrected_columns }}</div>
+                <div style="font-size:10px; color:var(--text-muted); text-transform:uppercase;">User-corrected</div>
+            </div>
+        </div>
+        {% if asumm.get('per_payor') %}
+        <table style="margin-top:8px;">
+            <thead>
+                <tr>
+                    <th>Payor</th>
+                    <th class="text-right">Files</th>
+                    <th class="text-right">Auto-mapped</th>
+                    <th class="text-right">Corrected</th>
+                    <th class="text-right">Avg Confidence</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for row in asumm.per_payor %}
+                <tr>
+                    <td style="font-size:12px; color:var(--text-secondary);">{{ row.name }}</td>
+                    <td class="text-right mono" style="font-size:12px;">{{ row.files }}</td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--green);">{{ row.auto_mapped }}</td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--yellow);">{{ row.user_corrected }}</td>
+                    <td class="text-right mono" style="font-size:12px;">{{ '%.0f' | format(row.avg_confidence * 100) }}%</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
 {# ---- ROW 6: Statement Coverage Grid ---- #}
 {% if results.get('coverage_rows') and results.get('coverage_months') %}
 <div class="grid" style="margin-bottom:16px;">
@@ -4483,6 +4542,62 @@ def custom_preview(payor_idx, struct_idx):
 
     current_struct = structures[struct_idx] if structures else None
 
+    # --- Quick Ingest: check if this structure's fingerprint has a saved mapping ---
+    if request.method == 'GET' and current_struct:
+        saved_mapping = mapper.get_fingerprint_mapping(current_struct['headers'])
+        if saved_mapping:
+            fingerprint = current_struct['fingerprint']
+            cleaning = sess.get('cleaning', {}).get(payor['code'], {}).get(fingerprint, {})
+            file_mappings = sess.get('column_mappings', {}).get(payor['code'], {})
+            for filename in current_struct['files']:
+                file_mappings[filename] = {
+                    'mapping': saved_mapping,
+                    'remove_top': cleaning.get('remove_top', 0),
+                    'remove_bottom': cleaning.get('remove_bottom', 0),
+                    'header_row': current_struct.get('header_row', 0),
+                    'sheet': cleaning.get('sheet'),
+                    'keep_columns': [],
+                }
+            sess.setdefault('column_mappings', {})[payor['code']] = file_mappings
+            mapper.increment_fingerprint_use(fingerprint)
+
+            # Build audit entry: all mapped columns auto-accepted at confidence 1.0
+            audit_columns = []
+            for col in current_struct['headers']:
+                canonical = saved_mapping.get(col, '')
+                audit_columns.append({
+                    'source_col': col,
+                    'auto_proposed': canonical,
+                    'auto_confidence': 1.0 if canonical else 0.0,
+                    'final_mapping': canonical,
+                    'decision': 'auto_accepted' if canonical else 'unmapped',
+                })
+            mapped_count = sum(1 for c in audit_columns if c['decision'] == 'auto_accepted')
+            unmapped_count = sum(1 for c in audit_columns if c['decision'] == 'unmapped')
+            audit_entry = {
+                'fingerprint': fingerprint,
+                'mapping_source': 'fingerprint',
+                'columns': audit_columns,
+                'summary': {
+                    'total_columns': len(audit_columns),
+                    'auto_accepted': mapped_count,
+                    'user_corrected': 0,
+                    'user_added': 0,
+                    'unmapped': unmapped_count,
+                },
+            }
+            sess.setdefault('audit_trail', {}).setdefault(payor['code'], {})[fingerprint] = audit_entry
+
+            flash(f'Recognized format for {payor["name"]} — auto-applied saved mapping.', 'success')
+
+            # Advance to next structure/payor/process
+            if struct_idx + 1 < struct_count:
+                return redirect(url_for('custom_preview', payor_idx=payor_idx, struct_idx=struct_idx + 1))
+            elif payor_idx + 1 < len(payors):
+                return redirect(url_for('custom_preview', payor_idx=payor_idx + 1, struct_idx=0))
+            else:
+                return redirect(url_for('custom_process'))
+
     if request.method == 'POST':
         action = request.form.get('action', 'clean')
         if action == 'skip':
@@ -4648,6 +4763,54 @@ def custom_map(payor_idx, struct_idx):
                             }
 
         sess.setdefault('column_mappings', {})[payor['code']] = file_mappings
+
+        # Persist fingerprint mapping to DB so future runs can Quick Ingest
+        if current_struct:
+            fingerprint = current_struct['fingerprint']
+            mapper.save_mapping(fingerprint, headers, col_mapping, source_label=payor['name'])
+            mapper.save_synonyms(col_mapping)
+
+        # --- Audit Trail: compare user selections vs auto-proposals ---
+        proposed = mapper.propose_mapping(headers)
+        audit_columns = []
+        for col in headers:
+            prop = proposed.get(col, {})
+            auto_canonical = prop.get('canonical', '')
+            auto_conf = prop.get('confidence', 0.0)
+            final = col_mapping.get(col, '')
+            if not final and not auto_canonical:
+                decision = 'unmapped'
+            elif not auto_canonical and final:
+                decision = 'user_added'
+            elif auto_canonical == final:
+                decision = 'auto_accepted'
+            else:
+                decision = 'user_corrected'
+            audit_columns.append({
+                'source_col': col,
+                'auto_proposed': auto_canonical,
+                'auto_confidence': auto_conf,
+                'final_mapping': final,
+                'decision': decision,
+            })
+        ac_count = sum(1 for c in audit_columns if c['decision'] == 'auto_accepted')
+        uc_count = sum(1 for c in audit_columns if c['decision'] == 'user_corrected')
+        ua_count = sum(1 for c in audit_columns if c['decision'] == 'user_added')
+        um_count = sum(1 for c in audit_columns if c['decision'] == 'unmapped')
+        audit_entry = {
+            'fingerprint': current_struct['fingerprint'] if current_struct else 'default',
+            'mapping_source': 'user',
+            'columns': audit_columns,
+            'summary': {
+                'total_columns': len(audit_columns),
+                'auto_accepted': ac_count,
+                'user_corrected': uc_count,
+                'user_added': ua_count,
+                'unmapped': um_count,
+            },
+        }
+        fp_key = current_struct['fingerprint'] if current_struct else 'default'
+        sess.setdefault('audit_trail', {}).setdefault(payor['code'], {})[fp_key] = audit_entry
 
         # Next structure, next payor, or process
         if struct_idx + 1 < struct_count:
@@ -5148,6 +5311,62 @@ def custom_finalize():
 
             analytics = compute_analytics(payor_results, formulas=formulas or None,
                                           enrichment_stats=enrichment_stats)
+
+            # --- Inject audit trail into analytics for dashboard rendering ---
+            audit_trail = sess.get('audit_trail', {})
+            if audit_trail:
+                # Compute cross-payor audit summary
+                total_files = 0
+                auto_ingested = 0
+                manually_mapped = 0
+                total_cols_mapped = 0
+                auto_accepted_cols = 0
+                user_corrected_cols = 0
+                # Build payor-name lookup from payor_results
+                payor_name_map = {pr.config.code: pr.config.name for pr in payor_results.values()}
+                per_payor_rows = []
+                for payor_code, fp_entries in audit_trail.items():
+                    p_files = 0
+                    p_auto = 0
+                    p_corrected = 0
+                    p_conf_sum = 0.0
+                    p_conf_count = 0
+                    for fp, entry in fp_entries.items():
+                        total_files += 1
+                        p_files += 1
+                        src = entry.get('mapping_source', 'user')
+                        if src == 'fingerprint':
+                            auto_ingested += 1
+                        else:
+                            manually_mapped += 1
+                        s = entry.get('summary', {})
+                        total_cols_mapped += s.get('auto_accepted', 0) + s.get('user_corrected', 0) + s.get('user_added', 0)
+                        auto_accepted_cols += s.get('auto_accepted', 0)
+                        user_corrected_cols += s.get('user_corrected', 0)
+                        p_auto += s.get('auto_accepted', 0)
+                        p_corrected += s.get('user_corrected', 0)
+                        for col_entry in entry.get('columns', []):
+                            if col_entry.get('auto_confidence', 0) > 0:
+                                p_conf_sum += col_entry['auto_confidence']
+                                p_conf_count += 1
+                    per_payor_rows.append({
+                        'name': payor_name_map.get(payor_code, payor_code),
+                        'files': p_files,
+                        'auto_mapped': p_auto,
+                        'user_corrected': p_corrected,
+                        'avg_confidence': round(p_conf_sum / p_conf_count, 2) if p_conf_count else 0.0,
+                    })
+                analytics['audit_trail'] = audit_trail
+                analytics['audit_summary'] = {
+                    'total_files': total_files,
+                    'auto_ingested_files': auto_ingested,
+                    'manually_mapped_files': manually_mapped,
+                    'total_columns_mapped': total_cols_mapped,
+                    'auto_accepted_columns': auto_accepted_cols,
+                    'user_corrected_columns': user_corrected_cols,
+                    'per_payor': per_payor_rows,
+                }
+
             with _state_lock:
                 _cached_analytics = analytics
                 if export_options.get('combined_excel', True):
@@ -5171,6 +5390,10 @@ def custom_finalize():
                     'ltm_gross': analytics.get('ltm_gross_total_fmt', '0'),
                     'ltm_net': analytics.get('ltm_net_total_fmt', '0'),
                 }
+                # Include audit trail in deal metadata
+                if audit_trail:
+                    deal_meta['audit_trail'] = audit_trail
+                    deal_meta['audit_summary'] = analytics.get('audit_summary', {})
                 with open(os.path.join(deal_dir, 'deal_meta.json'), 'w') as f:
                     json.dump(deal_meta, f, indent=2)
                 with open(os.path.join(deal_dir, 'analytics.json'), 'w') as f:
