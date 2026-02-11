@@ -1432,30 +1432,48 @@ function syncFormulas() {
 </form>
 
 <div class="card" style="margin-bottom:16px; max-width:600px;">
-    <div class="card-header"><span class="card-title">API Configuration</span></div>
+    <div class="card-header"><span class="card-title">Enrichment Sources</span></div>
     <form method="POST" action="/custom/enrich">
         <input type="hidden" name="action" value="enrich">
 
-        <div class="form-group">
-            <label class="form-label">MusicBrainz</label>
-            <div style="font-size:12px; color:var(--green); padding:8px 12px; background:var(--green-dim); border-radius:6px;">
-                Always enabled (no API key needed, 1 req/sec)
-            </div>
+        <div style="display:flex; flex-direction:column; gap:12px;">
+            <label style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--bg-secondary); border-radius:6px; cursor:pointer;">
+                <input type="checkbox" name="use_musicbrainz" value="1" checked disabled style="width:16px; height:16px; accent-color:var(--green);">
+                <div>
+                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);">MusicBrainz</div>
+                    <div style="font-size:11px; color:var(--text-dim);">Always enabled — free, no API key needed (1 req/sec)</div>
+                </div>
+                <span style="margin-left:auto; font-size:10px; padding:2px 8px; border-radius:4px; background:var(--green-dim); color:var(--green);">TIER 1</span>
+            </label>
+
+            <label style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--bg-secondary); border-radius:6px; cursor:pointer; opacity:{{ '1' if genius_available else '0.5' }};">
+                <input type="checkbox" name="use_genius" value="1" {{ 'checked' if genius_available else 'disabled' }} style="width:16px; height:16px; accent-color:var(--green);">
+                <div>
+                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);">Genius</div>
+                    <div style="font-size:11px; color:var(--text-dim);">Fuzzy title + artist search for tracks not found on MusicBrainz</div>
+                </div>
+                {% if genius_available %}
+                <span style="margin-left:auto; font-size:10px; padding:2px 8px; border-radius:4px; background:var(--green-dim); color:var(--green);">TIER 2</span>
+                {% else %}
+                <span style="margin-left:auto; font-size:10px; padding:2px 8px; border-radius:4px; background:rgba(255,255,255,0.05); color:var(--text-dim);">NO KEY</span>
+                {% endif %}
+            </label>
+
+            <label style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--bg-secondary); border-radius:6px; cursor:pointer; opacity:{{ '1' if gemini_available else '0.5' }};">
+                <input type="checkbox" name="use_gemini" value="1" {{ 'checked' if gemini_available else 'disabled' }} style="width:16px; height:16px; accent-color:var(--green);">
+                <div>
+                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);">Google Search</div>
+                    <div style="font-size:11px; color:var(--text-dim);">AI-powered batch lookup for remaining tracks — results flagged for verification</div>
+                </div>
+                {% if gemini_available %}
+                <span style="margin-left:auto; font-size:10px; padding:2px 8px; border-radius:4px; background:var(--green-dim); color:var(--green);">TIER 3</span>
+                {% else %}
+                <span style="margin-left:auto; font-size:10px; padding:2px 8px; border-radius:4px; background:rgba(255,255,255,0.05); color:var(--text-dim);">NO KEY</span>
+                {% endif %}
+            </label>
         </div>
 
-        <div class="form-group">
-            <label class="form-label">Genius API Token</label>
-            <input class="form-input" type="text" name="genius_token" value="{{ genius_token | default('') }}"
-                   placeholder="Paste your Genius API token (optional)">
-            <div style="font-size:11px; color:var(--text-dim); margin-top:4px;">Tier 2: Searches Genius for tracks not found on MusicBrainz</div>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label">Gemini API Key</label>
-            <input class="form-input" type="text" name="gemini_key" value="{{ gemini_key | default('') }}"
-                   placeholder="Paste your Gemini API key (optional)">
-            <div style="font-size:11px; color:var(--text-dim); margin-top:4px;">Tier 3: AI batch lookup for remaining tracks (results flagged for verification)</div>
-        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:12px;">API keys are configured in the server .env file. Contact your admin to add or change keys.</div>
 
         <button type="submit" class="btn-submit" style="margin-top:20px;">Run Enrichment</button>
     </form>
@@ -4764,14 +4782,14 @@ def custom_map(payor_idx, struct_idx):
 
         sess.setdefault('column_mappings', {})[payor['code']] = file_mappings
 
+        # --- Audit Trail: capture proposals BEFORE saving to DB ---
+        proposed = mapper.propose_mapping(headers)
+
         # Persist fingerprint mapping to DB so future runs can Quick Ingest
         if current_struct:
             fingerprint = current_struct['fingerprint']
             mapper.save_mapping(fingerprint, headers, col_mapping, source_label=payor['name'])
             mapper.save_synonyms(col_mapping)
-
-        # --- Audit Trail: compare user selections vs auto-proposals ---
-        proposed = mapper.propose_mapping(headers)
         audit_columns = []
         for col in headers:
             prop = proposed.get(col, {})
@@ -5059,9 +5077,14 @@ def custom_enrich():
             return redirect(url_for('custom_export'))
 
         if action == 'enrich':
-            # Start enrichment in background
-            genius_token = request.form.get('genius_token', '').strip()
-            gemini_key = request.form.get('gemini_key', '').strip()
+            # Start enrichment in background — keys from env/session, toggles from form
+            genius_token = sess.get('genius_token') or os.getenv('GENIUS_TOKEN', '')
+            gemini_key = sess.get('gemini_key') or os.getenv('GEMINI_API_KEY', '')
+            # Respect user's toggle choices
+            if not request.form.get('use_genius'):
+                genius_token = ''
+            if not request.form.get('use_gemini'):
+                gemini_key = ''
             sess['genius_token'] = genius_token
             sess['gemini_key'] = gemini_key
 
@@ -5138,7 +5161,7 @@ def custom_enrich():
     enrichment_running = enrich_status.get('running', False)
     enrichment_done = enrich_status.get('done', False)
 
-    # Pre-populate API keys from env
+    # Check API key availability (don't expose actual keys to template)
     genius_token = sess.get('genius_token') or os.getenv('GENIUS_TOKEN', '')
     gemini_key = sess.get('gemini_key') or os.getenv('GEMINI_API_KEY', '')
 
@@ -5149,8 +5172,8 @@ def custom_enrich():
         'enrichment_done': enrichment_done,
         'enrichment_stats': enrich_result.get('stats', {}) if enrich_result else {},
         'enrichment_no_dates': enrich_result.get('tracks_without_dates', []) if enrich_result else [],
-        'genius_token': genius_token,
-        'gemini_key': gemini_key,
+        'genius_available': bool(genius_token),
+        'gemini_available': bool(gemini_key),
         'results': None, 'payor_names': [], 'payor_codes': [], 'default_payors': [],
         'deal_name': sess.get('deal_name', ''),
     }
