@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.db
+*.json
+*.html
+_test_*
+test_*
+compare_*
+verify_*
+read_model*
+*.bat
+demo_data
+deals
+_debug_page.html
+nul
+.env

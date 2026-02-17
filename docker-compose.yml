@@ -1,0 +1,17 @@
+services:
+  royalty-consolidator:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GENIUS_TOKEN=${GENIUS_TOKEN:-}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-}
+    volumes:
+      - ./deals:/app/deals
+      - tmp_data:/tmp/royalty_consolidator
+
+volumes:
+  tmp_data:

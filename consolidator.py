@@ -282,10 +282,10 @@ COLUMN_PATTERNS = {
     'download_type': ['download type', 'usage type', 'transaction type',
                       'content type', 'sale type', 'revenue type', 'type'],
     'gross': ['gross', 'ppu total', 'revenue', 'earning gross', 'total revenue',
-              'gross revenue', 'earnings', 'amount', 'total amount',
+              'gross revenue', 'amount', 'total amount',
               'earning_gross', 'price', 'retail'],
-    'net': ['net', 'royalty', 'earning net', 'payout', 'net revenue', 'your share',
-            'payable', 'earning_net', 'net amount', 'royalties'],
+    'net': ['net', 'royalty', 'earning net', 'earnings', 'payout', 'net revenue',
+            'your share', 'payable', 'earning_net', 'net amount', 'royalties'],
     'fees': ['fee', 'commission', 'distribution fee', 'service fee', 'deduction'],
     'period': ['period', 'reporting period', 'statement period', 'statement date',
                'sale period', 'accounting period', 'royalty period', 'month'],
@@ -333,8 +333,15 @@ def _fuzzy_match_columns(df_columns):
                 if low.endswith('%') or low.endswith('pct') or low.endswith('percent')
                 or 'royalty%' in low or 'royalty %' in low}
 
-    # Sort patterns so more specific matches come first
+    # Disqualifiers: prevent cross-matching ambiguous terms like "earnings"
+    # e.g. "Net Earnings" should not match gross, "Gross Revenue" should not match net
+    field_disqualifiers = {
+        'gross': ('net',),
+        'net': ('gross',),
+    }
+
     for field, patterns in COLUMN_PATTERNS.items():
+        disqualifiers = field_disqualifiers.get(field, ())
         for pattern in patterns:
             for orig, low in lower_cols.items():
                 if orig in used:
@@ -343,6 +350,9 @@ def _fuzzy_match_columns(df_columns):
                 if field in ('gross', 'net') and orig in pct_cols:
                     continue
                 if pattern == low or pattern in low:
+                    # Skip if column contains a disqualifier word for this field
+                    if disqualifiers and any(dq in low for dq in disqualifiers):
+                        continue
                     mapped[field] = orig
                     used.add(orig)
                     break
@@ -1160,6 +1170,22 @@ def aggregate_detail(df: pd.DataFrame, group_by_cols: List[str]) -> pd.DataFrame
     return grouped
 
 
+EXCEL_MAX_ROWS = 1_048_575  # 1,048,576 minus 1 for header row
+
+
+def _write_df_to_excel(writer, df, sheet_name):
+    """Write a DataFrame to Excel, splitting across numbered sheets if it exceeds the row limit."""
+    if len(df) <= EXCEL_MAX_ROWS:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        part = 1
+        for start in range(0, len(df), EXCEL_MAX_ROWS):
+            chunk = df.iloc[start:start + EXCEL_MAX_ROWS]
+            sname = f'{sheet_name}_{part}' if part > 1 else sheet_name
+            chunk.to_excel(writer, sheet_name=sname[:31], index=False)
+            part += 1
+
+
 def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                              aggregate_by: Optional[List[str]] = None):
@@ -1245,8 +1271,8 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     print(f"  MusicBrainz lookup complete: {found}/{len(all_isrcs)} ISRCs matched.", flush=True)
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        combined_clean.to_excel(writer, sheet_name='Consolidated', index=False)
-        combined_summary.to_excel(writer, sheet_name='By ISRC-Month', index=False)
+        _write_df_to_excel(writer, combined_clean, 'Consolidated')
+        _write_df_to_excel(writer, combined_summary, 'By ISRC-Month')
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
 
         # Per-payor distributor breakdown
@@ -1334,8 +1360,8 @@ def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: s
         })
 
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
-            clean.to_excel(writer, sheet_name='Detail', index=False)
-            summary.to_excel(writer, sheet_name='By ISRC-Month', index=False)
+            _write_df_to_excel(writer, clean, 'Detail')
+            _write_df_to_excel(writer, summary, 'By ISRC-Month')
             monthly_totals.to_excel(writer, sheet_name='Monthly Totals', index=False)
             pr.by_distributor.to_excel(writer, sheet_name='Distributors', index=False)
 

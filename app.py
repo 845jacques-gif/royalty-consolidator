@@ -384,19 +384,34 @@ def load_deal(slug):
             fpath = os.path.join(exports_dir, fname)
             if not os.path.isfile(fpath):
                 continue
-            if fname.endswith('_consolidated.xlsx') or fname == 'consolidated.xlsx':
+            fl = fname.lower()
+            if fl.endswith('.xlsx') and ('consolidated' in fl or fl.startswith('consolidated')):
                 xlsx_path = fpath
-            elif fname.endswith('_consolidated.csv') or fname == 'consolidated.csv':
+            elif fl.endswith('.csv') and ('consolidated' in fl or fl.startswith('consolidated')):
                 csv_path = fpath
 
     per_payor_paths = {}
-    pp_dir = os.path.join(exports_dir, 'per_payor')
-    if os.path.isdir(pp_dir):
+    # Scan per_payor/ and per_payor_csv/ subdirs, plus exports/ root for per-payor files
+    pp_search_dirs = [
+        os.path.join(exports_dir, 'per_payor'),
+        os.path.join(exports_dir, 'per_payor_csv'),
+        exports_dir,
+    ]
+    for pp_dir in pp_search_dirs:
+        if not os.path.isdir(pp_dir):
+            continue
         for fname in os.listdir(pp_dir):
-            # Extract payor code from filename pattern: Name_Fee%_consolidated.xlsx
+            fpath = os.path.join(pp_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
             for code in payor_results.keys():
+                if code in per_payor_paths:
+                    continue
                 if code in fname or fname.startswith(payor_results[code].config.name.replace(' ', '_')):
-                    per_payor_paths[code] = os.path.join(pp_dir, fname)
+                    # Skip the main consolidated file
+                    if fpath == xlsx_path or fpath == csv_path:
+                        continue
+                    per_payor_paths[code] = fpath
                     break
 
     return meta['name'], payor_results, analytics, xlsx_path, csv_path, per_payor_paths
@@ -1379,11 +1394,12 @@ function syncFormulas() {
 </form>
 
 {% elif enrichment_running %}
-{# --- Enrichment in progress: poll --- #}
+{# --- Enrichment in progress: poll with ETA countdown --- #}
 <div class="card" style="text-align:center; padding:40px;">
     <div class="loading-ring" style="margin:0 auto 16px;"></div>
     <div id="enrichProgress" style="font-size:14px; color:var(--text-primary); font-weight:600;">Starting enrichment...</div>
     <div id="enrichDetail" style="font-size:12px; color:var(--text-muted); margin-top:8px;"></div>
+    <div id="enrichEta" style="font-size:13px; color:var(--accent); margin-top:10px; font-weight:600; font-variant-numeric:tabular-nums;"></div>
     <div style="margin-top:16px; background:var(--bg-inset); border-radius:8px; height:8px; overflow:hidden;">
         <div id="enrichBar" style="height:100%; background:var(--accent); border-radius:8px; width:0%; transition:width 0.5s;"></div>
     </div>
@@ -1391,6 +1407,28 @@ function syncFormulas() {
 
 <script>
 (function() {
+    let etaSeconds = 0;
+    let etaTimer = null;
+
+    function formatEta(s) {
+        if (s <= 0) return '';
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        if (m > 0) return 'Est. ' + m + ':' + String(sec).padStart(2, '0') + ' remaining';
+        return 'Est. ' + sec + 's remaining';
+    }
+
+    function tickEta() {
+        if (etaSeconds > 0) {
+            etaSeconds--;
+            document.getElementById('enrichEta').textContent = formatEta(etaSeconds);
+        } else {
+            document.getElementById('enrichEta').textContent = '';
+        }
+    }
+
+    etaTimer = setInterval(tickEta, 1000);
+
     const interval = setInterval(function() {
         fetch('/api/enrichment-status')
             .then(r => r.json())
@@ -1401,12 +1439,21 @@ function syncFormulas() {
                     const pct = Math.round(data.current / data.total * 100);
                     document.getElementById('enrichBar').style.width = pct + '%';
                 }
+                // Update ETA from server (more accurate than local countdown)
+                if (typeof data.eta_seconds === 'number') {
+                    etaSeconds = data.eta_seconds;
+                    document.getElementById('enrichEta').textContent = formatEta(etaSeconds);
+                }
                 if (data.done) {
                     clearInterval(interval);
-                    window.location.reload();
+                    clearInterval(etaTimer);
+                    document.getElementById('enrichEta').textContent = '';
+                    window.location.href = '/custom/enrich';
                 }
                 if (data.error) {
                     clearInterval(interval);
+                    clearInterval(etaTimer);
+                    document.getElementById('enrichEta').textContent = '';
                     document.getElementById('enrichProgress').textContent = 'Error: ' + data.error;
                     document.getElementById('enrichProgress').style.color = 'var(--red)';
                 }
@@ -1547,7 +1594,7 @@ function syncFormulas() {
             </div>
         </div>
 
-        <button type="submit" class="btn-submit" style="margin-top:20px;">Finalize &amp; Generate &rarr;</button>
+        <button type="submit" class="btn-submit" style="margin-top:20px;" onclick="showLoading()">Finalize &amp; Generate &rarr;</button>
     </form>
 </div>
 
@@ -1851,6 +1898,7 @@ function syncFormulas() {
 </div>
 
 {# ---- Ingest file upload card + saved formats ---- #}
+{% if not demo_autofill|default(false) %}
 <div class="grid grid-2" style="margin-bottom:24px;">
     <div class="card">
         <div class="card-header"><span class="card-title">Ingest Statement</span></div>
@@ -1908,6 +1956,7 @@ function syncFormulas() {
         </tbody>
     </table>
 </div>
+{% endif %}
 {% endif %}
 
 {# ---- Quick-run card ---- #}
@@ -2446,29 +2495,55 @@ function handleFormSubmit() {
         }
     });
 
-    // If no uploaded files (user may be using local dirs), submit directly
-    if (allFiles.length === 0) {
+    // Also collect local directory paths
+    const localDirs = [];
+    document.querySelectorAll('input[name^="payor_dir_"]').forEach(inp => {
+        if (inp.value.trim()) localDirs.push(inp.value.trim());
+    });
+
+    if (allFiles.length === 0 && localDirs.length === 0) {
         document.getElementById('uploadForm').submit();
         return;
     }
 
-    _pendingFilenames = allFiles;
+    // If we have uploaded files, use those directly
+    if (allFiles.length > 0) {
+        _pendingFilenames = allFiles;
+        _fetchDatesAndShowModal(allFiles);
+        return;
+    }
 
-    // Call API to extract dates
+    // For local dirs, first list the files via API, then show date modal
+    fetch('/api/list-dir-files', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({dirs: localDirs}),
+    })
+    .then(r => r.json())
+    .then(data => {
+        const dirFiles = data.files || [];
+        if (dirFiles.length === 0) {
+            _submitViaFetch();
+            return;
+        }
+        _pendingFilenames = dirFiles;
+        _fetchDatesAndShowModal(dirFiles);
+    })
+    .catch(() => { _submitViaFetch(); });
+}
+
+function _fetchDatesAndShowModal(filenames) {
     fetch('/api/extract-dates', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({filenames: allFiles}),
+        body: JSON.stringify({filenames: filenames}),
     })
     .then(r => r.json())
     .then(data => {
         _dateMap = data.dates || {};
         showDateModal();
     })
-    .catch(() => {
-        // On error, submit without dates
-        _submitViaFetch();
-    });
+    .catch(() => { _submitViaFetch(); });
 }
 
 function showDateModal() {
@@ -2580,6 +2655,45 @@ function _submitViaFetch() {
     });
 }
 </script>
+
+{% if demo_autofill|default(false) %}
+<script>
+(function() {
+    const B = '{{ demo_data_dir }}';
+    document.querySelector('input[name="deal_name"]').value = 'Demo Catalog';
+    document.querySelector('input[name="payor_code_0"]').value = 'B1';
+    document.querySelector('input[name="payor_name_0"]').value = 'Believe Digital';
+    document.querySelector('select[name="payor_stype_0"]').value = 'masters';
+    document.querySelector('input[name="payor_dir_0"]').value = B + '\\\\statements_B1';
+    for (let i = 0; i < 3; i++) addPayor();
+    setTimeout(function() {
+        document.querySelector('input[name="payor_code_1"]').value = 'FUGA';
+        document.querySelector('input[name="payor_name_1"]').value = 'FUGA';
+        document.querySelector('select[name="payor_stype_1"]').value = 'masters';
+        document.querySelector('input[name="payor_dir_1"]').value = B + '\\\\statements_FUGA';
+        document.querySelector('input[name="payor_code_2"]').value = 'ST';
+        document.querySelector('input[name="payor_name_2"]').value = 'Songtrust';
+        document.querySelector('select[name="payor_stype_2"]').value = 'publishing';
+        document.querySelector('input[name="payor_dir_2"]').value = B + '\\\\statements_ST';
+        document.querySelector('input[name="payor_code_3"]').value = 'EMP';
+        document.querySelector('input[name="payor_name_3"]').value = 'Empire';
+        document.querySelector('select[name="payor_stype_3"]').value = 'masters';
+        document.querySelector('input[name="payor_dir_3"]').value = B + '\\\\statements_EMP';
+
+        // Statement coverage periods
+        var el;
+        el = document.querySelector('input[name="payor_period_start_0"]'); if(el) el.value = '202501';
+        el = document.querySelector('input[name="payor_period_end_0"]');   if(el) el.value = '202503';
+        el = document.querySelector('input[name="payor_period_start_1"]'); if(el) el.value = '202501';
+        el = document.querySelector('input[name="payor_period_end_1"]');   if(el) el.value = '202502';
+        el = document.querySelector('input[name="payor_period_start_2"]'); if(el) el.value = '202501';
+        el = document.querySelector('input[name="payor_period_end_2"]');   if(el) el.value = '202502';
+        el = document.querySelector('input[name="payor_period_start_3"]'); if(el) el.value = '202501';
+        el = document.querySelector('input[name="payor_period_end_3"]');   if(el) el.value = '202501';
+    }, 300);
+})();
+</script>
+{% endif %}
 
 {% endif %}
 
@@ -4172,6 +4286,10 @@ def upload_page():
     formats = mapper.get_saved_formats()
     with _state_lock:
         deal_name_copy = _cached_deal_name
+    demo_autofill = request.args.get('demo') == '1'
+    if demo_autofill:
+        # Clear saved fingerprints so Preview+Map steps are shown
+        mapper.clear_all_fingerprints()
     return render_template_string(
         DASHBOARD_HTML,
         page='upload',
@@ -4183,6 +4301,8 @@ def upload_page():
         deal_name=deal_name_copy,
         import_history=history,
         saved_formats=formats,
+        demo_autofill=demo_autofill,
+        demo_data_dir=DEMO_DATA_DIR.replace(chr(92), chr(92)*2) if demo_autofill else '',
     )
 
 
@@ -4345,7 +4465,17 @@ def run_custom():
 CUSTOM_TEMP = os.path.join(tempfile.gettempdir(), 'royalty_consolidator', 'custom_flow')
 os.makedirs(CUSTOM_TEMP, exist_ok=True)
 
+DEMO_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'demo_data')
+
 _SUPPORTED_EXT = ('.csv', '.xlsx', '.xls')
+
+
+@app.route('/demo')
+def demo_shortcut():
+    """One-click demo: redirect to upload page with demo data pre-filled."""
+    global _cached_deal_name
+    _cached_deal_name = 'Demo Catalog'
+    return redirect(url_for('upload_page', demo='1'))
 
 
 def _find_first_file(directory):
@@ -4892,40 +5022,40 @@ def custom_map(payor_idx, struct_idx):
 @app.route('/custom/process', methods=['GET', 'POST'])
 def custom_process():
     """Phase 2: Parse all files with user mappings, then redirect to validation."""
-    sess, sid = _get_custom_session()
-    payors = sess.get('payors', [])
-    file_dates = sess.get('file_dates', {})
-    column_mappings_by_payor = sess.get('column_mappings', {})
-
-    # Build PayorConfig objects
-    configs = []
-    for p in payors:
-        payor_dir = p['payor_dir']
-        local_dir = p.get('local_dir', '')
-        statements_dir = payor_dir if os.path.isdir(payor_dir) and os.listdir(payor_dir) else local_dir
-
-        if not statements_dir or not os.path.isdir(statements_dir):
-            continue
-
-        cfg = PayorConfig(
-            code=p['code'],
-            name=p['name'],
-            statements_dir=statements_dir,
-            fmt=p['fmt'],
-            fee=p['fee'],
-            fx_currency=p['fx_currency'],
-            fx_rate=p['fx_rate'],
-            statement_type=p['statement_type'],
-            artist_split=p.get('artist_split'),
-            territory=p.get('territory'),
-        )
-        configs.append(cfg)
-
-    if not configs:
-        flash('No valid payor configurations.', 'error')
-        return redirect(url_for('upload_page'))
-
     try:
+        sess, sid = _get_custom_session()
+        payors = sess.get('payors', [])
+        file_dates = sess.get('file_dates', {})
+        column_mappings_by_payor = sess.get('column_mappings', {})
+
+        # Build PayorConfig objects
+        configs = []
+        for p in payors:
+            payor_dir = p['payor_dir']
+            local_dir = p.get('local_dir', '')
+            statements_dir = payor_dir if os.path.isdir(payor_dir) and os.listdir(payor_dir) else local_dir
+
+            if not statements_dir or not os.path.isdir(statements_dir):
+                continue
+
+            cfg = PayorConfig(
+                code=p['code'],
+                name=p['name'],
+                statements_dir=statements_dir,
+                fmt=p['fmt'],
+                fee=p['fee'],
+                fx_currency=p['fx_currency'],
+                fx_rate=p['fx_rate'],
+                statement_type=p['statement_type'],
+                artist_split=p.get('artist_split'),
+                territory=p.get('territory'),
+            )
+            configs.append(cfg)
+
+        if not configs:
+            flash('No valid payor configurations.', 'error')
+            return redirect(url_for('upload_page'))
+
         payor_results = load_all_payors(
             configs,
             file_dates=file_dates,
@@ -4948,8 +5078,8 @@ def custom_process():
         sess['all_file_paths'] = all_file_paths
 
     except Exception as e:
-        flash(f'Error processing files: {str(e)}', 'error')
         traceback.print_exc()
+        flash(f'Error processing files: {str(e)}', 'error')
         return redirect(url_for('upload_page'))
 
     return redirect(url_for('custom_validate'))
@@ -5077,6 +5207,13 @@ def custom_enrich():
             return redirect(url_for('custom_export'))
 
         if action == 'enrich':
+            # Guard: don't restart if already running or done
+            existing_status = sess.get('enrichment_status', {})
+            if existing_status.get('running'):
+                return redirect(url_for('custom_enrich'))
+            if existing_status.get('done'):
+                return redirect(url_for('custom_enrich'))
+
             # Start enrichment in background — keys from env/session, toggles from form
             genius_token = sess.get('genius_token') or os.getenv('GENIUS_TOKEN', '')
             gemini_key = sess.get('gemini_key') or os.getenv('GEMINI_API_KEY', '')
@@ -5102,16 +5239,43 @@ def custom_enrich():
 
             combined_detail = pd.concat(all_details, ignore_index=True)
 
+            # Count unique ISRCs for ETA estimate (~1.5s per track for MusicBrainz)
+            unique_isrcs = set()
+            for _, row in combined_detail.iterrows():
+                isrc = str(row.get('ISRC', '')).strip()
+                title = str(row.get('Title', '')).strip()
+                artist = str(row.get('Artist', '')).strip()
+                if isrc and isrc not in ('', 'nan', 'None'):
+                    unique_isrcs.add(isrc.upper())
+                elif title and artist:
+                    unique_isrcs.add(f"{title}::{artist}")
+            estimated_seconds = int(len(unique_isrcs) * 1.5)
+
             # Initialize enrichment status
             sess['enrichment_status'] = {
                 'running': True, 'done': False, 'error': None,
                 'phase': 'starting', 'current': 0, 'total': 0, 'message': 'Starting...',
+                'eta_seconds': estimated_seconds, 'need_lookup': len(unique_isrcs),
             }
 
             def _enrichment_thread():
                 try:
                     def _progress(info):
                         sess['enrichment_status'].update(info)
+                        # Update need_lookup when enrichment engine reports actual count after cache check
+                        if 'need_lookup' in info:
+                            sess['enrichment_status']['need_lookup'] = info['need_lookup']
+                            sess['enrichment_status']['eta_seconds'] = int(info['need_lookup'] * 1.5)
+                        # Compute live ETA from elapsed time and processed count
+                        elapsed = info.get('elapsed', 0)
+                        processed = info.get('processed_count', 0)
+                        need = sess['enrichment_status'].get('need_lookup', 0)
+                        if processed > 0 and need > 0:
+                            rate = elapsed / processed
+                            remaining = max(0, int(rate * (need - processed)))
+                            sess['enrichment_status']['eta_seconds'] = remaining
+                        elif info.get('phase') == 'done':
+                            sess['enrichment_status']['eta_seconds'] = 0
 
                     result = enrichment.enrich_release_dates(
                         combined_detail,
@@ -5129,6 +5293,7 @@ def custom_enrich():
                         'phase': 'done', 'current': result.stats.get('total', 0),
                         'total': result.stats.get('total', 0),
                         'message': 'Enrichment complete!',
+                        'eta_seconds': 0,
                     }
                 except Exception as e:
                     import traceback
@@ -5252,6 +5417,8 @@ def api_enrichment_status():
         'current': status.get('current', 0),
         'total': status.get('total', 0),
         'message': status.get('message', ''),
+        'eta_seconds': status.get('eta_seconds', 0),
+        'need_lookup': status.get('need_lookup', 0),
     })
 
 
@@ -5438,7 +5605,18 @@ def custom_finalize():
     # Clean up session
     _clear_custom_session()
 
-    return redirect(url_for('index'))
+    # Render a processing page with loading overlay (instead of redirect)
+    # This ensures the user sees the spinner and polls for completion.
+    return render_template_string(
+        DASHBOARD_HTML,
+        page='dashboard',
+        results=None,
+        payor_names=[],
+        payor_codes=[],
+        default_payors=[],
+        deal_name=deal_name,
+        processing={'running': True, 'progress': 'Finalizing...', 'done': False, 'error': None},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5591,6 +5769,25 @@ def api_status():
     """Return background processing status as JSON."""
     with _state_lock:
         return jsonify(dict(_processing_status))
+
+
+@app.route('/api/list-dir-files', methods=['POST'])
+def api_list_dir_files():
+    """List statement files from local directory paths.
+    POST JSON: {dirs: [str, ...]}
+    Returns JSON: {files: [filename, ...]}
+    """
+    data = request.get_json(silent=True) or {}
+    dirs = data.get('dirs', [])
+    files = []
+    for d in dirs:
+        if d and os.path.isdir(d):
+            for root, _, fnames in os.walk(d):
+                for fn in sorted(fnames):
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in ('.csv', '.xlsx', '.xls') and not fn.startswith('~$'):
+                        files.append(fn)
+    return jsonify({'files': files})
 
 
 @app.route('/api/extract-dates', methods=['POST'])
