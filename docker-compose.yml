@@ -1,8 +1,9 @@
 services:
   royalty-consolidator:
+    image: 845jacques/royalty-consolidator:latest
     build: .
-    ports:
-      - "5000:5000"
+    expose:
+      - "5000"
     env_file:
       - .env
     environment:
@@ -12,6 +13,24 @@ services:
     volumes:
       - ./deals:/app/deals
       - tmp_data:/tmp/royalty_consolidator
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - royalty-consolidator
+    restart: unless-stopped
 
 volumes:
   tmp_data:
+  caddy_data:
+  caddy_config:
