@@ -18,8 +18,11 @@ from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+import logging
 import pandas as pd
 import openpyxl
+
+log = logging.getLogger('royalty')
 
 try:
     import pdfplumber
@@ -132,7 +135,8 @@ def lookup_isrcs_batch(isrcs: List[str], progress_callback=None) -> Dict[str, di
 
     # Report ISRCs without release dates
     if not_found:
-        print(f"  [MusicBrainz] {len(not_found)} ISRCs missing release dates: {', '.join(not_found[:10])}{'...' if len(not_found) > 10 else ''}", flush=True)
+        log.warning("[MusicBrainz] %d ISRCs missing release dates: %s", len(not_found),
+                    ', '.join(not_found[:10]) + ('...' if len(not_found) > 10 else ''))
 
     return results
 
@@ -452,7 +456,7 @@ def _read_raw_dataframe(filepath, filename):
 
     elif ext == '.pdf':
         if not HAS_PDF:
-            print(f"    WARNING: pdfplumber not installed, skipping {filename}", flush=True)
+            log.warning("pdfplumber not installed, skipping %s", filename)
             return None
         frames = []
         with pdfplumber.open(filepath) as pdf:
@@ -490,8 +494,7 @@ def parse_file_universal(filepath, filename, fmt='auto', fallback_period=None):
 
     if 'identifier' not in col_map and 'gross' not in col_map:
         cols_found = list(df.columns)
-        print(f"    WARNING: Could not detect columns in {filename}. "
-              f"Found: {cols_found[:15]}", flush=True)
+        log.warning("Could not detect columns in %s. Found: %s", filename, cols_found[:15])
         return None, None
 
     # Derive period
@@ -549,7 +552,7 @@ def parse_file_universal(filepath, filename, fmt='auto', fallback_period=None):
         if period is None and fallback_period:
             period = fallback_period
         if period is None:
-            print(f"    WARNING: No period found for {filename}, skipping.", flush=True)
+            log.warning("No period found for %s, skipping", filename)
             return None
         df['_period'] = period
 
@@ -718,7 +721,7 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
         if period is None and fallback_period:
             period = fallback_period
         if period is None:
-            print(f"    WARNING: No period found for {filename}, skipping.", flush=True)
+            log.warning("No period found for %s, skipping", filename)
             return None, None
         period_col = pd.Series([period] * n)
 
@@ -786,7 +789,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     column_mappings: optional {filename: {mapping_dict, remove_top, remove_bottom, header_row, sheet, keep_columns}}
                      When provided for a file, uses parse_file_with_mapping() instead of parse_file_universal().
     """
-    print(f"\n  [{config.code}] Loading {config.name} from: {config.statements_dir}", flush=True)
+    log.info("[%s] Loading %s from: %s", config.code, config.name, config.statements_dir)
 
     chunks = []
     detail_chunks = []
@@ -855,7 +858,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                     'status': 'skipped',
                     'gross': 0,
                 })
-                print(f"    WARNING: Could not parse {f}, skipping.", flush=True)
+                log.warning("Could not parse %s, skipping", f)
                 continue
 
             if file_currency and file_currency != 'Unknown':
@@ -909,7 +912,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 'gross': round(file_gross, 2),
             })
 
-            print(f"    {f} ({len(df):,} rows)", flush=True)
+            log.info("  %s (%s rows)", f, f"{len(df):,}")
 
             # Ensure new columns exist with defaults
             for col in ['iswc', 'upc', 'other_identifier', 'country', 'release_date']:
@@ -970,10 +973,10 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             del df
 
     if not chunks:
-        print(f"    No files found for {config.name}.", flush=True)
+        log.warning("No files found for %s", config.name)
         return None
 
-    print(f"    Aggregating {file_count} files...", flush=True)
+    log.info("Aggregating %d files...", file_count)
 
     # Combine and re-aggregate across files
     monthly = pd.concat(chunks, ignore_index=True)
@@ -1033,9 +1036,9 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     isrc_meta = isrc_meta.sort_values('total_gross', ascending=False).reset_index(drop=True)
 
     currency_str = ', '.join(sorted(currencies_seen)) if currencies_seen else config.fx_currency
-    print(f"    {config.name}: {file_count} files, {len(isrc_meta):,} ISRCs, "
-          f"${isrc_meta['total_gross'].sum():,.2f} total gross, "
-          f"currency: {currency_str}", flush=True)
+    log.info("%s: %d files, %s ISRCs, $%s total gross, currency: %s",
+             config.name, file_count, f"{len(isrc_meta):,}",
+             f"{isrc_meta['total_gross'].sum():,.2f}", currency_str)
 
     return PayorResult(
         config=config,
@@ -1190,7 +1193,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                              aggregate_by: Optional[List[str]] = None):
     """Write a single consolidated Excel with data from all payors (23+ column schema)."""
-    print(f"\n  Writing consolidated data to: {output_path}", flush=True)
+    log.info("Writing consolidated data to: %s", output_path)
 
     all_clean = []
     all_summary = []
@@ -1265,10 +1268,10 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
 
     # MusicBrainz ISRC lookup for release dates (free, no credentials needed)
     all_isrcs = cross_payor['identifier'].unique().tolist()
-    print(f"  Looking up {len(all_isrcs)} ISRCs on MusicBrainz...", flush=True)
-    isrc_data = lookup_isrcs_batch(all_isrcs, progress_callback=lambda done, total: print(f"    {done}/{total} ISRCs looked up...", flush=True))
+    log.info("Looking up %d ISRCs on MusicBrainz...", len(all_isrcs))
+    isrc_data = lookup_isrcs_batch(all_isrcs, progress_callback=lambda done, total: log.info("  %d/%d ISRCs looked up...", done, total))
     found = sum(1 for v in isrc_data.values() if v.get('release_date'))
-    print(f"  MusicBrainz lookup complete: {found}/{len(all_isrcs)} ISRCs matched.", flush=True)
+    log.info("MusicBrainz lookup complete: %d/%d ISRCs matched", found, len(all_isrcs))
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         _write_df_to_excel(writer, combined_clean, 'Consolidated')
@@ -1293,7 +1296,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         catalog['Release Date'] = catalog['ISRC'].apply(lambda x: isrc_data.get(x, {}).get('release_date', ''))
         catalog.to_excel(writer, sheet_name='ISRC Catalog', index=False)
 
-    print(f"  Done. {len(combined_clean):,} rows in 'Consolidated'.", flush=True)
+    log.info("Done. %s rows in 'Consolidated'", f"{len(combined_clean):,}")
     return combined_clean
 
 
@@ -1301,7 +1304,7 @@ def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path,
                            deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                            aggregate_by: Optional[List[str]] = None):
     """Write consolidated detail as a single CSV file (23+ column schema)."""
-    print(f"\n  Writing consolidated CSV to: {output_path}", flush=True)
+    log.info("Writing consolidated CSV to: %s", output_path)
 
     all_clean = []
     for code, pr in payor_results.items():
@@ -1313,7 +1316,7 @@ def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path,
     if aggregate_by:
         combined = aggregate_detail(combined, aggregate_by)
     combined.to_csv(output_path, index=False)
-    print(f"  Done. {len(combined):,} rows.", flush=True)
+    log.info("Done. %s rows", f"{len(combined):,}")
     return combined
 
 
@@ -1326,7 +1329,7 @@ def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: s
     for code, pr in payor_results.items():
         safe_name = pr.config.name.replace(' ', '_').replace('/', '_')
         path = os.path.join(output_dir, f'{safe_name}_consolidated.xlsx')
-        print(f"  Writing {pr.config.name} -> {path}", flush=True)
+        log.info("Writing %s -> %s", pr.config.name, path)
 
         clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
         if aggregate_by:
@@ -1366,7 +1369,7 @@ def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: s
             pr.by_distributor.to_excel(writer, sheet_name='Distributors', index=False)
 
         paths[code] = path
-        print(f"  {pr.config.name}: {len(clean):,} rows.", flush=True)
+        log.info("%s: %s rows", pr.config.name, f"{len(clean):,}")
 
     return paths
 
@@ -1380,14 +1383,14 @@ def write_per_payor_csv_exports(payor_results: Dict[str, PayorResult], output_di
     for code, pr in payor_results.items():
         safe_name = pr.config.name.replace(' ', '_').replace('/', '_')
         path = os.path.join(output_dir, f'{safe_name}_consolidated.csv')
-        print(f"  Writing CSV {pr.config.name} -> {path}", flush=True)
+        log.info("Writing CSV %s -> %s", pr.config.name, path)
 
         clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
         if aggregate_by:
             clean = aggregate_detail(clean, aggregate_by)
         clean.to_csv(path, index=False)
         paths[code] = path
-        print(f"  {pr.config.name}: {len(clean):,} rows.", flush=True)
+        log.info("%s: %s rows", pr.config.name, f"{len(clean):,}")
 
     return paths
 

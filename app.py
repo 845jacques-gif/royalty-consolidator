@@ -4,16 +4,26 @@ Flask app with auto-consolidation from local dirs, polished dark UI, and Chart.j
 """
 
 import json
+import logging
 import os
 import pickle
 import re
 import shutil
 import tempfile
 import threading
-import traceback
 import uuid
 import zipfile
 from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+log = logging.getLogger('royalty')
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -42,6 +52,20 @@ import enrichment
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24).hex())
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
+
+def _log_memory():
+    """Log current memory usage (works on Linux/Docker and Windows)."""
+    try:
+        import resource
+        mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        log.info("Memory usage: %.0f MB", mb)
+    except ImportError:
+        try:
+            import psutil
+            mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            log.info("Memory usage: %.0f MB", mb)
+        except ImportError:
+            pass  # No memory info available
 
 WORK_DIR = os.path.join(tempfile.gettempdir(), 'royalty_consolidator', 'current')
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -354,8 +378,7 @@ def load_deal(slug):
                 with open(meta_path, 'w') as f:
                     json.dump(dmeta, f, indent=2)
         except Exception as e:
-            print(f"[load_deal] Failed to recompute analytics for {slug}: {e}")
-            traceback.print_exc()
+            log.error("load_deal: failed to recompute analytics for %s: %s", slug, e, exc_info=True)
 
     # Re-sort top_songs by LTM gross descending (older saves may be unsorted)
     if 'top_songs' in analytics:
@@ -4236,6 +4259,8 @@ def run_consolidation(payor_configs, output_dir=None, deal_name=None, file_dates
 def _run_in_background(payor_configs, output_dir=None, deal_name=None, file_dates=None):
     """Background worker for consolidation."""
     global _processing_status
+    log.info("Background consolidation started: %d payor(s), deal=%s", len(payor_configs), deal_name)
+    _log_memory()
     with _state_lock:
         _processing_status = {'running': True, 'progress': 'Loading payor data...', 'done': False, 'error': None}
     try:
@@ -4245,8 +4270,12 @@ def _run_in_background(payor_configs, output_dir=None, deal_name=None, file_date
             payor_configs, output_dir=output_dir, deal_name=deal_name, file_dates=file_dates)
         with _state_lock:
             if not payor_results:
+                log.warning("Background consolidation finished with no data")
                 _processing_status.update({'running': False, 'done': True, 'error': 'No data found.'})
             else:
+                log.info("Background consolidation done: %s files, %s ISRCs",
+                         analytics["total_files"], analytics["isrc_count"])
+                _log_memory()
                 _processing_status.update({
                     'running': False,
                     'progress': f'Done: {analytics["total_files"]} files, {analytics["isrc_count"]} ISRCs.',
@@ -4254,9 +4283,9 @@ def _run_in_background(payor_configs, output_dir=None, deal_name=None, file_date
                     'error': None,
                 })
     except Exception as e:
+        log.error("Background consolidation FAILED: %s", e, exc_info=True)
         with _state_lock:
             _processing_status.update({'running': False, 'done': True, 'error': str(e)})
-        traceback.print_exc()
 
 
 @app.route('/')
@@ -4452,8 +4481,8 @@ def run_custom():
         t.start()
 
     except Exception as e:
+        log.error("run_custom failed: %s", e, exc_info=True)
         flash(f'Error: {str(e)}', 'error')
-        traceback.print_exc()
 
     return redirect(url_for('index'))
 
@@ -4561,6 +4590,7 @@ def custom_upload():
     global _cached_deal_name
     try:
         _cached_deal_name = request.form.get('deal_name', '').strip()
+        log.info("custom_upload: deal='%s'", _cached_deal_name)
         sess, sid = _get_custom_session()
 
         work_dir = os.path.join(CUSTOM_TEMP, sid)
@@ -4657,8 +4687,8 @@ def custom_upload():
         return resp
 
     except Exception as e:
+        log.error("custom_upload failed: %s", e, exc_info=True)
         flash(f'Error: {str(e)}', 'error')
-        traceback.print_exc()
         return redirect(url_for('upload_page'))
 
 
@@ -5025,6 +5055,8 @@ def custom_process():
     try:
         sess, sid = _get_custom_session()
         payors = sess.get('payors', [])
+        log.info("custom_process: %d payor(s)", len(payors))
+        _log_memory()
         file_dates = sess.get('file_dates', {})
         column_mappings_by_payor = sess.get('column_mappings', {})
 
@@ -5078,7 +5110,7 @@ def custom_process():
         sess['all_file_paths'] = all_file_paths
 
     except Exception as e:
-        traceback.print_exc()
+        log.error("custom_process failed: %s", e, exc_info=True)
         flash(f'Error processing files: {str(e)}', 'error')
         return redirect(url_for('upload_page'))
 
@@ -5191,6 +5223,7 @@ def custom_calc():
 @app.route('/custom/enrich', methods=['GET', 'POST'])
 def custom_enrich():
     """Phase 3: Release date enrichment step."""
+    log.info("custom_enrich: method=%s", request.method)
     sess, sid = _get_custom_session()
     sess_data, _ = _get_ingest_session()
     payor_results = sess_data.get('_phase2_results', {})
@@ -5296,8 +5329,7 @@ def custom_enrich():
                         'eta_seconds': 0,
                     }
                 except Exception as e:
-                    import traceback
-                    traceback.print_exc()
+                    log.error("Enrichment thread failed: %s", e, exc_info=True)
                     sess['enrichment_status'] = {
                         'running': False, 'done': False, 'error': str(e),
                         'phase': 'error', 'current': 0, 'total': 0, 'message': str(e),
@@ -5426,6 +5458,7 @@ def api_enrichment_status():
 def custom_finalize():
     """Phase 2/3: Launch background consolidation thread with all mappings+formulas+enrichment."""
     global _cached_deal_name, _processing_status
+    log.info("custom_finalize: method=%s", request.method)
     sess, sid = _get_custom_session()
     sess_data, _ = _get_ingest_session()
     payor_results = sess_data.get('_phase2_results', {})
@@ -5595,7 +5628,7 @@ def custom_finalize():
                 _processing_status = {'running': False, 'progress': 'Done!', 'done': True, 'error': None}
 
         except Exception as e:
-            traceback.print_exc()
+            log.error("Finalize thread failed: %s", e, exc_info=True)
             with _state_lock:
                 _processing_status = {'running': False, 'progress': '', 'done': False, 'error': str(e)}
 
@@ -5712,8 +5745,8 @@ def refresh():
         else:
             flash('No data found.', 'error')
     except Exception as e:
+        log.error("Refresh failed: %s", e, exc_info=True)
         flash(f'Error: {str(e)}', 'error')
-        traceback.print_exc()
     return redirect(url_for('index'))
 
 
@@ -5846,8 +5879,8 @@ def load_deal_route(slug):
         app.config['PER_PAYOR_PATHS'] = per_payor_paths
         flash(f'Loaded deal "{deal_name}".', 'success')
     except Exception as e:
+        log.error("load_deal_route failed for %s: %s", slug, e, exc_info=True)
         flash(f'Error loading deal: {str(e)}', 'error')
-        traceback.print_exc()
         return redirect(url_for('deals_page'))
     return redirect(url_for('index'))
 
@@ -5908,13 +5941,14 @@ def edit_deal_route(slug):
             edit_analytics=analytics,
         )
     except Exception as e:
+        log.error("edit_deal GET failed for %s: %s", slug, e, exc_info=True)
         flash(f'Error loading deal for editing: {str(e)}', 'error')
-        traceback.print_exc()
         return redirect(url_for('deals_page'))
 
 
 @app.route('/deals/<slug>/edit', methods=['POST'])
 def edit_deal_post(slug):
+    log.info("edit_deal_post: slug=%s", slug)
     """Handle edit deal form submission."""
     global _cached_results, _cached_analytics, _cached_deal_name, _processing_status
     try:
@@ -6083,8 +6117,8 @@ def edit_deal_post(slug):
             return redirect(url_for('deals_page'))
 
     except Exception as e:
+        log.error("edit_deal POST failed for %s: %s", slug, e, exc_info=True)
         flash(f'Error editing deal: {str(e)}', 'error')
-        traceback.print_exc()
         return redirect(url_for('deals_page'))
 
 
@@ -6170,7 +6204,7 @@ def api_chat():
         return jsonify({'reply': reply, 'session_id': session_id})
 
     except Exception as e:
-        traceback.print_exc()
+        log.error("Chat API failed: %s", e, exc_info=True)
         error_msg = str(e)
         if 'API_KEY' in error_msg.upper() or 'AUTHENTICATION' in error_msg.upper():
             reply = 'Invalid Gemini API key. Please check your `.env` file and restart the app.'
@@ -6511,7 +6545,5 @@ def ingest_reset():
 
 
 if __name__ == '__main__':
-    print("\n  Royalty Consolidator")
-    print("  Open in your browser: http://localhost:5000")
-    print("  Press Ctrl+C to stop.\n")
+    log.info("Royalty Consolidator starting on http://localhost:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
