@@ -24,6 +24,15 @@ services:
       - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/app/gcs-credentials.json:ro
     restart: unless-stopped
 
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=300
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
     ports:
