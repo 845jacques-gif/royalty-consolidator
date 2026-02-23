@@ -60,14 +60,26 @@ The pre-built image is on Docker Hub: `845jacques/royalty-consolidator:latest`
 | `DOMAIN` | For production | Your domain (default: `localhost`) |
 | `GEMINI_API_KEY` | No | Enables AI-assisted column mapping |
 | `GENIUS_TOKEN` | No | Enables Genius release date lookups |
+| `DB_HOST` | No | PostgreSQL host (enables cloud DB) |
+| `DB_PORT` | No | PostgreSQL port (default: `5432`) |
+| `DB_NAME` | No | PostgreSQL database name |
+| `DB_USER` | No | PostgreSQL user |
+| `DB_PASSWORD` | No | PostgreSQL password |
+| `DB_MAX_CONN` | No | Connection pool size (default: `10`) |
+| `GCS_BUCKET` | No | Google Cloud Storage bucket name |
+| `GOOGLE_APPLICATION_CREDENTIALS` | No | Path to GCS service account JSON |
+
+All database and storage variables are optional — the app gracefully falls back to local files (SQLite, pickle, JSON) when they're not configured.
 
 ## Tech stack
 
 - **Backend:** Python 3.11, Flask, Pandas, gunicorn
 - **Parsing:** pdfplumber (PDF), openpyxl (Excel), pandas (CSV)
+- **Database:** PostgreSQL (optional, with graceful SQLite fallback)
+- **Storage:** Google Cloud Storage (optional, with local file fallback)
 - **Enrichment:** MusicBrainz (free), Genius API, Gemini API
 - **Frontend:** Jinja2 templates, Chart.js
-- **Deployment:** Docker, Caddy (auto-HTTPS)
+- **Deployment:** Docker, Caddy (auto-HTTPS), GitHub Actions CI/CD
 
 ## Project structure
 
@@ -78,6 +90,10 @@ mapper.py           Column mapping & schema definition
 enrichment.py       Release date lookup pipeline
 formula_engine.py   Waterfall calculations
 validator.py        Data quality checks
+db.py               PostgreSQL integration (connection pool, CRUD, migrations)
+storage.py          Google Cloud Storage integration (upload/download)
+migrate_data.py     One-time migration script (local files → PostgreSQL)
+migrations/         SQL migration files
 Dockerfile          Container image definition
 docker-compose.yml  App + Caddy reverse proxy
 Caddyfile           HTTPS reverse proxy config
