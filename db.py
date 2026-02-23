@@ -181,16 +181,19 @@ def save_deal_to_db(slug, deal_name, payor_results, analytics,
                      statement_type, deal_type, artist_split, territory,
                      contract_pdf_gcs, contract_summary,
                      expected_start, expected_end, file_count,
-                     detected_currencies, file_inventory)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     detected_currencies, file_inventory,
+                     calc_payable, payable_pct, calc_third_party, third_party_pct)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
-            """, (deal_id, code, c.name, c.fmt, c.fee, c.fx_currency, c.fx_rate,
+            """, (deal_id, code, c.name, c.fmt, c.fee,
+                  c.source_currency, 1.0,  # map source_currency -> fx_currency col, fx_rate always 1.0
                   c.statement_type, c.deal_type, c.artist_split, c.territory,
                   getattr(c, 'contract_pdf_gcs', None),
                   json.dumps(c.contract_summary) if c.contract_summary else None,
                   c.expected_start, c.expected_end, pr.file_count,
                   detected_currencies,
-                  json.dumps(file_inventory, default=str)))
+                  json.dumps(file_inventory, default=str),
+                  c.calc_payable, c.payable_pct, c.calc_third_party, c.third_party_pct))
 
             pc_id = cur.fetchone()[0]
 
@@ -206,9 +209,9 @@ def save_deal_to_db(slug, deal_name, payor_results, analytics,
             if pr.monthly is not None and not pr.monthly.empty:
                 _bulk_insert_monthly(conn, deal_id, pc_id, pr.monthly)
 
-            # Insert distributor summary
-            if pr.by_distributor is not None and not pr.by_distributor.empty:
-                _bulk_insert_distributor(conn, deal_id, pc_id, pr.by_distributor)
+            # Insert store summary (maps to distributor table for backward compat)
+            if pr.by_store is not None and not pr.by_store.empty:
+                _bulk_insert_distributor(conn, deal_id, pc_id, pr.by_store)
 
         return deal_id
 
@@ -285,6 +288,7 @@ def _bulk_insert_statement_rows(conn, deal_id, pc_id, df, batch_size=5000):
         'Release Date Source': 'release_date_source',
         'Source': 'source',
         'Deal': 'deal',
+        'Media Type': 'delivery_type',
         'Delivery Type': 'delivery_type',
         'Territory': 'territory',
         'FX Original': 'fx_original',
@@ -297,11 +301,12 @@ def _bulk_insert_statement_rows(conn, deal_id, pc_id, df, batch_size=5000):
         'Net Earnings': 'net_earnings',
     }
 
-    # Also extract period/distributor/country if present
+    # Also extract period/store/country if present
     extra_map = {
         'Period': 'period',
         '_period': 'period',
-        'Distributor': 'distributor',
+        'Store': 'distributor',       # map Store -> DB column 'distributor' for backward compat
+        'Distributor': 'distributor',  # legacy fallback
         'Country': 'country',
     }
 
@@ -429,20 +434,20 @@ def _bulk_insert_monthly(conn, deal_id, pc_id, df):
 
 
 def _bulk_insert_distributor(conn, deal_id, pc_id, df):
-    """Insert distributor summary rows."""
+    """Insert store/distributor summary rows (DB column still called 'distributor')."""
     from psycopg2.extras import execute_values
 
     cur = conn.cursor()
     rows = []
     for _, row in df.iterrows():
-        dist = str(row.get('distributor', row.get('Distributor', ''))).strip()
+        dist = str(row.get('store', row.get('Store', row.get('distributor', row.get('Distributor', ''))))).strip()
         if not dist or dist in ('nan', 'None'):
             continue
         rows.append((
             deal_id, pc_id, dist,
-            _safe_float(row.get('total_gross', row.get('gross', 0))),
-            _safe_float(row.get('total_net', row.get('net', 0))),
-            _safe_float(row.get('total_sales', row.get('sales', 0))),
+            _safe_float(row.get('total_gross', row.get('Total Gross', row.get('gross', 0)))),
+            _safe_float(row.get('total_net', row.get('Total Net', row.get('net', 0)))),
+            _safe_float(row.get('total_sales', row.get('Total Sales', row.get('sales', 0)))),
         ))
 
     if rows:

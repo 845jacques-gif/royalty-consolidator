@@ -22,7 +22,7 @@ WATERFALL_FIELDS = [
     'Payable Share', 'Third Party Share', 'Net Earnings',
 ]
 
-PERCENT_FIELDS = ['Fee %', 'Payable %', 'Third Party %']
+PERCENT_FIELDS = []
 
 # Known derivation rules: (target, expression_using_others)
 # Each rule is (result_field, callable(row_dict) -> value, required_fields)
@@ -45,17 +45,7 @@ WATERFALL_RELATIONSHIPS = [
     ('Net Earnings', lambda r: r['Payable Share'], {'Payable Share'}),
 ]
 
-# Percent-based derivation rules
-PERCENT_RELATIONSHIPS = [
-    # Fees = Gross * Fee%
-    ('Fees', lambda r: r['Gross Earnings'] * r['Fee %'] / 100.0, {'Gross Earnings', 'Fee %'}),
-    # Net Receipts = Gross * (1 - Fee%)
-    ('Net Receipts', lambda r: r['Gross Earnings'] * (1 - r['Fee %'] / 100.0), {'Gross Earnings', 'Fee %'}),
-    # Payable Share = Net Receipts * Payable%
-    ('Payable Share', lambda r: r['Net Receipts'] * r['Payable %'] / 100.0, {'Net Receipts', 'Payable %'}),
-    # Third Party Share = Net Receipts * Third Party%
-    ('Third Party Share', lambda r: r['Net Receipts'] * r['Third Party %'] / 100.0, {'Net Receipts', 'Third Party %'}),
-]
+PERCENT_RELATIONSHIPS = []
 
 # Safe builtins for formula eval
 _SAFE_BUILTINS = {'abs': abs, 'min': min, 'max': max, 'round': round}

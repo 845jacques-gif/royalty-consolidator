@@ -37,8 +37,8 @@ def _db():
 # Canonical schema fields
 CANONICAL_FIELDS = [
     'identifier', 'iswc', 'upc', 'other_identifier',
-    'title', 'artist', 'product_title', 'distributor',
-    'download_type', 'period', 'gross', 'net', 'fees', 'sales',
+    'title', 'artist', 'product_title', 'store',
+    'media_type', 'period', 'gross', 'net', 'fees', 'sales',
     'country', 'release_date',
 ]
 
@@ -47,9 +47,9 @@ REQUIRED_FIELDS = {'identifier', 'gross'}
 NUMERIC_FIELDS = {'gross', 'net', 'fees', 'sales'}
 
 # Phase 2: Extended mapping options including percent fields for waterfall
-PHASE2_MAPPING_OPTIONS = CANONICAL_FIELDS + ['fee_pct', 'payable_pct', 'third_party_pct']
+PHASE2_MAPPING_OPTIONS = CANONICAL_FIELDS + ['fee_pct']
 
-PERCENT_NUMERIC_FIELDS = {'fee_pct', 'payable_pct', 'third_party_pct'}
+PERCENT_NUMERIC_FIELDS = set()
 
 ALL_NUMERIC_FIELDS = NUMERIC_FIELDS | PERCENT_NUMERIC_FIELDS
 
@@ -520,7 +520,7 @@ def apply_mapping(filepath: str, mapping: Dict[str, str], header_row: int,
 
     # Strip string fields
     for c in ['identifier', 'iswc', 'upc', 'other_identifier', 'title', 'artist',
-              'product_title', 'distributor', 'download_type', 'country', 'release_date']:
+              'product_title', 'store', 'media_type', 'country', 'release_date']:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 

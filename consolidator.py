@@ -193,11 +193,15 @@ class PayorConfig:
     statements_dir: str    # Directory containing statement files
     fmt: str               # 'auto'
     fee: float             # Distribution fee as decimal (0.15 = 15%)
-    fx_currency: str = 'USD'
-    fx_rate: float = 1.0   # Multiply local currency amounts by this to get USD
+    source_currency: str = 'USD'
+    fx_rate: float = 1.0   # Kept for backward compat; always 1.0 (conversion at dashboard time)
     statement_type: str = 'masters'  # masters, publishing, neighboring, pro, sync, other
     deal_type: str = 'artist'                  # 'artist' or 'label' — whose perspective the earnings are from
     artist_split: Optional[float] = None       # Split % — your share after distro fees (e.g. 50 = you keep 50%)
+    calc_payable: bool = False                 # Toggle: calculate payable amount from %
+    payable_pct: float = 0.0                   # Payable share percentage
+    calc_third_party: bool = False             # Toggle: calculate third party amount from %
+    third_party_pct: float = 0.0               # Third party share percentage
     matching_right: Optional[bool] = None      # Whether payor has matching right
     contract_term: Optional[str] = None        # e.g. "3 years", "Life of copyright"
     territory: Optional[str] = None            # e.g. "Worldwide", "North America"
@@ -214,12 +218,13 @@ class PayorResult:
     config: PayorConfig
     isrc_meta: pd.DataFrame    # Unique ISRCs with title, artist, total_gross
     monthly: pd.DataFrame      # ISRC × period with gross, net, sales
-    detail: pd.DataFrame       # ISRC × period × distributor × download_type
+    detail: pd.DataFrame       # ISRC × period × store × media_type
     pivot_gross: pd.DataFrame  # Pivot: rows=ISRC, cols=period, vals=gross
-    by_distributor: pd.DataFrame
+    by_store: pd.DataFrame
     file_count: int
     detected_currencies: List[str] = field(default_factory=list)  # Currencies found in files
     file_inventory: List[dict] = field(default_factory=list)  # Per-file metadata
+    quality_warnings: List[str] = field(default_factory=list)  # Data quality warnings
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +332,13 @@ COLUMN_PATTERNS = {
     'artist': ['track artist', 'artist', 'performer', 'act', 'band', 'creator'],
     'product_title': ['product title', 'album', 'release', 'product', 'bundle',
                       'album name', 'release title'],
-    'distributor': ['distributor', 'store', 'platform', 'dsp', 'service',
-                    'retailer', 'partner', 'channel', 'source'],
+    'store': ['distributor', 'store', 'platform', 'dsp', 'service',
+              'retailer', 'partner', 'channel', 'source'],
     'sales': ['quantity', 'units', 'streams', 'plays', 'count',
               'qty', 'volume', 'number of', 'total units', 'sales'],
-    'download_type': ['download type', 'usage type', 'transaction type',
-                      'content type', 'sale type', 'revenue type', 'type'],
+    'media_type': ['download type', 'usage type', 'transaction type',
+                   'content type', 'sale type', 'revenue type', 'type',
+                   'media type', 'delivery type'],
     'gross': ['gross', 'ppu total', 'revenue', 'earning gross', 'total revenue',
               'gross revenue', 'amount', 'total amount',
               'earning_gross', 'price', 'retail'],
@@ -412,6 +418,170 @@ def _fuzzy_match_columns(df_columns):
                 break
 
     return mapped
+
+
+# ---------------------------------------------------------------------------
+# Sample-based column validation
+# ---------------------------------------------------------------------------
+
+# Patterns for validating detected column content
+_ISRC_RE = re.compile(r'^[A-Z]{2}[A-Z0-9]{3}\d{7}$')
+_UPC_RE = re.compile(r'^\d{12,13}$')
+_ISWC_RE = re.compile(r'^T\d{9,10}$')
+_COUNTRY_RE = re.compile(r'^[A-Z]{2}$')
+
+
+def _validate_column_detection(df: pd.DataFrame, mapping: dict, n_sample: int = 10) -> List[str]:
+    """Validate auto-detected column mappings by sampling data rows.
+
+    Checks that values in mapped columns match expected formats.
+    Returns a list of warning strings for suspicious mappings.
+    """
+    warnings = []
+    if len(df) == 0:
+        return warnings
+
+    sample = df.head(n_sample)
+
+    validators = {
+        'identifier': (_ISRC_RE, 'ISRC format (e.g. USRC12345678)'),
+        'upc': (_UPC_RE, 'UPC format (12-13 digits)'),
+        'iswc': (_ISWC_RE, 'ISWC format (e.g. T0123456789)'),
+        'country': (_COUNTRY_RE, '2-letter country code'),
+    }
+
+    numeric_fields = {'gross', 'net', 'fees', 'sales'}
+
+    for field_name, src_col in mapping.items():
+        if src_col not in sample.columns:
+            continue
+
+        col_data = sample[src_col].dropna().astype(str).str.strip()
+        if len(col_data) == 0:
+            continue
+
+        # Check format validators
+        if field_name in validators:
+            pattern, expected = validators[field_name]
+            match_count = col_data.apply(lambda v: bool(pattern.match(v))).sum()
+            match_pct = match_count / len(col_data) * 100
+            if match_pct < 30 and len(col_data) >= 3:
+                warnings.append(
+                    f'Column "{src_col}" mapped to {field_name} — only {match_pct:.0f}% of sampled '
+                    f'values match expected {expected}'
+                )
+
+        # Check numeric fields actually contain numbers
+        if field_name in numeric_fields:
+            try:
+                numeric_vals = pd.to_numeric(col_data.str.replace(',', ''), errors='coerce')
+                non_null = numeric_vals.notna().sum()
+                if non_null / len(col_data) < 0.5 and len(col_data) >= 3:
+                    warnings.append(
+                        f'Column "{src_col}" mapped to {field_name} — '
+                        f'only {non_null}/{len(col_data)} sampled values are numeric'
+                    )
+            except Exception:
+                pass
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Duplicate row detection (across files)
+# ---------------------------------------------------------------------------
+
+def detect_duplicate_rows(detail_df: pd.DataFrame) -> List[str]:
+    """Flag rows that appear identical across different files.
+
+    Checks for rows with the same ISRC + period + gross amount,
+    which may indicate duplicate data imported from overlapping statements.
+    Returns a list of warning strings.
+    """
+    warnings = []
+    if detail_df is None or len(detail_df) == 0:
+        return warnings
+
+    key_cols = ['identifier', 'period']
+    if not all(c in detail_df.columns for c in key_cols + ['gross']):
+        return warnings
+
+    # Group by ISRC + period and look for exact gross duplicates
+    grouped = detail_df.groupby(key_cols)['gross'].agg(['sum', 'count']).reset_index()
+    dups = grouped[grouped['count'] > 1]
+
+    if len(dups) > 0:
+        # Check if any have exact same gross (likely true duplicates vs legitimate splits)
+        dup_detail = detail_df.merge(dups[key_cols], on=key_cols, how='inner')
+        exact_dups = (
+            dup_detail.groupby(key_cols + ['gross'])
+            .size()
+            .reset_index(name='n')
+        )
+        exact_dups = exact_dups[exact_dups['n'] > 1]
+
+        if len(exact_dups) > 0:
+            n_rows = exact_dups['n'].sum() - len(exact_dups)  # extra duplicate rows
+            sample_isrcs = exact_dups['identifier'].head(3).tolist()
+            warnings.append(
+                f'{n_rows} potential duplicate rows detected (same ISRC + period + gross amount). '
+                f'Sample ISRCs: {", ".join(str(i) for i in sample_isrcs)}'
+            )
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Cross-file ISRC validation
+# ---------------------------------------------------------------------------
+
+def validate_cross_payor_isrcs(payor_results: Dict[str, 'PayorResult']) -> List[str]:
+    """Warn when an ISRC appears across payors with conflicting title/artist metadata.
+
+    Returns a list of warning strings.
+    """
+    warnings = []
+    if len(payor_results) < 2:
+        return warnings
+
+    # Collect title/artist per ISRC across all payors
+    isrc_info = {}  # {isrc: [(payor_code, title, artist), ...]}
+    for code, pr in payor_results.items():
+        if pr.isrc_meta is None or len(pr.isrc_meta) == 0:
+            continue
+        for _, row in pr.isrc_meta.iterrows():
+            isrc = str(row.get('identifier', '')).strip()
+            if not isrc:
+                continue
+            title = str(row.get('title', '')).strip().lower()
+            artist = str(row.get('artist', '')).strip().lower()
+            if isrc not in isrc_info:
+                isrc_info[isrc] = []
+            isrc_info[isrc].append((code, title, artist))
+
+    conflicts = []
+    for isrc, entries in isrc_info.items():
+        if len(entries) < 2:
+            continue
+        # Check for conflicting titles or artists
+        titles = set(t for _, t, _ in entries if t)
+        artists = set(a for _, _, a in entries if a)
+        if len(titles) > 1 or len(artists) > 1:
+            payor_codes = [e[0] for e in entries]
+            conflicts.append((isrc, payor_codes, titles, artists))
+
+    if conflicts:
+        n = len(conflicts)
+        samples = conflicts[:3]
+        details = []
+        for isrc, payors, titles, artists in samples:
+            details.append(f'{isrc} ({", ".join(payors)})')
+        warnings.append(
+            f'{n} ISRCs have conflicting title/artist metadata across payors. '
+            f'Examples: {"; ".join(details)}'
+        )
+
+    return warnings
 
 
 def _find_header_row(filepath, ext, max_scan=50):
@@ -570,6 +740,11 @@ def parse_file_universal(filepath, filename, fmt='auto', fallback_period=None):
         log.warning("Could not detect columns in %s. Found: %s", filename, cols_found[:15])
         return None, None
 
+    # Sample-based validation of detected columns
+    col_warnings = _validate_column_detection(df, col_map)
+    for w in col_warnings:
+        log.warning("[%s] %s", filename, w)
+
     # Derive period
     if 'period' in col_map:
         raw_period = df[col_map['period']]
@@ -667,8 +842,8 @@ def parse_file_universal(filepath, filename, fmt='auto', fallback_period=None):
         'title': _get('title'),
         'artist': _get('artist'),
         'product_title': _get('product_title'),
-        'distributor': _get('distributor'),
-        'download_type': _get('download_type'),
+        'store': _get('store'),
+        'media_type': _get('media_type'),
         'period': df['_period'],
         'gross': gross_vals,
         'net': net_vals,
@@ -836,8 +1011,8 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
         'title': _get('title'),
         'artist': _get('artist'),
         'product_title': _get('product_title'),
-        'distributor': _get('distributor'),
-        'download_type': _get('download_type'),
+        'store': _get('store'),
+        'media_type': _get('media_type'),
         'period': period_col,
         'gross': gross_vals,
         'net': net_vals,
@@ -847,10 +1022,9 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
         'release_date': _get('release_date'),
     })
 
-    # Percent fields for waterfall
-    for pct_field in ('fee_pct', 'payable_pct', 'third_party_pct'):
-        if pct_field in canonical_to_src:
-            result[pct_field] = _get_numeric(pct_field)
+    # Fee percent field for waterfall
+    if 'fee_pct' in canonical_to_src:
+        result['fee_pct'] = _get_numeric('fee_pct')
 
     # KEEP columns: only ones the user explicitly toggled
     if keep_columns:
@@ -1066,14 +1240,12 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             if file_currency and file_currency != 'Unknown':
                 currencies_seen.add(file_currency)
 
-            # Store pre-FX gross for FX Original column
+            # Store original gross for FX Original column (identical — no ingestion-time conversion)
             df['gross_original'] = df['gross'].copy()
 
-            # Apply FX conversion
-            if config.fx_rate != 1.0:
-                df['gross'] = df['gross'] * config.fx_rate
-                df['net'] = df['net'] * config.fx_rate
-                df['fees'] = df['fees'] * config.fx_rate
+            # Auto-detect source currency if user chose "auto"
+            if config.source_currency == 'auto' and file_currency and file_currency != 'Unknown':
+                config.source_currency = file_currency
 
             # Auto-detect fee from data when fee is 0 and both gross & net exist
             if not fee_detected and config.fee == 0 and df['gross'].abs().sum() > 0 and df['net'].abs().sum() > 0:
@@ -1145,7 +1317,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             # Identify KEEP columns for passthrough
             keep_cols = [c for c in df.columns if c.startswith('KEEP_')]
 
-            # Detail: ISRC + period + distributor + download_type + country
+            # Detail: ISRC + period + store + media_type + country
             detail_agg_dict = {
                 'title': 'first', 'artist': 'first', 'product_title': 'first',
                 'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
@@ -1157,15 +1329,15 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 detail_agg_dict[kc] = 'first'
 
             detail_agg = (
-                df.groupby(['identifier', 'period', 'distributor', 'download_type', 'country'])
+                df.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
                 .agg(detail_agg_dict)
                 .reset_index()
             )
             detail_chunks.append(detail_agg)
 
-            # Distributor aggregate
+            # Store aggregate
             dist_agg = (
-                df.groupby(['distributor', 'period'])
+                df.groupby(['store', 'period'])
                 .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
                 .reset_index()
             )
@@ -1206,7 +1378,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         detail_reagg[kc] = 'first'
 
     detail = (
-        detail.groupby(['identifier', 'period', 'distributor', 'download_type', 'country'])
+        detail.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
         .agg(detail_reagg)
         .reset_index()
     )
@@ -1219,13 +1391,13 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
 
     dist_all = pd.concat(dist_chunks, ignore_index=True)
     del dist_chunks
-    by_distributor = (
-        dist_all.groupby('distributor')
+    by_store = (
+        dist_all.groupby('store')
         .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
         .reset_index()
         .sort_values('gross', ascending=False)
     )
-    by_distributor.columns = ['Distributor', 'Total Gross', 'Total Net', 'Total Sales']
+    by_store.columns = ['Store', 'Total Gross', 'Total Net', 'Total Sales']
     del dist_all
 
     # Pivot: rows=ISRC, cols=period, vals=gross
@@ -1237,10 +1409,15 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     isrc_meta['total_gross'] = isrc_meta['identifier'].map(pivot_gross.sum(axis=1))
     isrc_meta = isrc_meta.sort_values('total_gross', ascending=False).reset_index(drop=True)
 
-    currency_str = ', '.join(sorted(currencies_seen)) if currencies_seen else config.fx_currency
+    currency_str = ', '.join(sorted(currencies_seen)) if currencies_seen else config.source_currency
     log.info("%s: %d files, %s ISRCs, $%s total gross, currency: %s",
              config.name, file_count, f"{len(isrc_meta):,}",
              f"{isrc_meta['total_gross'].sum():,.2f}", currency_str)
+
+    # Duplicate row detection across files
+    quality_warnings = detect_duplicate_rows(detail)
+    for w in quality_warnings:
+        log.warning("[%s] %s", config.code, w)
 
     return PayorResult(
         config=config,
@@ -1248,28 +1425,59 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         monthly=monthly,
         detail=detail,
         pivot_gross=pivot_gross,
-        by_distributor=by_distributor,
+        by_store=by_store,
         file_count=file_count,
-        detected_currencies=sorted(currencies_seen) if currencies_seen else [config.fx_currency],
+        detected_currencies=sorted(currencies_seen) if currencies_seen else [config.source_currency],
         file_inventory=file_inventory,
+        quality_warnings=quality_warnings,
     )
 
 
 def load_all_payors(configs: List[PayorConfig], file_dates: Optional[Dict[str, str]] = None,
                     column_mappings_by_payor: Optional[Dict[str, Dict[str, dict]]] = None) -> Dict[str, PayorResult]:
-    """Load statements for all payors.
+    """Load statements for all payors (parallel when multiple payors).
 
     file_dates: optional {filename: "MM/DD/YY"} from the date extraction modal,
                 used as fallback when auto-detection fails.
     column_mappings_by_payor: optional {payor_code: {filename: mapping_info}}
                               Phase 2 explicit column mappings per payor.
     """
-    results = {}
-    for cfg in configs:
-        cm = column_mappings_by_payor.get(cfg.code) if column_mappings_by_payor else None
-        result = load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm)
-        if result is not None:
-            results[cfg.code] = result
+    if len(configs) <= 1:
+        # Single payor — no need for threading overhead
+        results = {}
+        for cfg in configs:
+            cm = column_mappings_by_payor.get(cfg.code) if column_mappings_by_payor else None
+            result = load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm)
+            if result is not None:
+                results[cfg.code] = result
+    else:
+        # Multiple payors — parse in parallel
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _load_one(cfg):
+            cm = column_mappings_by_payor.get(cfg.code) if column_mappings_by_payor else None
+            return cfg.code, load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm)
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(len(configs), 4)) as pool:
+            futures = {pool.submit(_load_one, cfg): cfg.code for cfg in configs}
+            for future in as_completed(futures):
+                try:
+                    code, result = future.result()
+                    if result is not None:
+                        results[code] = result
+                except Exception as e:
+                    log.error("Payor %s failed: %s", futures[future], e)
+
+    # Cross-payor ISRC validation
+    cross_warnings = validate_cross_payor_isrcs(results)
+    if cross_warnings:
+        for w in cross_warnings:
+            log.warning("[cross-payor] %s", w)
+        # Attach cross-payor warnings to all payors
+        for pr in results.values():
+            pr.quality_warnings.extend(cross_warnings)
+
     return results
 
 
@@ -1283,7 +1491,7 @@ def _build_detail_23col(pr: 'PayorResult', deal_name: str = '',
 
     Output columns in order:
         Statement Date, Royalty Type, Payor, ISRC, ISWC, UPC, Other Identifier,
-        Title, Artist, Release Date, Source, Deal, Delivery Type, Territory,
+        Title, Artist, Release Date, Source, Deal, Media Type, Territory,
         FX Original, Units, Gross Earnings, Fees, Net Receipts, Payable Share,
         Third Party Share, Net Earnings, + any KEEP_ columns
 
@@ -1297,28 +1505,19 @@ def _build_detail_23col(pr: 'PayorResult', deal_name: str = '',
     def _col(name, default=''):
         return d[name] if name in d.columns else pd.Series([default] * n, dtype=object)
 
-    split_pct = cfg.artist_split if cfg.artist_split is not None else 100.0
-    deal_type = getattr(cfg, 'deal_type', 'artist')  # 'artist' or 'label'
     net_vals = d['net'] if 'net' in d.columns else pd.Series([0.0] * n)
 
-    # Handle per-row percent columns if available from Phase 2 mapping
-    if 'payable_pct' in d.columns and d['payable_pct'].abs().sum() > 0:
-        payable_share = net_vals * (d['payable_pct'] / 100.0)
-    elif 'third_party_pct' in d.columns and d['third_party_pct'].abs().sum() > 0:
-        third_party_share_tmp = net_vals * (d['third_party_pct'] / 100.0)
-        payable_share = net_vals - third_party_share_tmp
+    # Share calculation: driven by PayorConfig toggles (set on upload page)
+    if cfg.calc_payable and cfg.payable_pct > 0:
+        payable_share = net_vals * (cfg.payable_pct / 100.0)
     else:
-        # Use the configured split %:
-        # split_pct is "your share" — the payable portion after distro fees
-        # The other party gets the remainder
+        # Use the configured artist split %
+        split_pct = cfg.artist_split if cfg.artist_split is not None else 100.0
         payable_share = net_vals * (split_pct / 100.0)
 
-    if 'third_party_pct' in d.columns and d['third_party_pct'].abs().sum() > 0:
-        third_party_share = net_vals * (d['third_party_pct'] / 100.0)
-    elif 'payable_pct' in d.columns and d['payable_pct'].abs().sum() > 0:
-        third_party_share = net_vals - payable_share
+    if cfg.calc_third_party and cfg.third_party_pct > 0:
+        third_party_share = net_vals * (cfg.third_party_pct / 100.0)
     else:
-        # Other party's share is the remainder
         third_party_share = net_vals - payable_share
 
     net_earnings = payable_share - third_party_share
@@ -1335,9 +1534,9 @@ def _build_detail_23col(pr: 'PayorResult', deal_name: str = '',
         'Artist': _col('artist'),
         'Release Date': _col('release_date'),
         'Release Date Source': _col('release_date_source') if 'release_date_source' in d.columns else '',
-        'Source': _col('distributor'),
+        'Source': _col('store'),
         'Deal': deal_name or '',
-        'Delivery Type': _col('download_type'),
+        'Media Type': _col('media_type'),
         'Territory': d['country'] if 'country' in d.columns and d['country'].astype(str).str.strip().ne('').any()
                      else (cfg.territory or ''),
         'FX Original': d['gross_original'] if 'gross_original' in d.columns else d.get('gross', 0),
@@ -1490,10 +1689,10 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         _write_df_to_excel(writer, combined_summary, 'By ISRC-Month')
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
 
-        # Per-payor distributor breakdown
+        # Per-payor store breakdown
         for code, pr in payor_results.items():
-            sheet_name = f'Distributors_{code}'
-            pr.by_distributor.to_excel(writer, sheet_name=sheet_name, index=False)
+            sheet_name = f'Stores_{code}'
+            pr.by_store.to_excel(writer, sheet_name=sheet_name, index=False)
 
         # Top songs across all payors with release date
         top = cross_payor.head(50).copy()
@@ -1578,7 +1777,7 @@ def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: s
             _write_df_to_excel(writer, clean, 'Detail')
             _write_df_to_excel(writer, summary, 'By ISRC-Month')
             monthly_totals.to_excel(writer, sheet_name='Monthly Totals', index=False)
-            pr.by_distributor.to_excel(writer, sheet_name='Distributors', index=False)
+            pr.by_store.to_excel(writer, sheet_name='Stores', index=False)
 
         paths[code] = path
         log.info("%s: %s rows", pr.config.name, f"{len(clean):,}")
@@ -2000,8 +2199,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'payor_summaries': [],
             'monthly_trend': [], 'monthly_by_payor': {},
             'ltm_by_payor': {}, 'annual_by_payor': {},
-            'top_distributors': [], 'ltm_distributors': [],
-            'ltm_download_types': [],
+            'top_stores': [], 'ltm_stores': [],
+            'ltm_media_types': [],
             'ltm_gross_total': 0, 'ltm_gross_total_fmt': csym + '0',
             'ltm_net_total': 0, 'ltm_net_total_fmt': csym + '0',
             'ltm_yoy_pct': 0, 'ltm_yoy_direction': 'flat',
@@ -2011,7 +2210,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'coverage_months': [], 'coverage_rows': [],
             'currency_symbol': csym,
             'currency_code': _currency_code(payor_results),
-            'payor_currencies': {code: pr.config.fx_currency for code, pr in payor_results.items()},
+            'payor_currencies': {code: pr.config.source_currency for code, pr in payor_results.items()},
             'waterfall': _compute_waterfall(payor_results, formulas),
             'weighted_avg_age': _compute_weighted_average_age(payor_results),
             'source_breakdown': _compute_source_breakdown(enrichment_stats),
@@ -2187,10 +2386,10 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'isrcs': len(pr.isrc_meta),
             'total_gross': f"{pr.isrc_meta['total_gross'].sum():,.2f}",
             'total_gross_raw': round(float(pr.isrc_meta['total_gross'].sum()), 2),
-            'currency_code': pr.config.fx_currency,
+            'currency_code': pr.config.source_currency,
             'fee': f"{pr.config.fee:.0%}",
-            'fx': pr.config.fx_currency,
-            'currency_symbol': _CURRENCY_SYMBOLS.get(pr.config.fx_currency, '$'),
+            'fx': pr.config.source_currency,
+            'currency_symbol': _CURRENCY_SYMBOLS.get(pr.config.source_currency, '$'),
             'detected_currency': ', '.join(getattr(pr, 'detected_currencies', [])),
             'statement_type': STATEMENT_TYPES.get(pr.config.statement_type, pr.config.statement_type),
             'deal_type': getattr(pr.config, 'deal_type', 'artist'),
@@ -2206,6 +2405,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'annual_breakdown': annual_breakdown,
             'yoy_changes': yoy_changes,
             'file_inventory': getattr(pr, 'file_inventory', []),
+            'quality_warnings': getattr(pr, 'quality_warnings', []),
         }
         payor_summaries.append(summary)
 
@@ -2309,7 +2509,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'ltm_net': round(ltm_net, 2),
             'ltm_net_fmt': f"{ltm_net:,.2f}",
             'currency_symbol': payor_csyms.get(code, '$'),
-            'currency_code': pr.config.fx_currency,
+            'currency_code': pr.config.source_currency,
         })
 
     # --- Annual by payor (for stacked bar chart) ---
@@ -2338,7 +2538,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'code': code,
             'name': pr.config.name,
             'currency_symbol': payor_csyms.get(code, '$'),
-            'currency_code': pr.config.fx_currency,
+            'currency_code': pr.config.source_currency,
             'years': {y: {'gross': round(lookup.get(y, 0), 2),
                           'gross_fmt': f"{lookup.get(y, 0):,.2f}",
                           'net': round(net_lookup.get(y, 0), 2),
@@ -2363,24 +2563,24 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         }
     earnings_grand_total = sum(row['total_gross'] for row in earnings_matrix)
 
-    # --- Top distributors across all payors (all-time) ---
+    # --- Top stores across all payors (all-time) ---
     all_dist = []
     for code, pr in payor_results.items():
-        d = pr.by_distributor.copy()
-        d.columns = ['distributor', 'gross', 'net', 'sales']
+        d = pr.by_store.copy()
+        d.columns = ['store', 'gross', 'net', 'sales']
         all_dist.append(d)
     if all_dist:
         combined_dist = pd.concat(all_dist, ignore_index=True)
-        top_distributors = (
-            combined_dist.groupby('distributor')
+        top_stores_df = (
+            combined_dist.groupby('store')
             .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
             .reset_index()
             .sort_values('gross', ascending=False)
         )
         dist_list = []
-        for _, row in top_distributors.head(15).iterrows():
+        for _, row in top_stores_df.head(15).iterrows():
             dist_list.append({
-                'name': str(row['distributor']),
+                'name': str(row['store']),
                 'gross': round(float(row['gross']), 2),
                 'gross_fmt': f"{row['gross']:,.2f}",
                 'sales': int(row['sales']),
@@ -2388,25 +2588,25 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
     else:
         dist_list = []
 
-    # --- LTM distributors & download types ---
+    # --- LTM stores & media types ---
     all_ltm_detail = []
     for code, pr in payor_results.items():
         d = pr.detail.copy()
         d = d[d['period'] >= ltm_start_period]
         all_ltm_detail.append(d)
     ltm_dist_list = []
-    ltm_download_types = []
+    ltm_media_types = []
     if all_ltm_detail:
         ltm_detail = pd.concat(all_ltm_detail, ignore_index=True)
-        # LTM distributors
+        # LTM stores
         ltm_dist = (
-            ltm_detail.groupby('distributor')
+            ltm_detail.groupby('store')
             .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
             .reset_index()
             .sort_values('gross', ascending=False)
         )
         for _, row in ltm_dist.head(15).iterrows():
-            name = str(row['distributor']).strip()
+            name = str(row['store']).strip()
             if name:
                 ltm_dist_list.append({
                     'name': name,
@@ -2414,17 +2614,17 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
                     'gross_fmt': f"{row['gross']:,.2f}",
                     'sales': int(row['sales']),
                 })
-        # LTM download types
+        # LTM media types
         ltm_types = (
-            ltm_detail.groupby('download_type')
+            ltm_detail.groupby('media_type')
             .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
             .reset_index()
             .sort_values('gross', ascending=False)
         )
         for _, row in ltm_types.iterrows():
-            name = str(row['download_type']).strip()
+            name = str(row['media_type']).strip()
             if name:
-                ltm_download_types.append({
+                ltm_media_types.append({
                     'name': name,
                     'gross': round(float(row['gross']), 2),
                     'gross_fmt': f"{row['gross']:,.2f}",
@@ -2458,9 +2658,9 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         'monthly_by_payor': monthly_by_payor,
         'ltm_by_payor': ltm_by_payor,
         'annual_by_payor': annual_by_payor,
-        'top_distributors': dist_list,
-        'ltm_distributors': ltm_dist_list,
-        'ltm_download_types': ltm_download_types,
+        'top_stores': dist_list,
+        'ltm_stores': ltm_dist_list,
+        'ltm_media_types': ltm_media_types,
         # LTM totals
         'ltm_gross_total': round(ltm_gross_total, 2),
         'ltm_gross_total_fmt': f"{ltm_gross_total:,.2f}",
@@ -2480,7 +2680,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         # Currency
         'currency_symbol': _currency_symbol(payor_results),
         'currency_code': _currency_code(payor_results),
-        'payor_currencies': {code: pr.config.fx_currency for code, pr in payor_results.items()},
+        'payor_currencies': {code: pr.config.source_currency for code, pr in payor_results.items()},
         # Phase 3: Waterfall, WAA, Source Breakdown
         'waterfall': waterfall,
         'weighted_avg_age': weighted_avg_age,
@@ -2640,7 +2840,7 @@ _CURRENCY_SYMBOLS = {'USD': '$', 'EUR': '\u20ac', 'GBP': '\u00a3', 'CAD': 'C$', 
 
 def _currency_symbol(payor_results):
     """Determine display currency symbol from payor configs."""
-    currencies = [pr.config.fx_currency for pr in payor_results.values()]
+    currencies = [pr.config.source_currency for pr in payor_results.values()]
     if not currencies:
         return '$'
     # Use most common currency
@@ -2651,7 +2851,7 @@ def _currency_symbol(payor_results):
 
 def _currency_code(payor_results):
     """Determine the primary ISO currency code from payor configs."""
-    currencies = [pr.config.fx_currency for pr in payor_results.values()]
+    currencies = [pr.config.source_currency for pr in payor_results.values()]
     if not currencies:
         return 'USD'
     from collections import Counter
@@ -2661,7 +2861,7 @@ def _currency_code(payor_results):
 def _payor_currency_symbols(payor_results):
     """Return a dict mapping payor code -> currency symbol."""
     return {
-        code: _CURRENCY_SYMBOLS.get(pr.config.fx_currency, pr.config.fx_currency + ' ')
+        code: _CURRENCY_SYMBOLS.get(pr.config.source_currency, pr.config.source_currency + ' ')
         for code, pr in payor_results.items()
     }
 
@@ -2714,17 +2914,17 @@ def print_summary(payor_results: Dict[str, PayorResult]):
 DEFAULT_PAYORS = [
     PayorConfig(
         code='B1', name='Believe 15%', fmt='auto', fee=0.15,
-        fx_currency='EUR', fx_rate=1.0,  # Keep in EUR; model handles FX
+        source_currency='EUR',
         statements_dir=r'C:\Users\jacques\Downloads\Believe_15_extracted',
     ),
     PayorConfig(
         code='B2', name='Believe 20%', fmt='auto', fee=0.20,
-        fx_currency='EUR', fx_rate=1.0,
+        source_currency='EUR',
         statements_dir=r'C:\Users\jacques\Downloads\Believe_20_extracted',
     ),
     PayorConfig(
         code='RJ', name='RecordJet', fmt='auto', fee=0.07,
-        fx_currency='EUR', fx_rate=1.0,
+        source_currency='EUR',
         statements_dir=r'C:\Users\jacques\Downloads\RecordJet_extracted',
     ),
 ]

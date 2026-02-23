@@ -33,14 +33,23 @@ log = logging.getLogger('royalty')
 from dotenv import load_dotenv
 load_dotenv()
 
-import google.generativeai as genai
 from flask import Flask, render_template_string, request, send_file, flash, redirect, url_for, jsonify, make_response
 import pandas as pd
 
-# Configure Gemini
+# Lazy Gemini import to avoid ~2-3s delay from deprecation warnings on startup
+genai = None
+
 _gemini_api_key = os.getenv('GEMINI_API_KEY', '')
-if _gemini_api_key:
-    genai.configure(api_key=_gemini_api_key)
+
+def _get_genai():
+    """Lazy-load google.generativeai on first use."""
+    global genai
+    if genai is None:
+        import google.generativeai as _genai
+        genai = _genai
+        if _gemini_api_key:
+            genai.configure(api_key=_gemini_api_key)
+    return genai
 
 from consolidator import (
     PayorConfig, load_all_payors, write_consolidated_excel, write_consolidated_csv,
@@ -277,10 +286,10 @@ def _build_chat_context():
                     yoy_str = f" (YoY: {yoy_val})" if yoy_val else ""
                     lines.append(f"    {year}: Gross={gross}, Net={net}{yoy_str}")
 
-    # Top distributors
-    top_dist = a.get('top_distributors', [])
+    # Top stores
+    top_dist = a.get('top_stores', [])
     if top_dist:
-        lines.append("\n--- Top Distributors ---")
+        lines.append("\n--- Top Stores ---")
         for d in top_dist:
             lines.append(f"  {d.get('name', '?')}: Gross={d.get('gross', 'N/A')}")
 
@@ -420,7 +429,7 @@ def load_deal(slug):
     with open(analytics_path, 'r') as f:
         analytics = json.load(f)
 
-    if 'ltm_distributors' not in analytics or 'ltm_download_types' not in analytics:
+    if 'ltm_stores' not in analytics or 'ltm_media_types' not in analytics:
         try:
             analytics = compute_analytics(payor_results)
             with open(analytics_path, 'w') as f:
@@ -2188,17 +2197,39 @@ function syncFormulas() {
                         <input class="form-input" type="number" name="payor_fee_0" value="15" min="0" max="100" step="0.1">
                     </div>
                     <div class="form-group">
-                        <label class="form-label">Output Currency</label>
-                        <select class="form-input" name="payor_fx_0">
-                            <option value="USD" selected>USD</option>
+                        <label class="form-label">Source Currency</label>
+                        <select class="form-input" name="payor_source_currency_0">
+                            <option value="auto" selected>Auto-detect</option>
+                            <option value="USD">USD</option>
                             <option value="EUR">EUR</option>
                             <option value="GBP">GBP</option>
+                            <option value="CAD">CAD</option>
+                            <option value="AUD">AUD</option>
+                            <option value="JPY">JPY</option>
+                            <option value="SEK">SEK</option>
+                            <option value="NOK">NOK</option>
+                            <option value="DKK">DKK</option>
+                            <option value="CHF">CHF</option>
+                            <option value="BRL">BRL</option>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label class="form-label">FX Rate</label>
-                        <input class="form-input" type="number" name="payor_fxrate_0" value="1.0" min="0" step="0.0001">
-                        <span style="font-size:10px; color:var(--text-dim);">1.0 = no conversion</span>
+                </div>
+                <div class="form-row" style="margin-bottom:10px;">
+                    <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+                        <input type="checkbox" name="payor_calc_payable_0" id="calcPayable_0" onchange="document.getElementById('payablePctWrap_0').style.display=this.checked?'block':'none'">
+                        <label for="calcPayable_0" class="form-label" style="margin:0;">Calculate Payable Amount</label>
+                    </div>
+                    <div class="form-group" id="payablePctWrap_0" style="display:none;">
+                        <label class="form-label">Payable %</label>
+                        <input class="form-input" type="number" name="payor_payable_pct_0" value="100" min="0" max="100" step="0.1">
+                    </div>
+                    <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+                        <input type="checkbox" name="payor_calc_third_party_0" id="calcTP_0" onchange="document.getElementById('tpPctWrap_0').style.display=this.checked?'block':'none'">
+                        <label for="calcTP_0" class="form-label" style="margin:0;">Calculate Third Party Amount</label>
+                    </div>
+                    <div class="form-group" id="tpPctWrap_0" style="display:none;">
+                        <label class="form-label">Third Party %</label>
+                        <input class="form-input" type="number" name="payor_third_party_pct_0" value="0" min="0" max="100" step="0.1">
                     </div>
                 </div>
                 <div style="background:var(--bg-inset); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px;">
@@ -2314,8 +2345,7 @@ function applyPreset(selectEl) {
         block.querySelector('[name=payor_fmt_'+idx+']').value = 'auto';
         block.querySelector('[name=payor_stype_'+idx+']').value = 'masters';
         block.querySelector('[name=payor_fee_'+idx+']').value = '15';
-        block.querySelector('[name=payor_fx_'+idx+']').value = 'USD';
-        block.querySelector('[name=payor_fxrate_'+idx+']').value = '1.0';
+        block.querySelector('[name=payor_source_currency_'+idx+']').value = 'auto';
         block.querySelector('[name=payor_split_'+idx+']').value = '';
         block.querySelector('[name=payor_territory_'+idx+']').value = '';
         return;
@@ -2327,8 +2357,7 @@ function applyPreset(selectEl) {
     block.querySelector('[name=payor_fmt_'+idx+']').value = p.fmt || 'auto';
     block.querySelector('[name=payor_stype_'+idx+']').value = p.statement_type || 'masters';
     block.querySelector('[name=payor_fee_'+idx+']').value = p.fee || 0;
-    block.querySelector('[name=payor_fx_'+idx+']').value = p.fx_currency || 'USD';
-    block.querySelector('[name=payor_fxrate_'+idx+']').value = p.fx_rate || 1.0;
+    block.querySelector('[name=payor_source_currency_'+idx+']').value = p.source_currency || p.fx_currency || 'auto';
     if (p.artist_split !== '' && p.artist_split !== null)
         block.querySelector('[name=payor_split_'+idx+']').value = p.artist_split;
     if (p.territory)
@@ -2460,16 +2489,39 @@ function addPayor() {
                 <input class="form-input" type="number" name="payor_fee_${n}" value="15" min="0" max="100" step="0.1">
             </div>
             <div class="form-group">
-                <label class="form-label">Output Currency</label>
-                <select class="form-input" name="payor_fx_${n}">
-                    <option value="USD" selected>USD</option>
+                <label class="form-label">Source Currency</label>
+                <select class="form-input" name="payor_source_currency_${n}">
+                    <option value="auto" selected>Auto-detect</option>
+                    <option value="USD">USD</option>
                     <option value="EUR">EUR</option>
                     <option value="GBP">GBP</option>
+                    <option value="CAD">CAD</option>
+                    <option value="AUD">AUD</option>
+                    <option value="JPY">JPY</option>
+                    <option value="SEK">SEK</option>
+                    <option value="NOK">NOK</option>
+                    <option value="DKK">DKK</option>
+                    <option value="CHF">CHF</option>
+                    <option value="BRL">BRL</option>
                 </select>
             </div>
-            <div class="form-group">
-                <label class="form-label">FX Rate</label>
-                <input class="form-input" type="number" name="payor_fxrate_${n}" value="1.0" min="0" step="0.0001">
+        </div>
+        <div class="form-row" style="margin-bottom:10px;">
+            <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+                <input type="checkbox" name="payor_calc_payable_${n}" id="calcPayable_${n}" onchange="document.getElementById('payablePctWrap_${n}').style.display=this.checked?'block':'none'">
+                <label for="calcPayable_${n}" class="form-label" style="margin:0;">Calculate Payable Amount</label>
+            </div>
+            <div class="form-group" id="payablePctWrap_${n}" style="display:none;">
+                <label class="form-label">Payable %</label>
+                <input class="form-input" type="number" name="payor_payable_pct_${n}" value="100" min="0" max="100" step="0.1">
+            </div>
+            <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+                <input type="checkbox" name="payor_calc_third_party_${n}" id="calcTP_${n}" onchange="document.getElementById('tpPctWrap_${n}').style.display=this.checked?'block':'none'">
+                <label for="calcTP_${n}" class="form-label" style="margin:0;">Calculate Third Party Amount</label>
+            </div>
+            <div class="form-group" id="tpPctWrap_${n}" style="display:none;">
+                <label class="form-label">Third Party %</label>
+                <input class="form-input" type="number" name="payor_third_party_pct_${n}" value="0" min="0" max="100" step="0.1">
             </div>
         </div>
         <div style="background:var(--bg-inset); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px;">
@@ -3045,16 +3097,21 @@ function _submitViaFetch() {
                         <input class="form-input" type="number" name="payor_fee_{{ loop.index0 }}" value="{{ (p.fee * 100) | round(1) }}" min="0" max="100" step="0.1">
                     </div>
                     <div class="form-group">
-                        <label class="form-label">Output Currency</label>
-                        <select class="form-input" name="payor_fx_{{ loop.index0 }}">
-                            <option value="USD" {{ 'selected' if p.fx_currency == 'USD' or p.fx_currency is not defined }}>USD</option>
-                            <option value="EUR" {{ 'selected' if p.fx_currency == 'EUR' }}>EUR</option>
-                            <option value="GBP" {{ 'selected' if p.fx_currency == 'GBP' }}>GBP</option>
+                        <label class="form-label">Source Currency</label>
+                        <select class="form-input" name="payor_source_currency_{{ loop.index0 }}">
+                            <option value="auto" {{ 'selected' if p.source_currency is not defined or p.source_currency == 'auto' }}>Auto-detect</option>
+                            <option value="USD" {{ 'selected' if p.source_currency == 'USD' or (p.fx_currency is defined and p.fx_currency == 'USD') }}>USD</option>
+                            <option value="EUR" {{ 'selected' if p.source_currency == 'EUR' or (p.fx_currency is defined and p.fx_currency == 'EUR') }}>EUR</option>
+                            <option value="GBP" {{ 'selected' if p.source_currency == 'GBP' or (p.fx_currency is defined and p.fx_currency == 'GBP') }}>GBP</option>
+                            <option value="CAD" {{ 'selected' if p.source_currency == 'CAD' }}>CAD</option>
+                            <option value="AUD" {{ 'selected' if p.source_currency == 'AUD' }}>AUD</option>
+                            <option value="JPY" {{ 'selected' if p.source_currency == 'JPY' }}>JPY</option>
+                            <option value="SEK" {{ 'selected' if p.source_currency == 'SEK' }}>SEK</option>
+                            <option value="NOK" {{ 'selected' if p.source_currency == 'NOK' }}>NOK</option>
+                            <option value="DKK" {{ 'selected' if p.source_currency == 'DKK' }}>DKK</option>
+                            <option value="CHF" {{ 'selected' if p.source_currency == 'CHF' }}>CHF</option>
+                            <option value="BRL" {{ 'selected' if p.source_currency == 'BRL' }}>BRL</option>
                         </select>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">FX Rate</label>
-                        <input class="form-input" type="number" name="payor_fxrate_{{ loop.index0 }}" value="{{ p.fx_rate }}" min="0" step="0.0001">
                     </div>
                 </div>
                 <div class="form-row" style="margin-bottom:10px;">
@@ -3155,16 +3212,21 @@ function addEditPayor() {
                 <input class="form-input" type="number" name="payor_fee_${n}" value="15" min="0" max="100" step="0.1">
             </div>
             <div class="form-group">
-                <label class="form-label">Output Currency</label>
-                <select class="form-input" name="payor_fx_${n}">
-                    <option value="USD" selected>USD</option>
+                <label class="form-label">Source Currency</label>
+                <select class="form-input" name="payor_source_currency_${n}">
+                    <option value="auto" selected>Auto-detect</option>
+                    <option value="USD">USD</option>
                     <option value="EUR">EUR</option>
                     <option value="GBP">GBP</option>
+                    <option value="CAD">CAD</option>
+                    <option value="AUD">AUD</option>
+                    <option value="JPY">JPY</option>
+                    <option value="SEK">SEK</option>
+                    <option value="NOK">NOK</option>
+                    <option value="DKK">DKK</option>
+                    <option value="CHF">CHF</option>
+                    <option value="BRL">BRL</option>
                 </select>
-            </div>
-            <div class="form-group">
-                <label class="form-label">FX Rate</label>
-                <input class="form-input" type="number" name="payor_fxrate_${n}" value="1.0" min="0" step="0.0001">
             </div>
         </div>
         <div class="form-row" style="margin-bottom:10px;">
@@ -3597,8 +3659,8 @@ function addEditPayor() {
             <button class="pill-tab active" onclick="showDashTab('top')">Top Songs</button>
             <button class="pill-tab" onclick="showDashTab('annual')">Annual</button>
             <button class="pill-tab" onclick="showDashTab('decay')">YoY Decay</button>
-            <button class="pill-tab" onclick="showDashTab('dist')">LTM Distributors</button>
-            <button class="pill-tab" onclick="showDashTab('types')">LTM Types</button>
+            <button class="pill-tab" onclick="showDashTab('dist')">LTM Stores</button>
+            <button class="pill-tab" onclick="showDashTab('types')">LTM Media Types</button>
         </div>
 
         <div class="tab-content active" id="dtab-top">
@@ -3656,28 +3718,28 @@ function addEditPayor() {
         </div>
 
         <div class="tab-content" id="dtab-dist">
-            {% for d in (results.ltm_distributors | default([]))[:8] %}
+            {% for d in (results.ltm_stores | default([]))[:8] %}
             <div class="dist-bar-wrap">
                 <div class="dist-bar-label">
                     <span class="name">{{ d.name }}</span>
                     <span class="val"><span class="data-money" data-raw="{{ d.gross }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ d.gross_fmt }}</span></span>
                 </div>
                 <div class="dist-bar-track">
-                    <div class="dist-bar-fill" style="width: {{ (d.gross / (results.ltm_distributors | default([{}]))[0].gross * 100) | round(1) if results.ltm_distributors is defined and results.ltm_distributors and results.ltm_distributors[0].gross else 0 }}%"></div>
+                    <div class="dist-bar-fill" style="width: {{ (d.gross / (results.ltm_stores | default([{}]))[0].gross * 100) | round(1) if results.ltm_stores is defined and results.ltm_stores and results.ltm_stores[0].gross else 0 }}%"></div>
                 </div>
             </div>
             {% endfor %}
         </div>
 
         <div class="tab-content" id="dtab-types">
-            {% for d in (results.ltm_download_types | default([]))[:8] %}
+            {% for d in (results.ltm_media_types | default([]))[:8] %}
             <div class="dist-bar-wrap">
                 <div class="dist-bar-label">
                     <span class="name">{{ d.name }}</span>
                     <span class="val"><span class="data-money" data-raw="{{ d.gross }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ d.gross_fmt }}</span></span>
                 </div>
                 <div class="dist-bar-track">
-                    <div class="dist-bar-fill" style="width: {{ (d.gross / (results.ltm_download_types | default([{}]))[0].gross * 100) | round(1) if results.ltm_download_types is defined and results.ltm_download_types and results.ltm_download_types[0].gross else 0 }}%"></div>
+                    <div class="dist-bar-fill" style="width: {{ (d.gross / (results.ltm_media_types | default([{}]))[0].gross * 100) | round(1) if results.ltm_media_types is defined and results.ltm_media_types and results.ltm_media_types[0].gross else 0 }}%"></div>
                 </div>
             </div>
             {% endfor %}
@@ -4128,6 +4190,24 @@ function addEditPayor() {
                     </table>
                 </div>
             </details>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {# Quality warnings #}
+        {% set all_warnings = [] %}
+        {% for ps in results.payor_summaries %}
+            {% for w in ps.get('quality_warnings', []) %}
+                {% if all_warnings.append({'payor': ps.name, 'msg': w}) %}{% endif %}
+            {% endfor %}
+        {% endfor %}
+        {% if all_warnings %}
+        <div style="margin-top:16px; padding-top:16px; border-top:1px solid var(--border);">
+            <div style="font-size:11px; font-weight:600; color:var(--yellow); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:10px;">Data Quality Warnings</div>
+            {% for w in all_warnings %}
+            <div style="font-size:12px; color:var(--text-secondary); padding:4px 0; border-bottom:1px solid var(--border-subtle);">
+                <span style="color:var(--yellow); font-weight:500;">{{ w.payor }}:</span> {{ w.msg }}
+            </div>
             {% endfor %}
         </div>
         {% endif %}
@@ -4828,10 +4908,16 @@ def run_custom():
             fmt = request.form.get(f'payor_fmt_{idx}', 'auto')
             fee_raw = request.form.get(f'payor_fee_{idx}', '').strip()
             fee = 0.0 if (not fee_raw or fee_raw.upper() == 'N/A') else float(fee_raw) / 100.0
-            fx_currency = request.form.get(f'payor_fx_{idx}', 'USD')
-            fxrate_raw = request.form.get(f'payor_fxrate_{idx}', '').strip()
-            fx_rate = float(fxrate_raw) if fxrate_raw else 1.0
+            source_currency = request.form.get(f'payor_source_currency_{idx}', 'auto')
             statement_type = request.form.get(f'payor_stype_{idx}', 'masters')
+
+            # Share calculation toggles
+            calc_payable = request.form.get(f'payor_calc_payable_{idx}') is not None
+            payable_pct_raw = request.form.get(f'payor_payable_pct_{idx}', '0').strip()
+            payable_pct = float(payable_pct_raw) if payable_pct_raw else 0.0
+            calc_third_party = request.form.get(f'payor_calc_third_party_{idx}') is not None
+            tp_pct_raw = request.form.get(f'payor_third_party_pct_{idx}', '0').strip()
+            third_party_pct = float(tp_pct_raw) if tp_pct_raw else 0.0
 
             # Deal term fields
             deal_type = request.form.get(f'payor_deal_type_{idx}', 'artist').strip()
@@ -4901,12 +4987,15 @@ def run_custom():
                 name=name.strip(),
                 fmt=fmt,
                 fee=fee,
-                fx_currency=fx_currency,
-                fx_rate=fx_rate,
+                source_currency=source_currency,
                 statements_dir=payor_dir,
                 statement_type=statement_type,
                 deal_type=deal_type,
                 artist_split=artist_split,
+                calc_payable=calc_payable,
+                payable_pct=payable_pct,
+                calc_third_party=calc_third_party,
+                third_party_pct=third_party_pct,
                 territory=territory,
                 contract_pdf_path=contract_pdf_path,
                 contract_summary=contract_summary,
@@ -5109,13 +5198,19 @@ def custom_upload():
             fmt = request.form.get(f'payor_fmt_{idx}', 'auto')
             fee_raw = request.form.get(f'payor_fee_{idx}', '').strip()
             fee = 0.0 if (not fee_raw or fee_raw.upper() == 'N/A') else float(fee_raw) / 100.0
-            fx_currency = request.form.get(f'payor_fx_{idx}', 'USD')
-            fxrate_raw = request.form.get(f'payor_fxrate_{idx}', '').strip()
-            fx_rate = float(fxrate_raw) if fxrate_raw else 1.0
+            source_currency = request.form.get(f'payor_source_currency_{idx}', 'auto')
             statement_type = request.form.get(f'payor_stype_{idx}', 'masters')
             split_raw = request.form.get(f'payor_split_{idx}', '').strip()
             artist_split = float(split_raw) if split_raw else None
             territory = request.form.get(f'payor_territory_{idx}', '').strip() or None
+
+            # Share calculation toggles
+            calc_payable = request.form.get(f'payor_calc_payable_{idx}') is not None
+            payable_pct_raw = request.form.get(f'payor_payable_pct_{idx}', '0').strip()
+            payable_pct = float(payable_pct_raw) if payable_pct_raw else 0.0
+            calc_third_party = request.form.get(f'payor_calc_third_party_{idx}') is not None
+            tp_pct_raw = request.form.get(f'payor_third_party_pct_{idx}', '0').strip()
+            third_party_pct = float(tp_pct_raw) if tp_pct_raw else 0.0
 
             # Save uploaded files
             payor_dir = os.path.join(work_dir, code)
@@ -5148,10 +5243,13 @@ def custom_upload():
                 'name': name,
                 'fmt': fmt,
                 'fee': fee,
-                'fx_currency': fx_currency,
-                'fx_rate': fx_rate,
+                'source_currency': source_currency,
                 'statement_type': statement_type,
                 'artist_split': artist_split,
+                'calc_payable': calc_payable,
+                'payable_pct': payable_pct,
+                'calc_third_party': calc_third_party,
+                'third_party_pct': third_party_pct,
                 'territory': territory,
                 'payor_dir': payor_dir,
                 'local_dir': local_dir,
@@ -5642,10 +5740,13 @@ def _do_custom_process(sess, sid):
                 statements_dir=statements_dir,
                 fmt=p['fmt'],
                 fee=p['fee'],
-                fx_currency=p['fx_currency'],
-                fx_rate=p['fx_rate'],
+                source_currency=p.get('source_currency', p.get('fx_currency', 'auto')),
                 statement_type=p['statement_type'],
                 artist_split=p.get('artist_split'),
+                calc_payable=p.get('calc_payable', False),
+                payable_pct=p.get('payable_pct', 0.0),
+                calc_third_party=p.get('calc_third_party', False),
+                third_party_pct=p.get('third_party_pct', 0.0),
                 territory=p.get('territory'),
             )
             configs.append(cfg)
@@ -5972,8 +6073,8 @@ def custom_export():
     # Map raw detail columns to canonical aggregation field names
     raw_to_agg = [
         ('statement_date', 'Statement Date'), ('identifier', 'ISRC'),
-        ('title', 'Title'), ('artist', 'Artist'), ('distributor', 'Source'),
-        ('download_type', 'Delivery Type'), ('country', 'Territory'),
+        ('title', 'Title'), ('artist', 'Artist'), ('store', 'Source'),
+        ('media_type', 'Media Type'), ('country', 'Territory'),
     ]
     # Payor and Royalty Type are always available (set by config, not mapping)
     available_agg_fields = ['Statement Date', 'Royalty Type', 'Payor']
@@ -6487,7 +6588,8 @@ def api_analyze_contract():
         tmp_paths = []
         uploaded_files = []
 
-        genai.configure(api_key=api_key)
+        _genai = _get_genai()
+        _genai.configure(api_key=api_key)
 
         # Save and upload each PDF
         for cf in contract_files:
@@ -6497,12 +6599,12 @@ def api_analyze_contract():
             cf.save(tmp.name)
             tmp.close()
             tmp_paths.append(tmp.name)
-            uploaded_files.append(genai.upload_file(tmp.name, mime_type='application/pdf'))
+            uploaded_files.append(_genai.upload_file(tmp.name, mime_type='application/pdf'))
 
         if not uploaded_files:
             return jsonify({'error': 'No valid PDF files found'}), 400
 
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = _genai.GenerativeModel('gemini-2.0-flash')
         n_docs = len(uploaded_files)
         prompt = f"""Analyze {'this music industry contract' if n_docs == 1 else 'these ' + str(n_docs) + ' music industry contract documents together as parts of the same deal'} and extract the following deal terms.
 Return a single JSON object with exactly these keys (use null if not found):
@@ -6629,8 +6731,7 @@ def edit_deal_route(slug):
                 'name': c.name,
                 'fmt': c.fmt,
                 'fee': c.fee,
-                'fx_currency': c.fx_currency,
-                'fx_rate': c.fx_rate,
+                'source_currency': getattr(c, 'source_currency', getattr(c, 'fx_currency', 'USD')),
                 'statement_type': c.statement_type,
                 'deal_type': getattr(c, 'deal_type', 'artist'),
                 'artist_split': c.artist_split,
@@ -6692,10 +6793,16 @@ def edit_deal_post(slug):
             fmt = request.form.get(f'payor_fmt_{idx}', 'auto')
             fee_raw = request.form.get(f'payor_fee_{idx}', '').strip()
             fee = 0.0 if (not fee_raw or fee_raw.upper() == 'N/A') else float(fee_raw) / 100.0
-            fx_currency = request.form.get(f'payor_fx_{idx}', 'USD')
-            fxrate_raw = request.form.get(f'payor_fxrate_{idx}', '').strip()
-            fx_rate = float(fxrate_raw) if fxrate_raw else 1.0
+            source_currency = request.form.get(f'payor_source_currency_{idx}', 'auto')
             statement_type = request.form.get(f'payor_stype_{idx}', 'masters')
+
+            # Share calculation toggles
+            calc_payable = request.form.get(f'payor_calc_payable_{idx}') is not None
+            payable_pct_raw = request.form.get(f'payor_payable_pct_{idx}', '0').strip()
+            payable_pct = float(payable_pct_raw) if payable_pct_raw else 0.0
+            calc_third_party = request.form.get(f'payor_calc_third_party_{idx}') is not None
+            tp_pct_raw = request.form.get(f'payor_third_party_pct_{idx}', '0').strip()
+            third_party_pct = float(tp_pct_raw) if tp_pct_raw else 0.0
 
             deal_type = request.form.get(f'payor_deal_type_{idx}', 'artist').strip()
             split_raw = request.form.get(f'payor_split_{idx}', '').strip()
@@ -6740,12 +6847,15 @@ def edit_deal_post(slug):
                 name=name.strip(),
                 fmt=fmt,
                 fee=fee,
-                fx_currency=fx_currency,
-                fx_rate=fx_rate,
+                source_currency=source_currency,
                 statements_dir=payor_dir,
                 statement_type=statement_type,
                 deal_type=deal_type,
                 artist_split=artist_split,
+                calc_payable=calc_payable,
+                payable_pct=payable_pct,
+                calc_third_party=calc_third_party,
+                third_party_pct=third_party_pct,
                 territory=territory,
                 contract_pdf_path=contract_pdf_path,
                 contract_summary=contract_summary,
@@ -6884,7 +6994,8 @@ def api_chat():
     history = _chat_histories[session_id]
 
     try:
-        model = genai.GenerativeModel(
+        _genai = _get_genai()
+        model = _genai.GenerativeModel(
             'gemini-2.0-flash',
             system_instruction=system_prompt,
         )
