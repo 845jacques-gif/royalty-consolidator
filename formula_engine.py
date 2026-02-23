@@ -4,10 +4,13 @@ Handles bracket-notation formula parsing, waterfall field auto-calculation,
 and percent-column derivations for the consolidator Phase 2 pipeline.
 """
 
+import logging
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
+
+log = logging.getLogger('royalty')
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +155,8 @@ def auto_calculate(df: pd.DataFrame, available: Optional[dict] = None) -> Tuple[
                 if target in still_missing:
                     still_missing.remove(target)
                 made_progress = True
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Percent derivation failed for %s: %s", target, e)
 
         # Try direct waterfall relationships
         for target, func, required in WATERFALL_RELATIONSHIPS:
@@ -168,8 +171,8 @@ def auto_calculate(df: pd.DataFrame, available: Optional[dict] = None) -> Tuple[
                 if target in still_missing:
                     still_missing.remove(target)
                 made_progress = True
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Waterfall derivation failed for %s: %s", target, e)
 
         if not made_progress:
             break

@@ -6,6 +6,7 @@ Detects headers, proposes column mappings, runs QC, and remembers mappings via S
 import csv
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -16,6 +17,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from consolidator import COLUMN_PATTERNS
+
+log = logging.getLogger('royalty')
+
+# Lazy import to avoid circular dependency at module load time
+_db_mod = None
+
+def _db():
+    """Lazy-load db module and check availability."""
+    global _db_mod
+    if _db_mod is None:
+        try:
+            import db as _d
+            _db_mod = _d
+        except ImportError:
+            return None
+    return _db_mod if _db_mod.is_available() else None
 
 # Canonical schema fields
 CANONICAL_FIELDS = [
@@ -106,15 +123,55 @@ def compute_fingerprint(cols: List[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _sniff_csv_encoding(filepath: str) -> str:
-    """Try common encodings for CSV files."""
-    for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+    """Detect CSV encoding by reading raw bytes once and testing decodes."""
+    try:
+        with open(filepath, 'rb') as f:
+            raw = f.read()
+    except IOError:
+        return 'utf-8'
+    for enc in ('utf-8-sig', 'utf-8'):
         try:
-            with open(filepath, encoding=enc) as f:
-                f.read(4096)
+            raw.decode(enc)
             return enc
         except (UnicodeDecodeError, UnicodeError):
             continue
-    return 'utf-8'
+    # latin-1 never fails (all bytes 0-255 are valid), so use it as fallback
+    return 'latin-1'
+
+
+def _pick_best_sheet(sheet_names: List[str]) -> str:
+    """Auto-select the most likely line-item data sheet from an Excel workbook.
+
+    Prefers sheets whose names suggest digital royalty detail data.
+    Falls back to the first sheet if nothing matches.
+    """
+    # Keywords that suggest line-item royalty data (ordered by priority)
+    PREFER_KW = [
+        'digital sales', 'digital', 'streaming', 'detail', 'royalt',
+        'line item', 'lineitem', 'transaction', 'sales', 'download',
+        'mechanical', 'master',
+    ]
+    # Keywords that suggest summary / non-data tabs we want to skip
+    SKIP_KW = [
+        'summary', 'payment', 'invoice', 'cover', 'index', 'totals',
+        'instructions', 'notes', 'template', 'info',
+    ]
+
+    lower_names = [(s, s.lower().strip()) for s in sheet_names]
+
+    # First pass: pick the highest-priority PREFER keyword match
+    for kw in PREFER_KW:
+        for original, low in lower_names:
+            if kw in low:
+                return original
+
+    # Second pass: pick the first sheet that isn't a SKIP sheet
+    for original, low in lower_names:
+        if not any(sk in low for sk in SKIP_KW):
+            return original
+
+    # Fallback: first sheet
+    return sheet_names[0]
 
 
 def detect_headers(filepath: str, sheet: Optional[str] = None) -> dict:
@@ -131,11 +188,12 @@ def detect_headers(filepath: str, sheet: Optional[str] = None) -> dict:
     raw_rows: List[List[Any]] = []
     sheets: Optional[List[str]] = None
 
-    if ext in ('.xlsx', '.xls'):
-        xls = pd.ExcelFile(filepath)
+    if ext in ('.xlsx', '.xls', '.xlsb'):
+        engine = 'pyxlsb' if ext == '.xlsb' else None
+        xls = pd.ExcelFile(filepath, engine=engine)
         sheets = xls.sheet_names
-        target_sheet = sheet if sheet and sheet in sheets else sheets[0]
-        df_raw = pd.read_excel(filepath, sheet_name=target_sheet, header=None, nrows=30, dtype=str)
+        target_sheet = sheet if sheet and sheet in sheets else _pick_best_sheet(sheets)
+        df_raw = pd.read_excel(filepath, sheet_name=target_sheet, header=None, nrows=30, dtype=str, engine=engine)
         raw_rows = df_raw.fillna('').values.tolist()
     elif ext == '.csv':
         enc = _sniff_csv_encoding(filepath)
@@ -211,37 +269,56 @@ def propose_mapping(cols: List[str]) -> Dict[str, dict]:
         4. Unmapped → confidence 0.0
     """
     fp = compute_fingerprint(cols)
-    conn = _get_conn()
 
     result = {}
 
-    # 1. Check fingerprint
-    row = conn.execute(
-        'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
-    ).fetchone()
+    # 1. Check fingerprint — try PostgreSQL first, then SQLite
+    saved_mapping = None
+    dbm = _db()
+    if dbm:
+        try:
+            saved_mapping = dbm.get_fingerprint_mapping_db(fp)
+        except Exception as e:
+            log.debug("DB fingerprint lookup failed: %s", e)
 
-    if row:
-        saved = json.loads(row['mapping'])
-        # saved is {source_col: canonical_field}
-        for col in cols:
-            canonical = saved.get(col, '')
-            result[col] = {'canonical': canonical, 'confidence': 1.0 if canonical else 0.0}
+    if saved_mapping is None:
+        conn = _get_conn()
+        row = conn.execute(
+            'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
+        ).fetchone()
+        if row:
+            saved_mapping = json.loads(row['mapping'])
         conn.close()
+
+    if saved_mapping:
+        for col in cols:
+            canonical = saved_mapping.get(col, '')
+            result[col] = {'canonical': canonical, 'confidence': 1.0 if canonical else 0.0}
         return result
 
     # Build a set of already-assigned canonical fields to avoid duplicates
     assigned: set = set()
 
-    # 2. Check synonyms
+    # 2. Check synonyms — try PostgreSQL first, then SQLite
     for col in cols:
-        syn_row = conn.execute(
-            'SELECT canonical FROM synonyms WHERE raw_name = ?', (col.strip().lower(),)
-        ).fetchone()
-        if syn_row and syn_row['canonical'] not in assigned:
-            result[col] = {'canonical': syn_row['canonical'], 'confidence': 0.9}
-            assigned.add(syn_row['canonical'])
-
-    conn.close()
+        raw_lower = col.strip().lower()
+        canonical = None
+        if dbm:
+            try:
+                canonical = dbm.get_synonyms_db(raw_lower)
+            except Exception as e:
+                log.debug("DB synonym lookup failed for '%s': %s", raw_lower, e)
+        if canonical is None:
+            conn = _get_conn()
+            syn_row = conn.execute(
+                'SELECT canonical FROM synonyms WHERE raw_name = ?', (raw_lower,)
+            ).fetchone()
+            if syn_row:
+                canonical = syn_row['canonical']
+            conn.close()
+        if canonical and canonical not in assigned:
+            result[col] = {'canonical': canonical, 'confidence': 0.9}
+            assigned.add(canonical)
 
     # 3. COLUMN_PATTERNS fuzzy match
     # For each column, find all potential matches and pick the longest pattern
@@ -279,6 +356,16 @@ def propose_mapping(cols: List[str]) -> Dict[str, dict]:
 def get_fingerprint_mapping(cols: List[str]) -> Optional[Dict[str, str]]:
     """Check if a fingerprint match exists. Returns saved mapping dict or None."""
     fp = compute_fingerprint(cols)
+    # Try PostgreSQL first
+    dbm = _db()
+    if dbm:
+        try:
+            result = dbm.get_fingerprint_mapping_db(fp)
+            if result is not None:
+                return result
+        except Exception as e:
+            log.debug("DB fingerprint lookup failed: %s", e)
+    # Fall back to SQLite
     conn = _get_conn()
     row = conn.execute(
         'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
@@ -309,8 +396,12 @@ def apply_cleaning(filepath: str, remove_top: int = 0, remove_bottom: int = 0,
         header_row = detection['header_row']
 
     ext = os.path.splitext(filepath)[1].lower()
-    if ext in ('.xlsx', '.xls'):
-        df = pd.read_excel(filepath, sheet_name=sheet or 0, header=header_row, dtype=str)
+    if ext in ('.xlsx', '.xls', '.xlsb'):
+        engine = 'pyxlsb' if ext == '.xlsb' else None
+        if not sheet:
+            xls = pd.ExcelFile(filepath, engine=engine)
+            sheet = _pick_best_sheet(xls.sheet_names)
+        df = pd.read_excel(filepath, sheet_name=sheet, header=header_row, dtype=str, engine=engine)
     elif ext == '.csv':
         enc = _sniff_csv_encoding(filepath)
         # Use skiprows to avoid C parser errors from inconsistent field counts
@@ -319,9 +410,16 @@ def apply_cleaning(filepath: str, remove_top: int = 0, remove_bottom: int = 0,
         try:
             df = pd.read_csv(filepath, header=0 if skip else header_row,
                              skiprows=skip, dtype=str, encoding=enc)
-        except pd.errors.ParserError:
+        except UnicodeDecodeError:
             df = pd.read_csv(filepath, header=0 if skip else header_row,
-                             skiprows=skip, dtype=str, encoding=enc, on_bad_lines='skip')
+                             skiprows=skip, dtype=str, encoding='latin-1')
+        except pd.errors.ParserError:
+            try:
+                df = pd.read_csv(filepath, header=0 if skip else header_row,
+                                 skiprows=skip, dtype=str, encoding=enc, on_bad_lines='skip')
+            except UnicodeDecodeError:
+                df = pd.read_csv(filepath, header=0 if skip else header_row,
+                                 skiprows=skip, dtype=str, encoding='latin-1', on_bad_lines='skip')
     else:
         return {'headers': [], 'preview_rows': [], 'total_rows': 0, 'header_row': 0}
 
@@ -361,17 +459,28 @@ def apply_mapping(filepath: str, mapping: Dict[str, str], header_row: int,
     """
     ext = os.path.splitext(filepath)[1].lower()
 
-    if ext in ('.xlsx', '.xls'):
-        df = pd.read_excel(filepath, sheet_name=sheet or 0, header=header_row, dtype=str)
+    if ext in ('.xlsx', '.xls', '.xlsb'):
+        engine = 'pyxlsb' if ext == '.xlsb' else None
+        if not sheet:
+            xls = pd.ExcelFile(filepath, engine=engine)
+            sheet = _pick_best_sheet(xls.sheet_names)
+        df = pd.read_excel(filepath, sheet_name=sheet, header=header_row, dtype=str, engine=engine)
     elif ext == '.csv':
         enc = _sniff_csv_encoding(filepath)
         skip = list(range(header_row)) if header_row and header_row > 0 else None
         try:
             df = pd.read_csv(filepath, header=0 if skip else header_row,
                              skiprows=skip, dtype=str, encoding=enc)
-        except pd.errors.ParserError:
+        except UnicodeDecodeError:
             df = pd.read_csv(filepath, header=0 if skip else header_row,
-                             skiprows=skip, dtype=str, encoding=enc, on_bad_lines='skip')
+                             skiprows=skip, dtype=str, encoding='latin-1')
+        except pd.errors.ParserError:
+            try:
+                df = pd.read_csv(filepath, header=0 if skip else header_row,
+                                 skiprows=skip, dtype=str, encoding=enc, on_bad_lines='skip')
+            except UnicodeDecodeError:
+                df = pd.read_csv(filepath, header=0 if skip else header_row,
+                                 skiprows=skip, dtype=str, encoding='latin-1', on_bad_lines='skip')
     else:
         df = pd.DataFrame()
 
@@ -575,7 +684,16 @@ def run_qc(df: pd.DataFrame) -> QCResult:
 
 def save_mapping(fingerprint: str, cols: List[str], mapping: Dict[str, str],
                  source_label: str = ''):
-    """Upsert mapping to fingerprints table."""
+    """Upsert mapping to fingerprints table (PostgreSQL + SQLite)."""
+    # Save to PostgreSQL if available
+    dbm = _db()
+    if dbm:
+        try:
+            dbm.save_mapping_db(fingerprint, cols, mapping, source_label)
+        except Exception as e:
+            log.warning("DB save_mapping failed: %s", e)
+
+    # Always save to SQLite as fallback
     conn = _get_conn()
     now = datetime.now().isoformat()
     col_json = json.dumps(cols)
@@ -604,7 +722,16 @@ def save_mapping(fingerprint: str, cols: List[str], mapping: Dict[str, str],
 
 
 def save_synonyms(mapping: Dict[str, str]):
-    """Extract user corrections into synonyms table."""
+    """Extract user corrections into synonyms table (PostgreSQL + SQLite)."""
+    # Save to PostgreSQL if available
+    dbm = _db()
+    if dbm:
+        try:
+            dbm.save_synonyms_db(mapping)
+        except Exception as e:
+            log.warning("DB save_synonyms failed: %s", e)
+
+    # Always save to SQLite as fallback
     conn = _get_conn()
     for raw_col, canonical in mapping.items():
         if not canonical or canonical not in CANONICAL_FIELDS:
@@ -621,7 +748,14 @@ def save_synonyms(mapping: Dict[str, str]):
 
 
 def increment_fingerprint_use(fingerprint: str):
-    """Increment use_count for an existing fingerprint."""
+    """Increment use_count for an existing fingerprint (PostgreSQL + SQLite)."""
+    dbm = _db()
+    if dbm:
+        try:
+            dbm.increment_fingerprint_use_db(fingerprint)
+        except Exception as e:
+            log.debug("DB increment_fingerprint_use failed: %s", e)
+
     conn = _get_conn()
     conn.execute(
         'UPDATE fingerprints SET use_count = use_count + 1, updated_at = ? WHERE fingerprint = ?',
@@ -653,7 +787,15 @@ def export_clean(df: pd.DataFrame, path: str, fmt: str = 'xlsx'):
 
 def log_import(filename: str, fingerprint: str, mapping: Dict[str, str],
                row_count: int, qc_warnings: int, qc_errors: int, status: str = 'approved'):
-    """Write to import_log."""
+    """Write to import_log (PostgreSQL + SQLite)."""
+    dbm = _db()
+    if dbm:
+        try:
+            dbm.log_import_db(filename, fingerprint, mapping, row_count,
+                              qc_warnings, qc_errors, status)
+        except Exception as e:
+            log.warning("DB log_import failed: %s", e)
+
     conn = _get_conn()
     conn.execute("""
         INSERT INTO import_log (filename, fingerprint, mapping_used, row_count,
@@ -666,7 +808,14 @@ def log_import(filename: str, fingerprint: str, mapping: Dict[str, str],
 
 
 def get_import_history(limit: int = 20) -> List[dict]:
-    """Return recent import log entries."""
+    """Return recent import log entries (PostgreSQL preferred, SQLite fallback)."""
+    dbm = _db()
+    if dbm:
+        try:
+            return dbm.get_import_history_db(limit)
+        except Exception as e:
+            log.debug("DB get_import_history failed: %s", e)
+
     conn = _get_conn()
     rows = conn.execute(
         'SELECT * FROM import_log ORDER BY created_at DESC LIMIT ?', (limit,)
@@ -676,7 +825,14 @@ def get_import_history(limit: int = 20) -> List[dict]:
 
 
 def get_saved_formats() -> List[dict]:
-    """Return all saved fingerprint mappings."""
+    """Return all saved fingerprint mappings (PostgreSQL preferred, SQLite fallback)."""
+    dbm = _db()
+    if dbm:
+        try:
+            return dbm.get_saved_formats_db()
+        except Exception as e:
+            log.debug("DB get_saved_formats failed: %s", e)
+
     conn = _get_conn()
     rows = conn.execute(
         'SELECT fingerprint, source_label, column_names, use_count, updated_at '

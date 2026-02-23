@@ -99,6 +99,8 @@ def check_non_conforming_format(file_inventory: List[dict], payor_code: str = ''
     bad_files = []
 
     for fi in file_inventory:
+        if fi.get('status') == 'duplicate':
+            continue  # duplicates are intentionally skipped, not errors
         if fi.get('status') == 'skipped' or fi.get('rows', 0) == 0:
             bad_files.append(fi.get('filename', 'unknown'))
 

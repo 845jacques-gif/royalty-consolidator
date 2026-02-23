@@ -5,11 +5,13 @@ deduplication, and progress callbacks.
 """
 
 import json
+import logging
 import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Callable, Dict, List, Optional, Tuple
@@ -18,6 +20,22 @@ from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 import pandas as pd
+
+log = logging.getLogger('royalty')
+
+# Lazy DB module reference
+_db_mod = None
+
+def _db():
+    """Lazy-load db module and check availability."""
+    global _db_mod
+    if _db_mod is None:
+        try:
+            import db as _d
+            _db_mod = _d
+        except ImportError:
+            return None
+    return _db_mod if _db_mod.is_available() else None
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +70,16 @@ _enrichment_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__))
 
 def _load_cache():
     global _enrichment_cache
+    # Try DB first
+    dbm = _db()
+    if dbm:
+        try:
+            _enrichment_cache = dbm.load_full_enrichment_cache_db()
+            if _enrichment_cache:
+                return
+        except Exception as e:
+            log.debug("DB enrichment cache load failed: %s", e)
+    # Fall back to JSON file
     if os.path.exists(_enrichment_cache_path):
         try:
             with open(_enrichment_cache_path, 'r', encoding='utf-8') as f:
@@ -61,11 +89,19 @@ def _load_cache():
 
 
 def _save_cache():
+    # Save to DB if available
+    dbm = _db()
+    if dbm:
+        try:
+            dbm.save_enrichment_cache_db(_enrichment_cache)
+        except Exception as e:
+            log.debug("DB enrichment cache save failed: %s", e)
+    # Always save to file as fallback
     try:
         with open(_enrichment_cache_path, 'w', encoding='utf-8') as f:
             json.dump(_enrichment_cache, f, indent=2, ensure_ascii=False)
-    except IOError:
-        pass
+    except IOError as e:
+        log.warning("Failed to save enrichment cache file: %s", e)
 
 
 def _cache_key_isrc(isrc: str) -> str:
@@ -150,75 +186,87 @@ def deduplicate_tracks(detail_df: pd.DataFrame) -> List[TrackLookupItem]:
 # Tier 1: MusicBrainz
 # ---------------------------------------------------------------------------
 
-def _lookup_musicbrainz_isrc(isrc: str) -> dict:
-    """Look up a single ISRC on MusicBrainz. Returns {release_date, track_name, artist_name}."""
+def _lookup_musicbrainz_isrc(isrc: str, _retries: int = 3) -> dict:
+    """Look up a single ISRC on MusicBrainz. Retries on 503 rate-limit."""
     url = f"https://musicbrainz.org/ws/2/recording?query=isrc:{isrc}&fmt=json"
-    req = Request(url, headers={"User-Agent": "RoyaltyConsolidator/2.0 (contact@example.com)"})
 
     result = {'release_date': '', 'track_name': '', 'artist_name': ''}
-    try:
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+    for attempt in range(_retries):
+        req = Request(url, headers={"User-Agent": "RoyaltyConsolidator/2.0 (contact@example.com)"})
+        try:
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
 
-        recordings = data.get("recordings", [])
-        if recordings:
-            # Pick earliest release date across all recordings
-            best_date = None
-            best_rec = recordings[0]
-            for rec in recordings:
-                frd = rec.get("first-release-date", "")
-                if frd and (best_date is None or frd < best_date):
-                    best_date = frd
-                    best_rec = rec
+            recordings = data.get("recordings", [])
+            if recordings:
+                best_date = None
+                best_rec = recordings[0]
+                for rec in recordings:
+                    frd = rec.get("first-release-date", "")
+                    if frd and (best_date is None or frd < best_date):
+                        best_date = frd
+                        best_rec = rec
 
-            artist_credit = best_rec.get("artist-credit", [{}])
-            artist_name = artist_credit[0].get("name", "") if artist_credit else ""
-            result = {
-                'release_date': best_date or '',
-                'track_name': best_rec.get("title", ""),
-                'artist_name': artist_name,
-            }
-    except (HTTPError, URLError) as e:
-        if hasattr(e, 'code') and e.code == 503:
-            time.sleep(2)
-    except Exception:
-        pass
+                artist_credit = best_rec.get("artist-credit", [{}])
+                artist_name = artist_credit[0].get("name", "") if artist_credit else ""
+                result = {
+                    'release_date': best_date or '',
+                    'track_name': best_rec.get("title", ""),
+                    'artist_name': artist_name,
+                }
+            return result
+        except (HTTPError, URLError) as e:
+            if hasattr(e, 'code') and e.code == 503:
+                time.sleep(1 + attempt)  # backoff: 1s, 2s, 3s
+                continue
+            log.debug("MB ISRC HTTP error for %s: %s", isrc, e)
+            return result
+        except Exception as e:
+            log.debug("MB ISRC lookup error for %s: %s", isrc, e)
+            return result
 
     return result
 
 
-def _lookup_musicbrainz_title_artist(title: str, artist: str) -> dict:
-    """Search MusicBrainz by title+artist. Returns {release_date, track_name, artist_name}."""
+def _lookup_musicbrainz_title_artist(title: str, artist: str, _retries: int = 3) -> dict:
+    """Search MusicBrainz by title+artist. Retries on 503 rate-limit."""
     query = f'recording:"{title}" AND artist:"{artist}"'
     url = f"https://musicbrainz.org/ws/2/recording?query={quote_plus(query)}&fmt=json&limit=5"
-    req = Request(url, headers={"User-Agent": "RoyaltyConsolidator/2.0 (contact@example.com)"})
 
     result = {'release_date': '', 'track_name': '', 'artist_name': ''}
-    try:
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+    for attempt in range(_retries):
+        req = Request(url, headers={"User-Agent": "RoyaltyConsolidator/2.0 (contact@example.com)"})
+        try:
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
 
-        recordings = data.get("recordings", [])
-        if recordings:
-            best_date = None
-            best_rec = recordings[0]
-            for rec in recordings:
-                frd = rec.get("first-release-date", "")
-                if frd and (best_date is None or frd < best_date):
-                    best_date = frd
-                    best_rec = rec
+            recordings = data.get("recordings", [])
+            if recordings:
+                best_date = None
+                best_rec = recordings[0]
+                for rec in recordings:
+                    frd = rec.get("first-release-date", "")
+                    if frd and (best_date is None or frd < best_date):
+                        best_date = frd
+                        best_rec = rec
 
-            artist_credit = best_rec.get("artist-credit", [{}])
-            artist_name = artist_credit[0].get("name", "") if artist_credit else ""
-            result = {
-                'release_date': best_date or '',
-                'track_name': best_rec.get("title", ""),
-                'artist_name': artist_name,
-            }
-    except (HTTPError, URLError):
-        pass
-    except Exception:
-        pass
+                artist_credit = best_rec.get("artist-credit", [{}])
+                artist_name = artist_credit[0].get("name", "") if artist_credit else ""
+                result = {
+                    'release_date': best_date or '',
+                    'track_name': best_rec.get("title", ""),
+                    'artist_name': artist_name,
+                }
+            return result
+        except (HTTPError, URLError) as e:
+            if hasattr(e, 'code') and e.code == 503:
+                time.sleep(1 + attempt)
+                continue
+            log.debug("MB title+artist HTTP error for '%s' by '%s': %s", title, artist, e)
+            return result
+        except Exception as e:
+            log.debug("MB title+artist lookup error for '%s' by '%s': %s", title, artist, e)
+            return result
 
     return result
 
@@ -282,18 +330,18 @@ def _lookup_genius(title: str, artist: str, token: str, min_confidence: float = 
                         'track_name': song_info.get('title', best_hit.get('title', '')),
                         'artist_name': song_info.get('primary_artist', {}).get('name', ''),
                     }
-                except Exception:
-                    # Fall back to whatever we have
+                except Exception as e:
+                    log.debug("Genius song detail fetch failed for '%s': %s", title, e)
                     result = {
                         'release_date': '',
                         'track_name': best_hit.get('title', ''),
                         'artist_name': best_hit.get('primary_artist', {}).get('name', ''),
                     }
 
-    except (HTTPError, URLError):
-        pass
-    except Exception:
-        pass
+    except (HTTPError, URLError) as e:
+        log.debug("Genius search HTTP error for '%s': %s", title, e)
+    except Exception as e:
+        log.debug("Genius search error for '%s': %s", title, e)
 
     return result
 
@@ -325,7 +373,7 @@ def _lookup_gemini_batch(items: List[TrackLookupItem], api_key: str,
         return results
 
     total_batches = (len(items) + batch_size - 1) // batch_size
-    executor = ThreadPoolExecutor(max_workers=1)
+    executor = ThreadPoolExecutor(max_workers=min(5, total_batches))
 
     # Process in batches
     for batch_num, batch_start in enumerate(range(0, len(items), batch_size)):
@@ -461,14 +509,14 @@ def enrich_release_dates(
                            'total': len(items),
                            'message': f"{stats['from_source']} from source data, {stats['from_cache']} from cache, {len(need_lookup)} to look up"})
 
-    # Tier 1: MusicBrainz
+    # Tier 1: MusicBrainz (multi-threaded, 10 workers)
     still_need = []
     if 'MB' not in skip_tiers and need_lookup:
-        for i, item in enumerate(need_lookup):
-            if progress_callback:
-                progress_callback({'phase': 'musicbrainz', 'current': i + 1, 'total': len(need_lookup),
-                                   'message': f'MusicBrainz: {i+1}/{len(need_lookup)} — {item.title or item.isrc}'})
+        mb_lock = threading.Lock()
+        mb_counter = [0]  # mutable counter for progress
 
+        def _mb_worker(item):
+            """Look up a single item on MusicBrainz (runs in thread pool)."""
             if item.isrc:
                 mb_result = _lookup_musicbrainz_isrc(item.isrc)
             else:
@@ -476,60 +524,97 @@ def enrich_release_dates(
 
             key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
 
-            if mb_result.get('release_date'):
-                entry = {
-                    'release_date': mb_result['release_date'],
-                    'source': 'MB',
-                    'track_name': mb_result.get('track_name', item.title),
-                    'artist_name': mb_result.get('artist_name', item.artist),
-                    'looked_up': True,
-                }
-                result.lookups[key] = entry
-                _enrichment_cache[key] = entry
-                stats['mb_found'] += 1
-            else:
-                # Cache the miss too
-                _enrichment_cache[key] = {
-                    'release_date': '',
-                    'source': '',
-                    'track_name': item.title,
-                    'artist_name': item.artist,
-                    'looked_up': True,
-                }
-                still_need.append(item)
+            with mb_lock:
+                mb_counter[0] += 1
+                if progress_callback:
+                    progress_callback({
+                        'phase': 'musicbrainz', 'current': mb_counter[0],
+                        'total': len(need_lookup),
+                        'message': f'MusicBrainz: {mb_counter[0]}/{len(need_lookup)} — {item.title or item.isrc}',
+                    })
 
-            time.sleep(1.1)  # MusicBrainz rate limit
+            return item, key, mb_result
+
+        with ThreadPoolExecutor(max_workers=min(20, len(need_lookup))) as mb_pool:
+            futures = [mb_pool.submit(_mb_worker, item) for item in need_lookup]
+
+            for future in as_completed(futures):
+                try:
+                    item, key, mb_result = future.result()
+                except Exception as e:
+                    log.debug("MB worker thread error: %s", e)
+                    continue
+
+                if mb_result.get('release_date'):
+                    entry = {
+                        'release_date': mb_result['release_date'],
+                        'source': 'MB',
+                        'track_name': mb_result.get('track_name', item.title),
+                        'artist_name': mb_result.get('artist_name', item.artist),
+                        'looked_up': True,
+                    }
+                    result.lookups[key] = entry
+                    _enrichment_cache[key] = entry
+                    stats['mb_found'] += 1
+                else:
+                    _enrichment_cache[key] = {
+                        'release_date': '',
+                        'source': '',
+                        'track_name': item.title,
+                        'artist_name': item.artist,
+                        'looked_up': True,
+                    }
+                    still_need.append(item)
     else:
         still_need = need_lookup
 
     _save_cache()
 
-    # Tier 2: Genius
+    # Tier 2: Genius (multi-threaded, 10 workers)
     genius_still_need = []
     if 'GN' not in skip_tiers and genius_token and still_need:
-        for i, item in enumerate(still_need):
-            if progress_callback:
-                progress_callback({'phase': 'genius', 'current': i + 1, 'total': len(still_need),
-                                   'message': f'Genius: {i+1}/{len(still_need)} — {item.title}'})
+        gn_lock = threading.Lock()
+        gn_counter = [0]
 
+        def _gn_worker(item):
+            """Look up a single item on Genius (runs in thread pool)."""
             gn_result = _lookup_genius(item.title, item.artist, genius_token)
             key = _cache_key_isrc(item.isrc) if item.isrc else _cache_key_title_artist(item.title, item.artist)
 
-            if gn_result.get('release_date'):
-                entry = {
-                    'release_date': gn_result['release_date'],
-                    'source': 'GN',
-                    'track_name': gn_result.get('track_name', item.title),
-                    'artist_name': gn_result.get('artist_name', item.artist),
-                    'looked_up': True,
-                }
-                result.lookups[key] = entry
-                _enrichment_cache[key] = entry
-                stats['gn_found'] += 1
-            else:
-                genius_still_need.append(item)
+            with gn_lock:
+                gn_counter[0] += 1
+                if progress_callback:
+                    progress_callback({
+                        'phase': 'genius', 'current': gn_counter[0],
+                        'total': len(still_need),
+                        'message': f'Genius: {gn_counter[0]}/{len(still_need)} — {item.title}',
+                    })
 
-            time.sleep(0.3)  # Genius rate limit
+            return item, key, gn_result
+
+        with ThreadPoolExecutor(max_workers=min(20, len(still_need))) as gn_pool:
+            futures = [gn_pool.submit(_gn_worker, item) for item in still_need]
+
+            for future in as_completed(futures):
+                try:
+                    item, key, gn_result = future.result()
+                except Exception as e:
+                    log.debug("Genius worker thread error: %s", e)
+                    continue
+
+                if gn_result.get('release_date'):
+                    entry = {
+                        'release_date': gn_result['release_date'],
+                        'source': 'GN',
+                        'track_name': gn_result.get('track_name', item.title),
+                        'artist_name': gn_result.get('artist_name', item.artist),
+                        'looked_up': True,
+                    }
+                    result.lookups[key] = entry
+                    _enrichment_cache[key] = entry
+                    stats['gn_found'] += 1
+                else:
+                    genius_still_need.append(item)
     else:
         genius_still_need = still_need
 

@@ -4,3 +4,10 @@ __pycache__/
 .env
 *.xlsx
 *.csv
+*.pkl
+gcs-credentials.json
+mappings.db
+isrc_cache.json
+release_date_cache.json
+deals/
+app.log

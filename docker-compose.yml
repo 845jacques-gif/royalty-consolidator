@@ -10,9 +10,18 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GENIUS_TOKEN=${GENIUS_TOKEN:-}
       - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-}
+      - DB_HOST=${DB_HOST:-}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-royalty_consolidator}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-}
+      - DB_MAX_CONN=${DB_MAX_CONN:-10}
+      - GCS_BUCKET=${GCS_BUCKET:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
     volumes:
       - ./deals:/app/deals
       - tmp_data:/tmp/royalty_consolidator
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/app/gcs-credentials.json:ro
     restart: unless-stopped
 
   caddy:

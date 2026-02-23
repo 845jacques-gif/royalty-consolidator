@@ -18,10 +18,15 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
+_log_dir = os.path.dirname(os.path.abspath(__file__))
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(_log_dir, 'app.log'), encoding='utf-8'),
+    ],
 )
 log = logging.getLogger('royalty')
 
@@ -48,10 +53,20 @@ import mapper
 import formula_engine
 import validator
 import enrichment
+import db
+import storage
 
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24).hex())
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
+
+
+@app.after_request
+def _no_cache(response):
+    """Prevent browser from caching HTML pages (stale JS/CSS)."""
+    if 'text/html' in response.content_type:
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return response
 
 def _log_memory():
     """Log current memory usage (works on Linux/Docker and Windows)."""
@@ -73,6 +88,14 @@ os.makedirs(WORK_DIR, exist_ok=True)
 DEALS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deals')
 os.makedirs(DEALS_DIR, exist_ok=True)
 
+# Initialise PostgreSQL + GCS (graceful — app works without them)
+_db_ok = db.init_pool()
+if _db_ok:
+    _migrations_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'migrations')
+    if os.path.isdir(_migrations_dir):
+        db.run_migrations(_migrations_dir)
+_gcs_ok = storage.init_gcs()
+
 app.jinja_env.filters['basename'] = lambda p: os.path.basename(p) if p else ''
 
 # Cache results in memory so we don't re-parse on every page load
@@ -80,8 +103,11 @@ _cached_results = {}
 _cached_analytics = {}
 _cached_deal_name = ''
 
+
 # Ingest wizard session state (keyed by session ID for isolation)
 _ingest_sessions = {}
+_processing_locks = {}          # sid -> threading.Lock()  – prevents duplicate runs
+_processing_locks_guard = threading.Lock()  # protects _processing_locks dict
 INGEST_TEMP = os.path.join(tempfile.gettempdir(), 'royalty_consolidator', 'ingest')
 os.makedirs(INGEST_TEMP, exist_ok=True)
 
@@ -286,7 +312,38 @@ def _make_slug(deal_name):
 
 
 def save_deal(slug, deal_name, payor_results, analytics, xlsx_path, csv_path, per_payor_paths):
-    """Persist a deal to disk: pkl + json + copy export files + contracts."""
+    """Persist a deal to DB + GCS + local disk."""
+    # Save to PostgreSQL if available
+    if db.is_available():
+        try:
+            csym = analytics.get('currency_symbol', '$')
+            db.save_deal_to_db(slug, deal_name, payor_results, analytics,
+                               currency_symbol=csym)
+            log.info("Deal '%s' saved to PostgreSQL", slug)
+        except Exception as e:
+            log.error("DB save failed for %s: %s", slug, e, exc_info=True)
+
+    # Upload exports to GCS if available
+    if storage.is_available():
+        try:
+            if xlsx_path and os.path.exists(xlsx_path):
+                storage.upload_export(slug, os.path.basename(xlsx_path), xlsx_path)
+            if csv_path and os.path.exists(csv_path):
+                storage.upload_export(slug, os.path.basename(csv_path), csv_path)
+            if per_payor_paths:
+                for code, path in per_payor_paths.items():
+                    if path and os.path.exists(path):
+                        storage.upload_per_payor_export(slug, os.path.basename(path), path)
+            for pr in payor_results.values():
+                if pr.config.contract_pdf_path and os.path.exists(pr.config.contract_pdf_path):
+                    storage.upload_contract(slug, pr.config.code,
+                                            os.path.basename(pr.config.contract_pdf_path),
+                                            pr.config.contract_pdf_path)
+            log.info("Deal '%s' exports uploaded to GCS", slug)
+        except Exception as e:
+            log.error("GCS upload failed for %s: %s", slug, e)
+
+    # Always keep local as fallback
     deal_dir = os.path.join(DEALS_DIR, slug)
     os.makedirs(deal_dir, exist_ok=True)
 
@@ -441,37 +498,83 @@ def load_deal(slug):
 
 
 def list_deals():
-    """Scan DEALS_DIR and return sorted list of deal metadata dicts."""
+    """Return sorted list of deal metadata, merging DB and local sources."""
+    seen_slugs = set()
     deals = []
-    if not os.path.isdir(DEALS_DIR):
-        return deals
-    for slug in os.listdir(DEALS_DIR):
-        meta_path = os.path.join(DEALS_DIR, slug, 'deal_meta.json')
-        if os.path.isfile(meta_path):
-            try:
-                with open(meta_path, 'r') as f:
-                    meta = json.load(f)
-                meta['slug'] = slug
-                # Backwards compat: populate LTM fields from analytics.json if missing
-                if 'ltm_gross' not in meta:
-                    analytics_path = os.path.join(DEALS_DIR, slug, 'analytics.json')
-                    if os.path.isfile(analytics_path):
-                        try:
-                            with open(analytics_path, 'r') as af:
-                                ana = json.load(af)
-                            meta['ltm_gross'] = ana.get('ltm_gross_total_fmt', meta.get('total_gross', '0'))
-                            meta['ltm_net'] = ana.get('ltm_net_total_fmt', ana.get('total_net', '0'))
-                        except (json.JSONDecodeError, KeyError):
+
+    # Try PostgreSQL first
+    if db.is_available():
+        try:
+            db_deals = db.list_deals_from_db()
+            for d in db_deals:
+                seen_slugs.add(d['slug'])
+                deals.append(d)
+        except Exception as e:
+            log.warning("DB list_deals failed: %s", e)
+
+    # Always scan local DEALS_DIR for deals not yet in DB
+    if os.path.isdir(DEALS_DIR):
+        for slug in os.listdir(DEALS_DIR):
+            if slug in seen_slugs:
+                continue
+            meta_path = os.path.join(DEALS_DIR, slug, 'deal_meta.json')
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                    meta['slug'] = slug
+                    if 'ltm_gross' not in meta:
+                        analytics_path = os.path.join(DEALS_DIR, slug, 'analytics.json')
+                        if os.path.isfile(analytics_path):
+                            try:
+                                with open(analytics_path, 'r') as af:
+                                    ana = json.load(af)
+                                meta['ltm_gross'] = ana.get('ltm_gross_total_fmt', meta.get('total_gross', '0'))
+                                meta['ltm_net'] = ana.get('ltm_net_total_fmt', ana.get('total_net', '0'))
+                            except (json.JSONDecodeError, KeyError):
+                                meta['ltm_gross'] = meta.get('total_gross', '0')
+                                meta['ltm_net'] = '0'
+                        else:
                             meta['ltm_gross'] = meta.get('total_gross', '0')
                             meta['ltm_net'] = '0'
-                    else:
-                        meta['ltm_gross'] = meta.get('total_gross', '0')
-                        meta['ltm_net'] = '0'
-                deals.append(meta)
-            except (json.JSONDecodeError, KeyError):
-                continue
+                    deals.append(meta)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
     deals.sort(key=lambda d: d.get('timestamp', ''), reverse=True)
     return deals
+
+
+# ---------------------------------------------------------------------------
+# Auto-load the most recent saved deal on startup
+# ---------------------------------------------------------------------------
+def _auto_load_last_deal():
+    global _cached_results, _cached_analytics, _cached_deal_name
+    try:
+        best_slug = None
+        best_ts = ''
+        for slug in os.listdir(DEALS_DIR):
+            meta_path = os.path.join(DEALS_DIR, slug, 'deal_meta.json')
+            if os.path.isfile(meta_path):
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                ts = meta.get('timestamp', '')
+                if ts > best_ts:
+                    best_ts = ts
+                    best_slug = slug
+        if best_slug:
+            deal_name, payor_results, analytics, xlsx_path, csv_path, per_payor_paths = load_deal(best_slug)
+            _cached_results = payor_results
+            _cached_analytics = analytics
+            _cached_deal_name = deal_name
+            app.config['CONSOLIDATED_PATH'] = xlsx_path
+            app.config['CONSOLIDATED_CSV_PATH'] = csv_path
+            app.config['PER_PAYOR_PATHS'] = per_payor_paths
+            log.info("Auto-loaded last deal '%s' (%s) on startup", deal_name, best_slug)
+    except Exception as e:
+        log.warning("Could not auto-load last deal on startup: %s", e)
+
+_auto_load_last_deal()
 
 
 # ---------------------------------------------------------------------------
@@ -1117,7 +1220,7 @@ function updateCleaningPreview() {
     </div>
     <input type="hidden" name="headers_json" value='{{ custom_headers | tojson }}'>
     <div id="mappingWarnings" style="margin-bottom:12px;"></div>
-    <button type="submit" class="btn-submit">Save Mapping &amp; Continue &rarr;</button>
+    <button type="submit" class="btn-submit" id="mapSubmitBtn">Save Mapping &amp; Continue &rarr;</button>
     </form>
 </div>
 
@@ -1141,9 +1244,19 @@ function onMappingChange(sel) {
         s.style.borderColor = s.value ? 'var(--accent)' : 'var(--border)';
     });
 }
-// Init on load
+// Init on load + submit debounce
 document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('select[name^="map_"]').forEach(s => onMappingChange(s));
+    // Prevent double-submit on mapping form
+    const mapForm = document.getElementById('mapSubmitBtn')?.closest('form');
+    if (mapForm) {
+        mapForm.addEventListener('submit', function(e) {
+            const btn = document.getElementById('mapSubmitBtn');
+            if (btn.disabled) { e.preventDefault(); return; }
+            btn.disabled = true;
+            btn.textContent = 'Processing\u2026';
+        });
+    }
 });
 </script>
 
@@ -1277,8 +1390,14 @@ document.addEventListener('DOMContentLoaded', () => {
     <input type="hidden" name="formula_{{ field.name }}" id="hformula_{{ field.name | replace(' ', '_') }}" value="{{ field.formula | default('') }}">
     {% endif %}
     {% endfor %}
-    <button type="submit" class="btn-submit" onclick="syncFormulas()">Finalize &amp; Process &rarr;</button>
+    <button type="submit" class="btn-submit" id="finalizeBtn" onclick="syncFormulas();">Finalize &amp; Process &rarr;</button>
 </form>
+<script>
+document.querySelector('form[action="/custom/calc"]').addEventListener('submit', function() {
+    var btn = document.getElementById('finalizeBtn');
+    setTimeout(function(){ btn.disabled=true; btn.textContent='Processing\u2026'; }, 50);
+});
+</script>
 
 <script>
 function validateFormula(fieldName) {
@@ -1929,7 +2048,7 @@ function syncFormulas() {
         <form method="POST" action="/ingest/upload" enctype="multipart/form-data">
             <div class="form-group">
                 <label class="form-label">Statement File</label>
-                <input class="form-input" type="file" name="statement_file" accept=".xlsx,.xls,.csv" required>
+                <input class="form-input" type="file" name="statement_file" accept=".xlsx,.xls,.xlsb,.csv" required>
             </div>
             <button type="submit" class="btn-submit">Upload &amp; Detect</button>
         </form>
@@ -2082,36 +2201,35 @@ function syncFormulas() {
                         <span style="font-size:10px; color:var(--text-dim);">1.0 = no conversion</span>
                     </div>
                 </div>
+                <div style="background:var(--bg-inset); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+                        <div class="form-group" style="flex:1; margin:0;">
+                            <label class="form-label">Contract PDFs</label>
+                            <input class="form-input" type="file" name="payor_contract_0" accept=".pdf" multiple onchange="toggleAnalyzeBtn(this, 0)">
+                        </div>
+                        <div style="padding-top:18px;">
+                            <button type="button" class="nav-btn primary" id="analyzeBtn_0" style="font-size:11px; padding:6px 14px; display:none;" onclick="analyzeContract(0)">Analyze Contract</button>
+                        </div>
+                    </div>
+                    <div id="contractResult_0" style="display:none; font-size:11px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:6px;"></div>
+                </div>
                 <div class="form-row" style="margin-bottom:10px;">
                     <div class="form-group">
-                        <label class="form-label">Artist/Label Split %</label>
-                        <input class="form-input" type="number" name="payor_split_0" placeholder="e.g. 80" min="0" max="100" step="0.1">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Matching Right</label>
-                        <select class="form-input" name="payor_matching_0">
-                            <option value="">—</option>
-                            <option value="yes">Yes</option>
-                            <option value="no">No</option>
+                        <label class="form-label">Deal Type</label>
+                        <select class="form-input" name="payor_deal_type_0">
+                            <option value="artist" selected>Artist Deal</option>
+                            <option value="label">Label Deal</option>
                         </select>
+                        <span style="font-size:10px; color:var(--text-dim);">Whose earnings perspective</span>
                     </div>
                     <div class="form-group">
-                        <label class="form-label">Contract Term</label>
-                        <input class="form-input" type="text" name="payor_term_0" placeholder="e.g. 3 years">
+                        <label class="form-label">Share Split %</label>
+                        <input class="form-input" type="number" name="payor_split_0" placeholder="e.g. 50" min="0" max="100" step="0.1">
+                        <span style="font-size:10px; color:var(--text-dim);">Your share after distro fees</span>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Territory</label>
                         <input class="form-input" type="text" name="payor_territory_0" placeholder="e.g. Worldwide">
-                    </div>
-                </div>
-                <div class="form-row" style="margin-bottom:10px;">
-                    <div class="form-group">
-                        <label class="form-label">Advance</label>
-                        <input class="form-input" type="number" name="payor_advance_0" placeholder="Amount" min="0" step="0.01">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Contract PDF</label>
-                        <input class="form-input" type="file" name="payor_contract_0" accept=".pdf">
                     </div>
                 </div>
                 <div class="form-row" style="margin-bottom:10px;">
@@ -2136,7 +2254,7 @@ function syncFormulas() {
                 <div class="form-group" style="margin-bottom:0;">
                     <label class="form-label">Or Upload Files</label>
                     <div class="dropzone">
-                        <input type="file" name="payor_files_0" multiple accept=".zip,.xlsx,.xls,.csv,.pdf" style="display:none;" onchange="updateDropzoneFiles(this)">
+                        <input type="file" name="payor_files_0" multiple accept=".zip,.xlsx,.xls,.xlsb,.csv,.pdf" style="display:none;" onchange="updateDropzoneFiles(this)">
                         <input type="file" name="payor_folder_0" webkitdirectory style="display:none;" onchange="updateDropzoneFiles(this, 'payor_files_0')">
                         <div class="dz-icon">&#128194;</div>
                         <div class="dz-text">Drag files or folder here, or
@@ -2223,6 +2341,81 @@ function _presetOptions() {
         sorted.map(p => '<option value="'+p.code+'">'+p.name+'</option>').join('');
 }
 
+function toggleAnalyzeBtn(input, idx) {
+    const btn = document.getElementById('analyzeBtn_' + idx);
+    if (btn) btn.style.display = input.files.length ? '' : 'none';
+}
+
+function analyzeContract(idx) {
+    const block = document.querySelector('.payor-block[data-idx="'+idx+'"]') || document.querySelector('.payor-block');
+    const fileInput = block ? block.querySelector('[name=payor_contract_'+idx+']') : document.querySelector('[name=payor_contract_'+idx+']');
+    if (!fileInput || !fileInput.files.length) return;
+
+    const btn = document.getElementById('analyzeBtn_' + idx);
+    const resultDiv = document.getElementById('contractResult_' + idx);
+    const numFiles = fileInput.files.length;
+    btn.disabled = true;
+    btn.textContent = 'Analyzing ' + numFiles + ' file' + (numFiles > 1 ? 's' : '') + '...';
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<span style="color:var(--text-dim);">Uploading and analyzing ' + numFiles + ' contract' + (numFiles > 1 ? 's' : '') + ' with Gemini...</span>';
+
+    const fd = new FormData();
+    for (let i = 0; i < fileInput.files.length; i++) {
+        fd.append('contract_pdfs', fileInput.files[i]);
+    }
+
+    fetch('/api/analyze-contract', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            btn.disabled = false;
+            btn.textContent = 'Analyze Contracts';
+            if (data.error) {
+                resultDiv.innerHTML = '<span style="color:var(--red);">Error: ' + data.error + '</span>';
+                return;
+            }
+            // Store analysis for submission
+            let hidden = block ? block.querySelector('[name=payor_contract_summary_'+idx+']') : document.querySelector('[name=payor_contract_summary_'+idx+']');
+            if (!hidden) {
+                hidden = document.createElement('input');
+                hidden.type = 'hidden';
+                hidden.name = 'payor_contract_summary_' + idx;
+                (block || fileInput.closest('form')).appendChild(hidden);
+            }
+            hidden.value = JSON.stringify(data);
+
+            // Show summary
+            let html = '<div style="margin-bottom:6px; font-weight:600; color:var(--text-primary);">Contract Summary (' + numFiles + ' document' + (numFiles > 1 ? 's' : '') + ')</div>';
+            if (data.summary) html += '<div style="margin-bottom:8px; color:var(--text-secondary);">' + data.summary + '</div>';
+            html += '<div style="display:flex; flex-wrap:wrap; gap:6px;">';
+            if (data.license_term) html += '<span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--text-secondary);">Term: ' + data.license_term + '</span>';
+            if (data.matching_right !== null && data.matching_right !== undefined) html += '<span style="background:' + (data.matching_right ? 'var(--red-dim)' : 'var(--green-dim)') + '; padding:2px 8px; border-radius:4px; color:' + (data.matching_right ? 'var(--red)' : 'var(--green)') + ';">Matching: ' + (data.matching_right ? 'Yes' : 'No') + '</span>';
+            if (data.assignment_language !== null && data.assignment_language !== undefined) html += '<span style="background:' + (data.assignment_language ? 'rgba(251,191,36,0.15)' : 'var(--green-dim)') + '; padding:2px 8px; border-radius:4px; color:' + (data.assignment_language ? 'var(--yellow)' : 'var(--green)') + ';">Assignment: ' + (data.assignment_language ? 'Yes' : 'No') + '</span>';
+            if (data.distro_fee !== null && data.distro_fee !== undefined) html += '<span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--cyan);">Fee: ' + data.distro_fee + '%</span>';
+            if (data.split_pct !== null && data.split_pct !== undefined) html += '<span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--accent);">Split: ' + data.split_pct + '%</span>';
+            if (data.deal_type) html += '<span style="background:rgba(139,92,246,0.15); padding:2px 8px; border-radius:4px; color:var(--purple);">' + (data.deal_type === 'artist' ? 'Artist Deal' : 'Label Deal') + '</span>';
+            html += '</div>';
+            html += '<div style="margin-top:8px;"><button type="button" class="nav-btn" style="font-size:10px; padding:3px 10px;" onclick="applyContractTerms('+idx+')">Apply to form fields</button></div>';
+            resultDiv.innerHTML = html;
+        })
+        .catch(err => {
+            btn.disabled = false;
+            btn.textContent = 'Analyze Contracts';
+            resultDiv.innerHTML = '<span style="color:var(--red);">Error: ' + err.message + '</span>';
+        });
+}
+
+function applyContractTerms(idx) {
+    const block = document.querySelector('.payor-block[data-idx="'+idx+'"]') || document.querySelector('.payor-block');
+    const hidden = block ? block.querySelector('[name=payor_contract_summary_'+idx+']') : document.querySelector('[name=payor_contract_summary_'+idx+']');
+    if (!hidden || !hidden.value) return;
+    const data = JSON.parse(hidden.value);
+    const q = name => block ? block.querySelector('[name='+name+']') : document.querySelector('[name='+name+']');
+
+    if (data.deal_type) { const el = q('payor_deal_type_'+idx); if (el) el.value = data.deal_type; }
+    if (data.split_pct !== null && data.split_pct !== undefined) { const el = q('payor_split_'+idx); if (el) el.value = data.split_pct; }
+    if (data.distro_fee !== null && data.distro_fee !== undefined) { const el = q('payor_fee_'+idx); if (el) el.value = data.distro_fee; }
+}
+
 let payorIdx = 1;
 function addPayor() {
     const n = payorIdx;
@@ -2279,36 +2472,35 @@ function addPayor() {
                 <input class="form-input" type="number" name="payor_fxrate_${n}" value="1.0" min="0" step="0.0001">
             </div>
         </div>
+        <div style="background:var(--bg-inset); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px;">
+            <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+                <div class="form-group" style="flex:1; margin:0;">
+                    <label class="form-label">Contract PDFs</label>
+                    <input class="form-input" type="file" name="payor_contract_${n}" accept=".pdf" multiple onchange="toggleAnalyzeBtn(this, ${n})">
+                </div>
+                <div style="padding-top:18px;">
+                    <button type="button" class="nav-btn primary" id="analyzeBtn_${n}" style="font-size:11px; padding:6px 14px; display:none;" onclick="analyzeContract(${n})">Analyze Contracts</button>
+                </div>
+            </div>
+            <div id="contractResult_${n}" style="display:none; font-size:11px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:6px;"></div>
+        </div>
         <div class="form-row" style="margin-bottom:10px;">
             <div class="form-group">
-                <label class="form-label">Artist/Label Split %</label>
-                <input class="form-input" type="number" name="payor_split_${n}" placeholder="e.g. 80" min="0" max="100" step="0.1">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Matching Right</label>
-                <select class="form-input" name="payor_matching_${n}">
-                    <option value="">—</option>
-                    <option value="yes">Yes</option>
-                    <option value="no">No</option>
+                <label class="form-label">Deal Type</label>
+                <select class="form-input" name="payor_deal_type_${n}">
+                    <option value="artist" selected>Artist Deal</option>
+                    <option value="label">Label Deal</option>
                 </select>
+                <span style="font-size:10px; color:var(--text-dim);">Whose earnings perspective</span>
             </div>
             <div class="form-group">
-                <label class="form-label">Contract Term</label>
-                <input class="form-input" type="text" name="payor_term_${n}" placeholder="e.g. 3 years">
+                <label class="form-label">Share Split %</label>
+                <input class="form-input" type="number" name="payor_split_${n}" placeholder="e.g. 50" min="0" max="100" step="0.1">
+                <span style="font-size:10px; color:var(--text-dim);">Your share after distro fees</span>
             </div>
             <div class="form-group">
                 <label class="form-label">Territory</label>
                 <input class="form-input" type="text" name="payor_territory_${n}" placeholder="e.g. Worldwide">
-            </div>
-        </div>
-        <div class="form-row" style="margin-bottom:10px;">
-            <div class="form-group">
-                <label class="form-label">Advance</label>
-                <input class="form-input" type="number" name="payor_advance_${n}" placeholder="Amount" min="0" step="0.01">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Contract PDF</label>
-                <input class="form-input" type="file" name="payor_contract_${n}" accept=".pdf">
             </div>
         </div>
         <div class="form-row" style="margin-bottom:10px;">
@@ -2333,7 +2525,7 @@ function addPayor() {
         <div class="form-group" style="margin-bottom:0;">
             <label class="form-label">Or Upload Files</label>
             <div class="dropzone">
-                <input type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.csv,.pdf" style="display:none;" onchange="updateDropzoneFiles(this)">
+                <input type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.xlsb,.csv,.pdf" style="display:none;" onchange="updateDropzoneFiles(this)">
                 <input type="file" name="payor_folder_${n}" webkitdirectory style="display:none;" onchange="updateDropzoneFiles(this, 'payor_files_${n}')">
                 <div class="dz-icon">&#128194;</div>
                 <div class="dz-text">Drag files or folder here, or
@@ -2352,7 +2544,7 @@ function addPayor() {
 
 /* ---- Drag-and-Drop Helpers ---- */
 const _dzFiles = {};  // maps input name (payor_files_N) -> File[]
-const ACCEPTED_EXT = ['.csv', '.xlsx', '.xls', '.zip', '.pdf'];
+const ACCEPTED_EXT = ['.csv', '.xlsx', '.xls', '.xlsb', '.zip', '.pdf'];
 
 function _readEntryRecursive(entry) {
     return new Promise((resolve) => {
@@ -2504,6 +2696,7 @@ if (document.readyState === 'loading') {
 /* ---- Statement Date Extraction Modal ---- */
 let _pendingFilenames = [];
 let _dateMap = {};
+let _dateSources = {};
 
 function handleFormSubmit() {
     // Collect all filenames from _dzFiles and native file inputs
@@ -2556,14 +2749,20 @@ function handleFormSubmit() {
 }
 
 function _fetchDatesAndShowModal(filenames) {
+    // Collect directory paths so API can peek inside files for dates
+    const dirs = [];
+    document.querySelectorAll('input[name^="payor_dir_"]').forEach(inp => {
+        if (inp.value.trim()) dirs.push(inp.value.trim());
+    });
     fetch('/api/extract-dates', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({filenames: filenames}),
+        body: JSON.stringify({filenames: filenames, dirs: dirs}),
     })
     .then(r => r.json())
     .then(data => {
         _dateMap = data.dates || {};
+        _dateSources = data.sources || {};
         showDateModal();
     })
     .catch(() => { _submitViaFetch(); });
@@ -2574,10 +2773,14 @@ function showDateModal() {
     tbody.innerHTML = '';
     _pendingFilenames.forEach((fn, i) => {
         const date = _dateMap[fn] || '';
+        const src = (_dateSources && _dateSources[fn]) || '';
+        const srcBadge = src === 'content' ? '<span style="font-size:9px; background:var(--green-dim); color:var(--green); padding:1px 5px; border-radius:3px; margin-left:4px;">from file</span>'
+                       : src === 'filename' ? '<span style="font-size:9px; background:rgba(59,130,246,0.15); color:var(--accent); padding:1px 5px; border-radius:3px; margin-left:4px;">from name</span>'
+                       : '';
         const tr = document.createElement('tr');
         tr.style.borderBottom = '1px solid var(--border)';
         tr.innerHTML = `
-            <td style="padding:6px 8px; color:var(--text-secondary); max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${fn}">${fn}</td>
+            <td style="padding:6px 8px; color:var(--text-secondary); max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${fn}">${fn}${srcBadge}</td>
             <td style="padding:6px 8px;">
                 <input class="form-input date-input" type="text" data-filename="${fn}" data-idx="${i}"
                        value="${date}" placeholder="MM/DD/YY" style="font-size:12px; padding:4px 8px;"
@@ -2856,35 +3059,21 @@ function _submitViaFetch() {
                 </div>
                 <div class="form-row" style="margin-bottom:10px;">
                     <div class="form-group">
-                        <label class="form-label">Artist/Label Split %</label>
-                        <input class="form-input" type="number" name="payor_split_{{ loop.index0 }}" value="{{ p.artist_split if p.artist_split is not none else '' }}" min="0" max="100" step="0.1">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Matching Right</label>
-                        <select class="form-input" name="payor_matching_{{ loop.index0 }}">
-                            <option value="">—</option>
-                            <option value="yes" {{ 'selected' if p.matching_right == true }}>Yes</option>
-                            <option value="no" {{ 'selected' if p.matching_right == false and p.matching_right is not none }}>No</option>
+                        <label class="form-label">Deal Type</label>
+                        <select class="form-input" name="payor_deal_type_{{ loop.index0 }}">
+                            <option value="artist" {{ 'selected' if p.get('deal_type', 'artist') == 'artist' }}>Artist Deal</option>
+                            <option value="label" {{ 'selected' if p.get('deal_type', 'artist') == 'label' }}>Label Deal</option>
                         </select>
+                        <span style="font-size:10px; color:var(--text-dim);">Whose earnings perspective</span>
                     </div>
                     <div class="form-group">
-                        <label class="form-label">Contract Term</label>
-                        <input class="form-input" type="text" name="payor_term_{{ loop.index0 }}" value="{{ p.contract_term or '' }}">
+                        <label class="form-label">Share Split %</label>
+                        <input class="form-input" type="number" name="payor_split_{{ loop.index0 }}" value="{{ p.artist_split if p.artist_split is not none else '' }}" min="0" max="100" step="0.1">
+                        <span style="font-size:10px; color:var(--text-dim);">Your share after distro fees</span>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Territory</label>
                         <input class="form-input" type="text" name="payor_territory_{{ loop.index0 }}" value="{{ p.territory or '' }}">
-                    </div>
-                </div>
-                <div class="form-row" style="margin-bottom:10px;">
-                    <div class="form-group">
-                        <label class="form-label">Advance</label>
-                        <input class="form-input" type="number" name="payor_advance_{{ loop.index0 }}" value="{{ p.advance if p.advance is not none else '' }}" min="0" step="0.01">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Contract PDF</label>
-                        <input class="form-input" type="file" name="payor_contract_{{ loop.index0 }}" accept=".pdf">
-                        {% if p.contract_pdf_path %}<span style="font-size:10px; color:var(--text-dim);">Current: {{ p.contract_pdf_path | basename }}</span>{% endif %}
                     </div>
                 </div>
                 <div class="form-row" style="margin-bottom:10px;">
@@ -2904,7 +3093,7 @@ function _submitViaFetch() {
                 </div>
                 <div class="form-group" style="margin-bottom:0;">
                     <label class="form-label">Add More Statement Files</label>
-                    <input class="form-input" type="file" name="payor_files_{{ loop.index0 }}" multiple accept=".zip,.xlsx,.xls,.csv,.pdf">
+                    <input class="form-input" type="file" name="payor_files_{{ loop.index0 }}" multiple accept=".zip,.xlsx,.xls,.xlsb,.csv,.pdf">
                     <span style="font-size:10px; color:var(--text-dim);">New files will be appended to existing statements for this payor.</span>
                 </div>
             </div>
@@ -2980,34 +3169,21 @@ function addEditPayor() {
         </div>
         <div class="form-row" style="margin-bottom:10px;">
             <div class="form-group">
-                <label class="form-label">Artist/Label Split %</label>
-                <input class="form-input" type="number" name="payor_split_${n}" placeholder="e.g. 80" min="0" max="100" step="0.1">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Matching Right</label>
-                <select class="form-input" name="payor_matching_${n}">
-                    <option value="">—</option>
-                    <option value="yes">Yes</option>
-                    <option value="no">No</option>
+                <label class="form-label">Deal Type</label>
+                <select class="form-input" name="payor_deal_type_${n}">
+                    <option value="artist" selected>Artist Deal</option>
+                    <option value="label">Label Deal</option>
                 </select>
+                <span style="font-size:10px; color:var(--text-dim);">Whose earnings perspective</span>
             </div>
             <div class="form-group">
-                <label class="form-label">Contract Term</label>
-                <input class="form-input" type="text" name="payor_term_${n}" placeholder="e.g. 3 years">
+                <label class="form-label">Share Split %</label>
+                <input class="form-input" type="number" name="payor_split_${n}" placeholder="e.g. 50" min="0" max="100" step="0.1">
+                <span style="font-size:10px; color:var(--text-dim);">Your share after distro fees</span>
             </div>
             <div class="form-group">
                 <label class="form-label">Territory</label>
                 <input class="form-input" type="text" name="payor_territory_${n}" placeholder="e.g. Worldwide">
-            </div>
-        </div>
-        <div class="form-row" style="margin-bottom:10px;">
-            <div class="form-group">
-                <label class="form-label">Advance</label>
-                <input class="form-input" type="number" name="payor_advance_${n}" placeholder="Amount" min="0" step="0.01">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Contract PDF</label>
-                <input class="form-input" type="file" name="payor_contract_${n}" accept=".pdf">
             </div>
         </div>
         <div class="form-row" style="margin-bottom:10px;">
@@ -3022,7 +3198,7 @@ function addEditPayor() {
         </div>
         <div class="form-group" style="margin-bottom:0;">
             <label class="form-label">Statement Files</label>
-            <input class="form-input" type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.csv,.pdf">
+            <input class="form-input" type="file" name="payor_files_${n}" multiple accept=".zip,.xlsx,.xls,.xlsb,.csv,.pdf">
         </div>
     </div>`;
     document.getElementById('editPayorList').insertAdjacentHTML('beforeend', html);
@@ -3353,9 +3529,24 @@ function addEditPayor() {
 
 {% elif page == 'dashboard' and results %}
 {# ==================== DASHBOARD ==================== #}
-<div class="page-header">
-    <h1>{% if deal_name %}{{ deal_name }}{% else %}Royalty Analytics{% endif %}</h1>
-    <p>{{ results.period_range }} &middot; {{ results.total_files }} files &middot; {{ results.isrc_count }} ISRCs</p>
+<div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
+    <div>
+        <h1>{% if deal_name %}{{ deal_name }}{% else %}Royalty Analytics{% endif %}</h1>
+        <p>{{ results.period_range }} &middot; {{ results.total_files }} files &middot; {{ results.isrc_count }} ISRCs</p>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px; margin-top:4px;">
+        <label for="currencyToggle" style="font-size:11px; color:var(--text-muted); white-space:nowrap;">Currency:</label>
+        <select id="currencyToggle" class="form-input" style="width:auto; font-size:12px; padding:4px 10px;">
+            <option value="original">Original</option>
+            <option value="USD">USD ($)</option>
+            <option value="EUR">EUR (&euro;)</option>
+            <option value="GBP">GBP (&pound;)</option>
+            <option value="CAD">CAD (C$)</option>
+            <option value="AUD">AUD (A$)</option>
+            <option value="JPY">JPY (&yen;)</option>
+        </select>
+        <span id="currencyStatus" style="font-size:10px; color:var(--text-dim);"></span>
+    </div>
 </div>
 
 {# ---- ROW 1: Hero stats ---- #}
@@ -3367,8 +3558,8 @@ function addEditPayor() {
             <span class="card-title">LTM Revenue</span>
             <div class="card-icon">&#8364;</div>
         </div>
-        <div class="stat-value">{{ results.currency_symbol | default('$') }}{{ results.ltm_gross_total_fmt | default(results.total_gross) }}</div>
-        <div class="stat-subtitle">Net: {{ results.currency_symbol | default('$') }}{{ results.ltm_net_total_fmt | default(results.total_net) }} &middot; last 12 months</div>
+        <div class="stat-value"><span class="data-money" data-raw="{{ results.ltm_gross_total }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ results.ltm_gross_total_fmt | default(results.total_gross) }}</span></div>
+        <div class="stat-subtitle">Net: <span class="data-money" data-raw="{{ results.ltm_net_total }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ results.ltm_net_total_fmt | default(results.total_net) }}</span> &middot; last 12 months</div>
         {% if results.ltm_yoy_pct is defined %}
         <div class="stat-change {{ results.ltm_yoy_direction }}">
             {{ '%+.1f' | format(results.ltm_yoy_pct) }}% YoY
@@ -3385,13 +3576,13 @@ function addEditPayor() {
             <span class="card-title">LTM Earnings by Payor</span>
         </div>
         {% set ltm_total = results.ltm_by_payor | map(attribute='ltm_gross') | sum %}
-        <div class="stat-value medium">{{ results.currency_symbol | default('$') }}{{ "{:,.2f}".format(ltm_total) }}</div>
+        <div class="stat-value medium"><span class="data-money" data-raw="{{ ltm_total }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ "{:,.2f}".format(ltm_total) }}</span></div>
         <div class="stat-subtitle">Last 12 months total</div>
         <ul class="payor-list" style="margin-top:16px;">
             {% for lp in results.ltm_by_payor %}
             <li class="payor-item">
                 <span class="payor-name">{{ lp.name }}</span>
-                <span class="payor-value">{{ results.currency_symbol | default('$') }}{{ lp.ltm_gross_fmt }}</span>
+                <span class="payor-value"><span class="data-money" data-raw="{{ lp.ltm_gross }}" data-ccy="{{ lp.currency_code | default(results.currency_code) | default('USD') }}">{{ lp.currency_symbol | default(results.currency_symbol) | default('$') }}{{ lp.ltm_gross_fmt }}</span></span>
             </li>
             {% endfor %}
         </ul>
@@ -3419,7 +3610,7 @@ function addEditPayor() {
                     <td><span class="rank">{{ loop.index }}</span></td>
                     <td>{{ song.artist }}</td>
                     <td style="color:var(--text-primary); font-weight:500;">{{ song.title }}</td>
-                    <td class="text-right mono">{{ results.currency_symbol | default('$') }}{{ song.ltm_gross | default(song.gross) }}</td>
+                    <td class="text-right mono"><span class="data-money" data-raw="{{ song._ltm_gross_raw | default(song.gross_raw) | default(0) }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ song.ltm_gross | default(song.gross) }}</span></td>
                     <td class="text-right">
                         {% if song.get('yoy') %}
                         <span class="stat-change {{ song.yoy[-1].direction }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(song.yoy[-1].pct) }}%</span>
@@ -3440,8 +3631,8 @@ function addEditPayor() {
                 {% for ae in results.annual_earnings %}
                 <tr>
                     <td style="font-weight:600; color:var(--text-primary);">{{ ae.year }}</td>
-                    <td class="text-right mono">{{ results.currency_symbol | default('$') }}{{ ae.gross }}</td>
-                    <td class="text-right mono" style="color:var(--text-muted);">{{ results.currency_symbol | default('$') }}{{ ae.net }}</td>
+                    <td class="text-right mono"><span class="data-money" data-raw="{{ ae.gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ ae.gross }}</span></td>
+                    <td class="text-right mono" style="color:var(--text-muted);"><span class="data-money" data-raw="{{ ae.net_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ ae.net }}</span></td>
                 </tr>
                 {% endfor %}
                 </tbody>
@@ -3455,8 +3646,8 @@ function addEditPayor() {
                 {% for d in results.yoy_decay %}
                 <tr>
                     <td>{{ d.period }}</td>
-                    <td class="text-right mono">{{ results.currency_symbol | default('$') }}{{ d.prev_gross }}</td>
-                    <td class="text-right mono">{{ results.currency_symbol | default('$') }}{{ d.curr_gross }}</td>
+                    <td class="text-right mono"><span class="data-money" data-raw="{{ d.prev_gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ d.prev_gross }}</span></td>
+                    <td class="text-right mono"><span class="data-money" data-raw="{{ d.curr_gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ d.curr_gross }}</span></td>
                     <td class="text-right mono {{ 'text-red' if '-' in d.change_pct else 'text-green' }}">{{ d.change_pct }}</td>
                 </tr>
                 {% endfor %}
@@ -3469,7 +3660,7 @@ function addEditPayor() {
             <div class="dist-bar-wrap">
                 <div class="dist-bar-label">
                     <span class="name">{{ d.name }}</span>
-                    <span class="val">{{ results.currency_symbol | default('$') }}{{ d.gross_fmt }}</span>
+                    <span class="val"><span class="data-money" data-raw="{{ d.gross }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ d.gross_fmt }}</span></span>
                 </div>
                 <div class="dist-bar-track">
                     <div class="dist-bar-fill" style="width: {{ (d.gross / (results.ltm_distributors | default([{}]))[0].gross * 100) | round(1) if results.ltm_distributors is defined and results.ltm_distributors and results.ltm_distributors[0].gross else 0 }}%"></div>
@@ -3483,7 +3674,7 @@ function addEditPayor() {
             <div class="dist-bar-wrap">
                 <div class="dist-bar-label">
                     <span class="name">{{ d.name }}</span>
-                    <span class="val">{{ results.currency_symbol | default('$') }}{{ d.gross_fmt }}</span>
+                    <span class="val"><span class="data-money" data-raw="{{ d.gross }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ d.gross_fmt }}</span></span>
                 </div>
                 <div class="dist-bar-track">
                     <div class="dist-bar-fill" style="width: {{ (d.gross / (results.ltm_download_types | default([{}]))[0].gross * 100) | round(1) if results.ltm_download_types is defined and results.ltm_download_types and results.ltm_download_types[0].gross else 0 }}%"></div>
@@ -3525,7 +3716,7 @@ function addEditPayor() {
                 <td>{{ song.artist }}</td>
                 <td style="color:var(--text-primary); font-weight:500;">{{ song.title }}</td>
                 <td class="mono" style="font-size:11px; color:var(--text-dim);">{{ song.isrc }}</td>
-                <td class="text-right mono">{{ results.currency_symbol | default('$') }}{{ song.gross }}</td>
+                <td class="text-right mono"><span class="data-money" data-raw="{{ song.gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ song.gross }}</span></td>
             </tr>
             {% endfor %}
             </tbody>
@@ -3542,11 +3733,8 @@ function addEditPayor() {
                     <div style="font-size:11px; color:var(--text-dim);">{{ ps.code }} &middot; {{ ps.statement_type }} &middot; {{ ps.files }} files &middot; {{ ps.isrcs }} ISRCs &middot; fee {{ ps.fee }} &middot; <span style="color:var(--yellow);">{{ ps.detected_currency }}</span></div>
                 </div>
                 <div style="display:flex; align-items:center; gap:12px;">
-                    {% if ps.has_contract %}
-                    <a href="/download/contract/{{ ps.code }}" style="font-size:11px; color:var(--purple); text-decoration:none; border:1px solid var(--purple); padding:3px 10px; border-radius:4px;">View Contract</a>
-                    {% endif %}
                     <a href="/download/payor/{{ ps.code }}" style="font-size:11px; color:var(--accent); text-decoration:none; border:1px solid var(--accent); padding:3px 10px; border-radius:4px;">Export</a>
-                    <div class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);">{{ results.currency_symbol | default('$') }}{{ ps.total_gross }}</div>
+                    <div class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);"><span class="data-money" data-raw="{{ ps.total_gross_raw }}" data-ccy="{{ ps.currency_code | default(results.currency_code) | default('USD') }}">{{ ps.currency_symbol | default(results.currency_symbol) | default('$') }}{{ ps.total_gross }}</span></div>
                 </div>
             </div>
             {# Latest statement & missing months #}
@@ -3573,23 +3761,42 @@ function addEditPayor() {
                 {% endfor %}
                 {% endif %}
             </div>
-            {% if ps.artist_split is not none or ps.matching_right is not none or ps.contract_term or ps.territory or ps.advance %}
+            {% if ps.get('deal_type') or ps.artist_split is not none or ps.territory %}
             <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:8px; font-size:11px;">
+                {% if ps.get('deal_type') %}
+                <span style="background:{% if ps.deal_type == 'artist' %}rgba(139,92,246,0.15){% else %}rgba(59,130,246,0.15){% endif %}; padding:2px 8px; border-radius:4px; color:{% if ps.deal_type == 'artist' %}var(--purple){% else %}var(--accent){% endif %};">{{ 'Artist Deal' if ps.deal_type == 'artist' else 'Label Deal' }}</span>
+                {% endif %}
                 {% if ps.artist_split is not none %}
                 <span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--text-secondary);">Split: {{ ps.artist_split }}%</span>
-                {% endif %}
-                {% if ps.matching_right is not none %}
-                <span style="background:{% if ps.matching_right %}var(--red-dim){% else %}var(--green-dim){% endif %}; padding:2px 8px; border-radius:4px; color:{% if ps.matching_right %}var(--red){% else %}var(--green){% endif %};">Matching: {{ 'Yes' if ps.matching_right else 'No' }}</span>
-                {% endif %}
-                {% if ps.contract_term %}
-                <span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--text-secondary);">Term: {{ ps.contract_term }}</span>
                 {% endif %}
                 {% if ps.territory %}
                 <span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--text-secondary);">{{ ps.territory }}</span>
                 {% endif %}
-                {% if ps.advance %}
-                <span style="background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--cyan);">Advance: {{ ps.advance }}</span>
+            </div>
+            {% endif %}
+            {% if ps.get('contract_summary') %}
+            <div style="margin-top:8px; background:var(--bg-inset); border:1px solid var(--border); border-radius:6px; padding:8px 12px;">
+                <div style="font-size:11px; font-weight:600; color:var(--text-primary); margin-bottom:4px;">Contract Summary</div>
+                {% if ps.contract_summary.get('summary') %}
+                <div style="font-size:11px; color:var(--text-secondary); margin-bottom:6px;">{{ ps.contract_summary.summary }}</div>
                 {% endif %}
+                <div style="display:flex; flex-wrap:wrap; gap:6px; font-size:10px;">
+                    {% if ps.contract_summary.get('license_term') %}
+                    <span style="background:var(--bg-card); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--text-secondary);">Term: {{ ps.contract_summary.license_term }}</span>
+                    {% endif %}
+                    {% if ps.contract_summary.get('matching_right') is not none and ps.contract_summary.get('matching_right') is not undefined %}
+                    <span style="background:{% if ps.contract_summary.matching_right %}var(--red-dim){% else %}var(--green-dim){% endif %}; padding:2px 8px; border-radius:4px; color:{% if ps.contract_summary.matching_right %}var(--red){% else %}var(--green){% endif %};">Matching: {{ 'Yes' if ps.contract_summary.matching_right else 'No' }}</span>
+                    {% endif %}
+                    {% if ps.contract_summary.get('assignment_language') is not none and ps.contract_summary.get('assignment_language') is not undefined %}
+                    <span style="background:{% if ps.contract_summary.assignment_language %}rgba(251,191,36,0.15){% else %}var(--green-dim){% endif %}; padding:2px 8px; border-radius:4px; color:{% if ps.contract_summary.assignment_language %}var(--yellow){% else %}var(--green){% endif %};">Assignment: {{ 'Yes' if ps.contract_summary.assignment_language else 'No' }}</span>
+                    {% endif %}
+                    {% if ps.contract_summary.get('distro_fee') is not none %}
+                    <span style="background:var(--bg-card); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--cyan);">Fee: {{ ps.contract_summary.distro_fee }}%</span>
+                    {% endif %}
+                    {% if ps.contract_summary.get('split_pct') is not none %}
+                    <span style="background:var(--bg-card); border:1px solid var(--border); padding:2px 8px; border-radius:4px; color:var(--accent);">Split: {{ ps.contract_summary.split_pct }}%</span>
+                    {% endif %}
+                </div>
             </div>
             {% endif %}
         </div>
@@ -3638,13 +3845,13 @@ function addEditPayor() {
                     {% for year in results.earnings_years %}
                     {% set ydata = row.years.get(year, row.years.get(year|string, {})) %}
                     <td class="text-right mono">
-                        <span style="color:var(--text-primary);">{{ results.currency_symbol | default('$') }}{{ ydata.get('gross_fmt', '0.00') }}</span>
-                        <br><span style="color:var(--text-dim); font-size:10px;">net {{ ydata.get('net_fmt', '0.00') }}</span>
+                        <span style="color:var(--text-primary);"><span class="data-money" data-raw="{{ ydata.get('gross', 0) }}" data-ccy="{{ row.currency_code | default(results.currency_code) | default('USD') }}">{{ row.currency_symbol | default(results.currency_symbol) | default('$') }}{{ ydata.get('gross_fmt', '0.00') }}</span></span>
+                        <br><span style="color:var(--text-dim); font-size:10px;">net <span class="data-money" data-raw="{{ ydata.get('net', 0) }}" data-ccy="{{ row.currency_code | default(results.currency_code) | default('USD') }}">{{ ydata.get('net_fmt', '0.00') }}</span></span>
                     </td>
                     {% endfor %}
                     <td class="text-right mono" style="font-weight:700; color:var(--text-primary);">
-                        {{ results.currency_symbol | default('$') }}{{ row.total_gross_fmt }}
-                        <br><span style="color:var(--text-dim); font-size:10px;">net {{ row.total_net_fmt }}</span>
+                        <span class="data-money" data-raw="{{ row.total_gross }}" data-ccy="{{ row.currency_code | default(results.currency_code) | default('USD') }}">{{ row.currency_symbol | default(results.currency_symbol) | default('$') }}{{ row.total_gross_fmt }}</span>
+                        <br><span style="color:var(--text-dim); font-size:10px;">net <span class="data-money" data-raw="{{ row.total_net }}" data-ccy="{{ row.currency_code | default(results.currency_code) | default('USD') }}">{{ row.total_net_fmt }}</span></span>
                     </td>
                 </tr>
                 {% endfor %}
@@ -3652,9 +3859,9 @@ function addEditPayor() {
                     <td style="font-weight:700; color:var(--text-primary);">Total</td>
                     {% for year in results.earnings_years %}
                     {% set ytotal = results.earnings_year_totals.get(year, results.earnings_year_totals.get(year|string, {})) %}
-                    <td class="text-right mono" style="font-weight:700; color:var(--text-primary);">{{ results.currency_symbol | default('$') }}{{ ytotal.get('gross_fmt', '0.00') }}</td>
+                    <td class="text-right mono" style="font-weight:700; color:var(--text-primary);"><span class="data-money data-money-mixed" data-raw="{{ ytotal.get('gross', 0) }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ ytotal.get('gross_fmt', '0.00') }}</span></td>
                     {% endfor %}
-                    <td class="text-right mono" style="font-weight:800; color:var(--accent);">{{ results.currency_symbol | default('$') }}{{ results.earnings_grand_total_fmt }}</td>
+                    <td class="text-right mono" style="font-weight:800; color:var(--accent);"><span class="data-money data-money-mixed" data-raw="{{ results.earnings_grand_total }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ results.earnings_grand_total_fmt }}</span></td>
                 </tr>
                 </tbody>
             </table>
@@ -3858,8 +4065,12 @@ function addEditPayor() {
                     {{ ps.name }}
                     <span style="color:var(--text-dim); font-weight:400;">{{ ps.file_inventory | length }} file{{ 's' if ps.file_inventory | length != 1 }}</span>
                     {% set skipped = ps.file_inventory | selectattr('status', 'eq', 'skipped') | list %}
+                    {% set dupes = ps.file_inventory | selectattr('status', 'eq', 'duplicate') | list %}
                     {% if skipped %}
                     <span style="color:var(--red); font-size:10px;">({{ skipped | length }} skipped)</span>
+                    {% endif %}
+                    {% if dupes %}
+                    <span style="color:var(--yellow); font-size:10px;">({{ dupes | length }} duplicate{{ 's' if dupes | length != 1 }})</span>
                     {% endif %}
                 </summary>
                 <div style="overflow-x:auto; margin-top:4px; margin-bottom:8px;">
@@ -3901,10 +4112,12 @@ function addEditPayor() {
                                 {% endif %}
                             </td>
                             <td class="text-right mono" style="font-size:11px;">{{ fi.rows }}</td>
-                            <td class="text-right mono" style="font-size:11px;">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(fi.gross) }}</td>
+                            <td class="text-right mono" style="font-size:11px;"><span class="data-money" data-raw="{{ fi.gross }}" data-ccy="{{ ps.currency_code | default(results.currency_code) | default('USD') }}">{{ ps.currency_symbol | default(results.currency_symbol) | default('$') }}{{ '{:,.2f}'.format(fi.gross) }}</span></td>
                             <td>
                                 {% if fi.status == 'ok' %}
                                 <span style="font-size:10px; color:var(--green);">OK</span>
+                                {% elif fi.status == 'duplicate' %}
+                                <span style="font-size:10px; color:var(--yellow);" title="Duplicate of {{ fi.get('duplicate_of', '?') }}">DUP</span>
                                 {% else %}
                                 <span style="font-size:10px; color:var(--red);">SKIP</span>
                                 {% endif %}
@@ -3929,16 +4142,235 @@ const PAYOR_NAMES = {{ payor_names | tojson }};
 const PAYOR_CODES = {{ payor_codes | tojson }};
 const CSYM = '{{ results.currency_symbol | default("$") }}';
 
+/* ---- Currency data for conversion engine ---- */
+const CURRENCY_DATA = {
+    defaultCode: '{{ results.currency_code | default("USD") }}',
+    defaultSymbol: CSYM,
+    payorCurrencies: {{ results.payor_currencies | default({}) | tojson }},
+    symbols: {'USD':'$','EUR':'\u20ac','GBP':'\u00a3','CAD':'C$','AUD':'A$','JPY':'\u00a5'},
+    /* Raw chart data (for re-converting chart datasets) */
+    monthlyTrend: {{ results.monthly_trend | tojson }},
+    monthlyByPayor: {{ results.monthly_by_payor | tojson }},
+    annualByPayor: {{ results.annual_by_payor | tojson }},
+    waterfall: {{ results.waterfall | default({}) | tojson }},
+};
+
+/* ---- CurrencyConverter module ---- */
+const CurrencyConverter = (function() {
+    let _rates = null;
+    let _target = 'original';
+
+    function symbolFor(code) {
+        return CURRENCY_DATA.symbols[code] || code + ' ';
+    }
+
+    function currentSymbol() {
+        if (_target === 'original') return null;
+        return symbolFor(_target);
+    }
+
+    async function fetchRates() {
+        if (_rates) return _rates;
+        try {
+            const resp = await fetch('/api/exchange-rates');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            _rates = data.rates;
+            _rates['USD'] = 1;
+            return _rates;
+        } catch (e) {
+            console.warn('Exchange rate fetch failed:', e);
+            return null;
+        }
+    }
+
+    function convert(amount, sourceCcy, targetCcy) {
+        if (!_rates || sourceCcy === targetCcy) return amount;
+        const srcRate = _rates[sourceCcy] || 1;
+        const tgtRate = _rates[targetCcy] || 1;
+        return amount / srcRate * tgtRate;
+    }
+
+    function formatMoney(value, ccy) {
+        const sym = symbolFor(ccy);
+        const decimals = ccy === 'JPY' ? 0 : 2;
+        const formatted = Math.abs(value).toLocaleString(undefined, {
+            minimumFractionDigits: decimals,
+            maximumFractionDigits: decimals
+        });
+        return (value < 0 ? '-' : '') + sym + formatted;
+    }
+
+    function csym() {
+        return _target === 'original' ? CSYM : symbolFor(_target);
+    }
+
+    /* Reverse-lookup: symbol → ISO code */
+    const _symToCode = {};
+    Object.entries(CURRENCY_DATA.symbols).forEach(([code, sym]) => { _symToCode[sym] = code; });
+
+    function _parseOriginal(el) {
+        /* On first touch, cache the original text and parse raw value + source currency from it */
+        if (el.dataset._origDone) return;
+        el.dataset._origDone = '1';
+        el.dataset.origText = el.textContent.trim();
+        /* If data-raw is empty, parse numeric value from displayed text */
+        if (!el.dataset.raw || el.dataset.raw === '') {
+            const numStr = el.dataset.origText.replace(/[^0-9.\-]/g, '');
+            const parsed = parseFloat(numStr);
+            if (!isNaN(parsed)) el.dataset.raw = String(parsed);
+        }
+        /* Detect source currency from the leading symbol in original text */
+        const txt = el.dataset.origText;
+        for (const [sym, code] of Object.entries(_symToCode)) {
+            if (txt.startsWith(sym)) { el.dataset.ccy = code; return; }
+        }
+    }
+
+    function updateDOMValues() {
+        document.querySelectorAll('.data-money').forEach(el => {
+            _parseOriginal(el);
+            const raw = parseFloat(el.dataset.raw);
+            if (isNaN(raw)) return;
+            const srcCcy = el.dataset.ccy || CURRENCY_DATA.defaultCode;
+            if (_target === 'original') {
+                el.textContent = el.dataset.origText;
+            } else {
+                const converted = convert(raw, srcCcy, _target);
+                el.textContent = formatMoney(converted, _target);
+            }
+        });
+    }
+
+    function _convertChartData(rawData, srcCcy) {
+        if (_target === 'original' || !_rates) return rawData;
+        return rawData.map(v => convert(v, srcCcy, _target));
+    }
+
+    function updateCharts() {
+        const sym = csym();
+        const fmtTip = (val) => sym + val.toLocaleString(undefined, {minimumFractionDigits:2});
+        const fmtAxis = (v) => sym + (Math.abs(v)/1000).toFixed(0) + 'k';
+
+        /* Mini monthly chart */
+        if (window.CHARTS.miniMonthly) {
+            const ch = window.CHARTS.miniMonthly;
+            const data = CURRENCY_DATA.monthlyTrend.slice(-24);
+            const ccy = CURRENCY_DATA.defaultCode;
+            ch.data.datasets[0].data = data.map(d => _target === 'original' ? d.gross : convert(d.gross, ccy, _target));
+            ch.options.plugins.tooltip.callbacks.label = ctx => fmtTip(ctx.parsed.y);
+            ch.update('none');
+        }
+
+        /* Monthly by payor */
+        if (window.CHARTS.monthlyPayor) {
+            const ch = window.CHARTS.monthlyPayor;
+            const allPeriods = CURRENCY_DATA.monthlyTrend.slice(-36);
+            const periodKeys = allPeriods.map(d => d.period);
+            PAYOR_CODES.forEach((code, i) => {
+                if (!ch.data.datasets[i]) return;
+                const pdata = CURRENCY_DATA.monthlyByPayor[code] || [];
+                const lookup = {};
+                pdata.forEach(d => { lookup[d.period] = d.gross; });
+                const ccy = CURRENCY_DATA.payorCurrencies[code] || CURRENCY_DATA.defaultCode;
+                ch.data.datasets[i].data = periodKeys.map(p => {
+                    const v = lookup[p] || 0;
+                    return _target === 'original' ? v : convert(v, ccy, _target);
+                });
+            });
+            ch.options.plugins.tooltip.callbacks.label = ctx => ctx.dataset.label + ': ' + fmtTip(ctx.parsed.y);
+            ch.options.scales.y.ticks.callback = fmtAxis;
+            ch.update('none');
+        }
+
+        /* Annual by payor */
+        if (window.CHARTS.annualPayor) {
+            const ch = window.CHARTS.annualPayor;
+            const byPayor = CURRENCY_DATA.annualByPayor;
+            const allYears = [...new Set(Object.values(byPayor).flat().map(d => d.year))].sort();
+            PAYOR_CODES.forEach((code, i) => {
+                if (!ch.data.datasets[i]) return;
+                const pdata = byPayor[code] || [];
+                const lookup = {};
+                pdata.forEach(d => { lookup[d.year] = d.gross; });
+                const ccy = CURRENCY_DATA.payorCurrencies[code] || CURRENCY_DATA.defaultCode;
+                ch.data.datasets[i].data = allYears.map(y => {
+                    const v = lookup[y] || 0;
+                    return _target === 'original' ? v : convert(v, ccy, _target);
+                });
+            });
+            ch.options.plugins.tooltip.callbacks.label = ctx => ctx.dataset.label + ': ' + fmtTip(ctx.parsed.y);
+            ch.options.scales.y.ticks.callback = fmtAxis;
+            ch.update('none');
+        }
+
+        /* Waterfall chart */
+        if (window.CHARTS.waterfall && CURRENCY_DATA.waterfall.overall) {
+            const sel = document.getElementById('waterfallPayorSelect');
+            const val = sel ? sel.value : 'overall';
+            const srcData = val === 'overall' ? CURRENCY_DATA.waterfall.overall : (CURRENCY_DATA.waterfall.per_payor || {})[val];
+            if (srcData) {
+                const ccy = val === 'overall' ? CURRENCY_DATA.defaultCode : (CURRENCY_DATA.payorCurrencies[val] || CURRENCY_DATA.defaultCode);
+                const cv = (v) => _target === 'original' ? v : convert(v, ccy, _target);
+                const values = [cv(srcData.gross), -Math.abs(cv(srcData.fees)), cv(srcData.net_receipts), cv(srcData.payable), -Math.abs(cv(srcData.third_party)), cv(srcData.net_earnings)];
+                const colors = values.map(v => v >= 0 ? 'rgba(74, 222, 128, 0.7)' : 'rgba(248, 113, 113, 0.7)');
+                const ch = window.CHARTS.waterfall;
+                ch.data.datasets[0].data = values;
+                ch.data.datasets[0].backgroundColor = colors;
+                ch.options.plugins.tooltip.callbacks.label = ctx => sym + Math.abs(ctx.parsed.y).toLocaleString(undefined, {minimumFractionDigits:2});
+                ch.options.scales.y.ticks.callback = v => sym + (Math.abs(v)/1000).toFixed(0) + 'k';
+                ch.update('none');
+            }
+        }
+    }
+
+    async function setTargetCurrency(ccy) {
+        _target = ccy;
+        const status = document.getElementById('currencyStatus');
+        if (ccy === 'original') {
+            updateDOMValues();
+            updateCharts();
+            if (status) status.textContent = '';
+            return;
+        }
+        if (!_rates) {
+            if (status) status.textContent = 'Loading rates...';
+            const r = await fetchRates();
+            if (!r) {
+                if (status) { status.textContent = 'Rate fetch failed'; status.style.color = 'var(--red)'; }
+                _target = 'original';
+                const sel = document.getElementById('currencyToggle');
+                if (sel) sel.value = 'original';
+                return;
+            }
+            if (status) { status.textContent = ''; status.style.color = 'var(--text-dim)'; }
+        }
+        updateDOMValues();
+        updateCharts();
+    }
+
+    return { fetchRates, convert, formatMoney, setTargetCurrency, csym, symbolFor, currentSymbol };
+})();
+
+/* Wire up dropdown */
+document.getElementById('currencyToggle').addEventListener('change', function() {
+    CurrencyConverter.setTargetCurrency(this.value);
+});
+
 Chart.defaults.color = '#52525b';
 Chart.defaults.borderColor = 'rgba(30,30,34,0.6)';
 Chart.defaults.font.family = "'Inter', sans-serif";
 Chart.defaults.font.size = 11;
 
+/* Store chart instances for currency updates */
+window.CHARTS = {};
+
 /* ---- Mini monthly chart (top-left card) ---- */
 (function() {
-    const data = {{ results.monthly_trend | tojson }};
+    const data = CURRENCY_DATA.monthlyTrend;
     const last24 = data.slice(-24);
-    new Chart(document.getElementById('monthlyMiniChart'), {
+    window.CHARTS.miniMonthly = new Chart(document.getElementById('monthlyMiniChart'), {
         type: 'bar',
         data: {
             labels: last24.map(d => d.label),
@@ -3964,8 +4396,8 @@ Chart.defaults.font.size = 11;
 
 /* ---- Monthly revenue by payor (stacked bar) ---- */
 (function() {
-    const byPayor = {{ results.monthly_by_payor | tojson }};
-    const allPeriods = {{ results.monthly_trend | tojson }};
+    const byPayor = CURRENCY_DATA.monthlyByPayor;
+    const allPeriods = CURRENCY_DATA.monthlyTrend;
     const last36 = allPeriods.slice(-36);
     const labels = last36.map(d => d.label);
     const periodKeys = last36.map(d => d.period);
@@ -3983,7 +4415,7 @@ Chart.defaults.font.size = 11;
         };
     });
 
-    new Chart(document.getElementById('monthlyPayorChart'), {
+    window.CHARTS.monthlyPayor = new Chart(document.getElementById('monthlyPayorChart'), {
         type: 'bar',
         data: { labels, datasets },
         options: {
@@ -4004,7 +4436,7 @@ Chart.defaults.font.size = 11;
 
 /* ---- Annual gross by payor (grouped bar) ---- */
 (function() {
-    const byPayor = {{ results.annual_by_payor | tojson }};
+    const byPayor = CURRENCY_DATA.annualByPayor;
     const allYears = [...new Set(Object.values(byPayor).flat().map(d => d.year))].sort();
     const labels = allYears.map(String);
 
@@ -4021,7 +4453,7 @@ Chart.defaults.font.size = 11;
         };
     });
 
-    new Chart(document.getElementById('annualPayorChart'), {
+    window.CHARTS.annualPayor = new Chart(document.getElementById('annualPayorChart'), {
         type: 'bar',
         data: { labels, datasets },
         options: {
@@ -4043,8 +4475,7 @@ Chart.defaults.font.size = 11;
 /* ---- Earnings Waterfall Chart ---- */
 {% if results.get('waterfall') and results.waterfall.get('overall') %}
 (function() {
-    const waterfallData = {{ results.waterfall | tojson }};
-    let waterfallChart = null;
+    const waterfallData = CURRENCY_DATA.waterfall;
 
     function renderWaterfall(data) {
         const labels = ['Gross Earnings', 'Fees', 'Net Receipts', 'Payable Share', '3P Share', 'Net Earnings'];
@@ -4052,9 +4483,9 @@ Chart.defaults.font.size = 11;
         const colors = values.map(v => v >= 0 ? 'rgba(74, 222, 128, 0.7)' : 'rgba(248, 113, 113, 0.7)');
 
         const ctx = document.getElementById('waterfallChart');
-        if (waterfallChart) waterfallChart.destroy();
+        if (window.CHARTS.waterfall) window.CHARTS.waterfall.destroy();
 
-        waterfallChart = new Chart(ctx, {
+        window.CHARTS.waterfall = new Chart(ctx, {
             type: 'bar',
             data: {
                 labels: labels,
@@ -4092,6 +4523,11 @@ Chart.defaults.font.size = 11;
         } else {
             const payor = waterfallData.per_payor[val];
             if (payor) renderWaterfall(payor);
+        }
+        /* Re-apply currency conversion if active */
+        const currSel = document.getElementById('currencyToggle');
+        if (currSel && currSel.value !== 'original') {
+            CurrencyConverter.setTargetCurrency(currSel.value);
         }
     };
 
@@ -4296,6 +4732,21 @@ def index():
         payor_codes = list(_cached_results.keys()) if _cached_results else []
         deal_name_copy = _cached_deal_name
         processing_copy = dict(_processing_status)
+
+        # Inject per-payor currency symbols into cached analytics
+        if analytics_copy and _cached_results:
+            from consolidator import _payor_currency_symbols
+            pcsyms = _payor_currency_symbols(_cached_results)
+            for item in analytics_copy.get('ltm_by_payor', []):
+                if 'currency_symbol' not in item:
+                    item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
+            for item in analytics_copy.get('payor_summaries', []):
+                if 'currency_symbol' not in item:
+                    item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
+            for item in analytics_copy.get('earnings_matrix', []):
+                if 'currency_symbol' not in item:
+                    item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
+
     return render_template_string(
         DASHBOARD_HTML,
         page='dashboard',
@@ -4383,30 +4834,40 @@ def run_custom():
             statement_type = request.form.get(f'payor_stype_{idx}', 'masters')
 
             # Deal term fields
+            deal_type = request.form.get(f'payor_deal_type_{idx}', 'artist').strip()
             split_raw = request.form.get(f'payor_split_{idx}', '').strip()
             artist_split = float(split_raw) if split_raw else None
-            matching_raw = request.form.get(f'payor_matching_{idx}', '').strip()
-            matching_right = True if matching_raw == 'yes' else (False if matching_raw == 'no' else None)
-            contract_term = request.form.get(f'payor_term_{idx}', '').strip() or None
             territory = request.form.get(f'payor_territory_{idx}', '').strip() or None
-            advance_raw = request.form.get(f'payor_advance_{idx}', '').strip()
-            advance = float(advance_raw) if advance_raw else None
+
+            # Contract summary from Gemini analysis
+            contract_summary = None
+            contract_summary_raw = request.form.get(f'payor_contract_summary_{idx}', '').strip()
+            if contract_summary_raw:
+                try:
+                    contract_summary = json.loads(contract_summary_raw)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # Contract PDF uploads (multiple)
+            contract_pdf_path = None
+            contract_files = request.files.getlist(f'payor_contract_{idx}')
+            saved_contracts = []
+            for cf in contract_files:
+                if cf and cf.filename and cf.filename.lower().endswith('.pdf'):
+                    contracts_dir = os.path.join(work_dir, 'contracts')
+                    os.makedirs(contracts_dir, exist_ok=True)
+                    pdf_filename = f"contract_{code.strip()}_{len(saved_contracts)}.pdf"
+                    pdf_path = os.path.join(contracts_dir, pdf_filename)
+                    cf.save(pdf_path)
+                    saved_contracts.append(pdf_path)
+            if saved_contracts:
+                contract_pdf_path = saved_contracts[0]  # primary path for backwards compat
 
             # Expected period range (YYYYMM)
             period_start_raw = request.form.get(f'payor_period_start_{idx}', '').strip()
             expected_start = int(period_start_raw) if period_start_raw and period_start_raw.isdigit() and len(period_start_raw) == 6 else None
             period_end_raw = request.form.get(f'payor_period_end_{idx}', '').strip()
             expected_end = int(period_end_raw) if period_end_raw and period_end_raw.isdigit() and len(period_end_raw) == 6 else None
-
-            # Contract PDF upload
-            contract_pdf_path = None
-            contract_file = request.files.get(f'payor_contract_{idx}')
-            if contract_file and contract_file.filename and contract_file.filename.lower().endswith('.pdf'):
-                contracts_dir = os.path.join(work_dir, 'contracts')
-                os.makedirs(contracts_dir, exist_ok=True)
-                pdf_filename = f"contract_{code.strip()}.pdf"
-                contract_pdf_path = os.path.join(contracts_dir, pdf_filename)
-                contract_file.save(contract_pdf_path)
 
             # Check for local directory path first
             local_dir = request.form.get(f'payor_dir_{idx}', '').strip()
@@ -4444,12 +4905,11 @@ def run_custom():
                 fx_rate=fx_rate,
                 statements_dir=payor_dir,
                 statement_type=statement_type,
+                deal_type=deal_type,
                 artist_split=artist_split,
-                matching_right=matching_right,
-                contract_term=contract_term,
                 territory=territory,
-                advance=advance,
                 contract_pdf_path=contract_pdf_path,
+                contract_summary=contract_summary,
                 expected_start=expected_start,
                 expected_end=expected_end,
             ))
@@ -4467,6 +4927,34 @@ def run_custom():
                 file_dates = json.loads(file_dates_raw)
             except (json.JSONDecodeError, ValueError):
                 pass
+
+        # Second pass: fill in missing dates from filenames/folders/content
+        from consolidator import parse_period_from_filename, period_to_end_of_month, peek_statement_date
+        for cfg in payor_configs:
+            src_dir = cfg.statements_dir
+            if not src_dir or not os.path.isdir(src_dir):
+                continue
+            for root, _, fnames in os.walk(src_dir):
+                for fn in fnames:
+                    if fn in file_dates and file_dates[fn]:
+                        continue
+                    period = parse_period_from_filename(fn)
+                    if not period:
+                        rel = os.path.relpath(os.path.join(root, fn), src_dir)
+                        parts_list = os.path.normpath(rel).split(os.sep)
+                        for part in reversed(parts_list[:-1]):
+                            period = parse_period_from_filename(part)
+                            if period:
+                                break
+                    if not period:
+                        try:
+                            period = peek_statement_date(os.path.join(root, fn), fn)
+                        except Exception as e:
+                            log.debug("peek_statement_date failed for %s: %s", fn, e)
+                    if period:
+                        eom = period_to_end_of_month(period)
+                        date_parts = eom.split('/')
+                        file_dates[fn] = f"{date_parts[0]}/{date_parts[1]}/{date_parts[2][2:]}"
 
         with _state_lock:
             _processing_status = {'running': True, 'progress': 'Starting...', 'done': False, 'error': None}
@@ -4496,7 +4984,7 @@ os.makedirs(CUSTOM_TEMP, exist_ok=True)
 
 DEMO_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'demo_data')
 
-_SUPPORTED_EXT = ('.csv', '.xlsx', '.xls')
+_SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.xlsb')
 
 
 @app.route('/demo')
@@ -4564,8 +5052,8 @@ def _scan_file_structures(directory):
                     'header_row': header_row,
                 }
             groups[fp]['files'].append(filename)
-        except Exception:
-            # Skip files that can't be read
+        except Exception as e:
+            log.warning("Skipping unreadable file %s: %s", filename, e)
             continue
 
     # Sort by group size (largest first)
@@ -4591,11 +5079,13 @@ def custom_upload():
     try:
         _cached_deal_name = request.form.get('deal_name', '').strip()
         log.info("custom_upload: deal='%s'", _cached_deal_name)
-        sess, sid = _get_custom_session()
+
+        # Always start with a fresh session to avoid stale files from prior runs
+        sid = str(uuid.uuid4())
+        _ingest_sessions[sid] = {'custom_flow': {}}
+        sess = _ingest_sessions[sid]['custom_flow']
 
         work_dir = os.path.join(CUSTOM_TEMP, sid)
-        if os.path.exists(work_dir):
-            shutil.rmtree(work_dir)
         os.makedirs(work_dir, exist_ok=True)
 
         # Parse file_dates from hidden field
@@ -4673,6 +5163,38 @@ def custom_upload():
         if not payors:
             flash('No payors configured.', 'error')
             return redirect(url_for('upload_page'))
+
+        # Second pass: for any file without a date, try extracting from
+        # filename and file contents now that files are saved to disk
+        from consolidator import parse_period_from_filename, period_to_end_of_month, peek_statement_date
+        for p in payors:
+            src_dir = p['payor_dir'] if os.path.isdir(p['payor_dir']) else p.get('local_dir', '')
+            if not src_dir or not os.path.isdir(src_dir):
+                continue
+            for root, _, fnames in os.walk(src_dir):
+                for fn in fnames:
+                    if fn in file_dates and file_dates[fn]:
+                        continue
+                    # Try filename
+                    period = parse_period_from_filename(fn)
+                    # Try parent folder names
+                    if not period:
+                        rel = os.path.relpath(os.path.join(root, fn), src_dir)
+                        parts = os.path.normpath(rel).split(os.sep)
+                        for part in reversed(parts[:-1]):
+                            period = parse_period_from_filename(part)
+                            if period:
+                                break
+                    # Try peeking inside file content
+                    if not period:
+                        try:
+                            period = peek_statement_date(os.path.join(root, fn), fn)
+                        except Exception as e:
+                            log.debug("peek_statement_date failed for %s: %s", fn, e)
+                    if period:
+                        eom = period_to_end_of_month(period)
+                        parts = eom.split('/')
+                        file_dates[fn] = f"{parts[0]}/{parts[1]}/{parts[2][2:]}"
 
         sess['payors'] = payors
         sess['deal_name'] = _cached_deal_name
@@ -4930,7 +5452,7 @@ def custom_map(payor_idx, struct_idx):
                         if f.startswith('~$'):
                             continue
                         ext = os.path.splitext(f)[1].lower()
-                        if ext in ('.csv', '.xlsx', '.xls', '.pdf'):
+                        if ext in ('.csv', '.xlsx', '.xls', '.xlsb', '.pdf'):
                             file_mappings[f] = {
                                 'mapping': col_mapping,
                                 'remove_top': cleaning.get('remove_top', 0),
@@ -5054,6 +5576,34 @@ def custom_process():
     """Phase 2: Parse all files with user mappings, then redirect to validation."""
     try:
         sess, sid = _get_custom_session()
+
+        # ── Prevent duplicate concurrent processing runs ──
+        with _processing_locks_guard:
+            if sid not in _processing_locks:
+                _processing_locks[sid] = threading.Lock()
+            lock = _processing_locks[sid]
+
+        if not lock.acquire(blocking=False):
+            # Another run is already in progress – wait for it to finish
+            log.warning("custom_process: duplicate run blocked for sid=%s", sid)
+            lock.acquire()          # block until the first run is done
+            lock.release()
+            # First run already stored results – just redirect to validation
+            return redirect(url_for('custom_validate'))
+
+        try:
+            return _do_custom_process(sess, sid)
+        finally:
+            lock.release()
+    except Exception as e:
+        log.error("custom_process failed: %s", e, exc_info=True)
+        flash(f'Error processing files: {str(e)}', 'error')
+        return redirect(url_for('upload_page'))
+
+
+def _do_custom_process(sess, sid):
+    """Actual processing logic (called under lock)."""
+    try:
         payors = sess.get('payors', [])
         log.info("custom_process: %d payor(s)", len(payors))
         _log_memory()
@@ -5066,6 +5616,22 @@ def custom_process():
             payor_dir = p['payor_dir']
             local_dir = p.get('local_dir', '')
             statements_dir = payor_dir if os.path.isdir(payor_dir) and os.listdir(payor_dir) else local_dir
+
+            # Merge: copy any files from local_dir missing in payor_dir
+            if local_dir and os.path.isdir(local_dir) and os.path.isdir(payor_dir):
+                existing = {f.lower() for f in os.listdir(payor_dir)}
+                for root, dirs, files in os.walk(local_dir):
+                    for f in files:
+                        if f.startswith('~$'):
+                            continue
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in _SUPPORTED_EXT and f.lower() not in existing:
+                            try:
+                                shutil.copy2(os.path.join(root, f), os.path.join(payor_dir, f))
+                                existing.add(f.lower())
+                                log.info("  Copied missing file from local_dir: %s", f)
+                            except Exception as e:
+                                log.warning("Failed to copy %s: %s", f, e)
 
             if not statements_dir or not os.path.isdir(statements_dir):
                 continue
@@ -5110,7 +5676,7 @@ def custom_process():
         sess['all_file_paths'] = all_file_paths
 
     except Exception as e:
-        log.error("custom_process failed: %s", e, exc_info=True)
+        log.error("_do_custom_process failed: %s", e, exc_info=True)
         flash(f'Error processing files: {str(e)}', 'error')
         return redirect(url_for('upload_page'))
 
@@ -5788,6 +6354,37 @@ def download_contract(code):
     return 'Contract not found.', 404
 
 
+_exchange_rate_cache = {'rates': None, 'ts': 0}
+
+@app.route('/api/exchange-rates')
+def api_exchange_rates():
+    """Proxy exchange rates (USD-based) with 1-hour cache."""
+    import time, urllib.request, urllib.error
+    now = time.time()
+    if _exchange_rate_cache['rates'] and now - _exchange_rate_cache['ts'] < 3600:
+        return jsonify(_exchange_rate_cache['rates'])
+
+    urls = [
+        'https://open.er-api.com/v6/latest/USD',
+        'https://api.frankfurter.app/latest?from=USD',
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'RoyaltyConsolidator/1.0'})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            rates = data.get('rates', {})
+            if rates:
+                result = {'base': 'USD', 'rates': rates}
+                _exchange_rate_cache['rates'] = result
+                _exchange_rate_cache['ts'] = now
+                return jsonify(result)
+        except Exception as e:
+            log.warning('Exchange rate fetch failed (%s): %s', url, e)
+            continue
+    return jsonify({'error': 'Could not fetch exchange rates'}), 502
+
+
 @app.route('/api/analytics')
 def api_analytics():
     """Return analytics as JSON (for future AJAX refresh)."""
@@ -5818,32 +6415,136 @@ def api_list_dir_files():
             for root, _, fnames in os.walk(d):
                 for fn in sorted(fnames):
                     ext = os.path.splitext(fn)[1].lower()
-                    if ext in ('.csv', '.xlsx', '.xls') and not fn.startswith('~$'):
+                    if ext in ('.csv', '.xlsx', '.xls', '.xlsb') and not fn.startswith('~$'):
                         files.append(fn)
     return jsonify({'files': files})
 
 
 @app.route('/api/extract-dates', methods=['POST'])
 def api_extract_dates():
-    """Extract statement dates from filenames using parse_period_from_filename.
-    POST JSON: {filenames: [str, ...]}
-    Returns JSON: {dates: {filename: "MM/DD/YY" or ""}}
+    """Extract statement dates from filenames and file contents.
+    POST JSON: {filenames: [str, ...], dirs: [str, ...] (optional)}
+    Returns JSON: {dates: {filename: "MM/DD/YY" or ""}, sources: {filename: "filename"|"content"|""}}
     """
-    from consolidator import parse_period_from_filename, period_to_end_of_month
+    from consolidator import parse_period_from_filename, period_to_end_of_month, peek_statement_date
     data = request.get_json(silent=True) or {}
     filenames = data.get('filenames', [])
+    dirs = data.get('dirs', [])
     dates = {}
+    sources = {}
+
+    # Build a lookup of filename -> full filepath for content peeking
+    file_paths = {}
+    for d in dirs:
+        if d and os.path.isdir(d):
+            for root, _, fnames in os.walk(d):
+                for fn in fnames:
+                    file_paths[fn] = os.path.join(root, fn)
+
     for fn in filenames:
+        # Try filename first
         period = parse_period_from_filename(fn)
         if period:
-            # Convert YYYYMM to MM/DD/YY (end of month)
             eom = period_to_end_of_month(period)
-            # Convert mm/dd/yyyy to MM/DD/YY
             parts = eom.split('/')
             dates[fn] = f"{parts[0]}/{parts[1]}/{parts[2][2:]}"
-        else:
-            dates[fn] = ''
-    return jsonify({'dates': dates})
+            sources[fn] = 'filename'
+            continue
+
+        # Try peeking inside file content
+        fpath = file_paths.get(fn)
+        if fpath:
+            period = peek_statement_date(fpath, fn)
+            if period:
+                eom = period_to_end_of_month(period)
+                parts = eom.split('/')
+                dates[fn] = f"{parts[0]}/{parts[1]}/{parts[2][2:]}"
+                sources[fn] = 'content'
+                continue
+
+        dates[fn] = ''
+        sources[fn] = ''
+    return jsonify({'dates': dates, 'sources': sources})
+
+
+@app.route('/api/analyze-contract', methods=['POST'])
+def api_analyze_contract():
+    """Analyze one or more contract PDFs using Gemini to extract key deal terms.
+    Accepts multiple files via 'contract_pdfs' field.
+    Returns JSON: {license_term, matching_right, assignment_language, distro_fee, split_pct, summary}
+    """
+    contract_files = request.files.getlist('contract_pdfs')
+    if not contract_files or not any(f.filename for f in contract_files):
+        return jsonify({'error': 'No PDFs uploaded'}), 400
+
+    # Check for Gemini API key
+    api_key = request.form.get('gemini_key', '').strip() or _gemini_api_key
+    if not api_key:
+        return jsonify({'error': 'Gemini API key required. Set GEMINI_API_KEY env var or provide in settings.'}), 400
+
+    try:
+        import tempfile as _tf
+        tmp_paths = []
+        uploaded_files = []
+
+        genai.configure(api_key=api_key)
+
+        # Save and upload each PDF
+        for cf in contract_files:
+            if not cf.filename or not cf.filename.lower().endswith('.pdf'):
+                continue
+            tmp = _tf.NamedTemporaryFile(delete=False, suffix='.pdf')
+            cf.save(tmp.name)
+            tmp.close()
+            tmp_paths.append(tmp.name)
+            uploaded_files.append(genai.upload_file(tmp.name, mime_type='application/pdf'))
+
+        if not uploaded_files:
+            return jsonify({'error': 'No valid PDF files found'}), 400
+
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        n_docs = len(uploaded_files)
+        prompt = f"""Analyze {'this music industry contract' if n_docs == 1 else 'these ' + str(n_docs) + ' music industry contract documents together as parts of the same deal'} and extract the following deal terms.
+Return a single JSON object with exactly these keys (use null if not found):
+
+{{
+  "license_term": "string describing the license/contract term, e.g. '3 years', 'Life of copyright', '5 years with auto-renewal'",
+  "matching_right": true/false or null if not mentioned,
+  "assignment_language": true/false - whether the contract contains assignment/transfer of rights language (vs pure license),
+  "distro_fee": number - the distribution fee percentage (e.g. 15 for 15%), or null,
+  "split_pct": number - the artist/label split percentage for the party receiving statements (e.g. 50 for 50/50), or null,
+  "deal_type": "artist" or "label" - whose perspective the deal is from based on who the contracting party is,
+  "summary": "2-3 sentence plain English summary of the key commercial terms{' across all documents' if n_docs > 1 else ''}"
+}}
+
+Only return valid JSON, no markdown fences or extra text."""
+
+        response = model.generate_content([*uploaded_files, prompt])
+
+        # Clean up temp files
+        for p in tmp_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+        # Parse JSON from response
+        text = response.text.strip()
+        # Strip markdown fences if present
+        if text.startswith('```'):
+            text = text.split('\n', 1)[1] if '\n' in text else text[3:]
+        if text.endswith('```'):
+            text = text[:-3]
+        if text.startswith('json'):
+            text = text[4:]
+        result = json.loads(text.strip())
+        return jsonify(result)
+
+    except json.JSONDecodeError:
+        return jsonify({'error': 'Could not parse Gemini response', 'raw': response.text[:500]}), 500
+    except Exception as e:
+        log.error("Contract analysis failed: %s", e, exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/deals')
@@ -5887,10 +6588,27 @@ def load_deal_route(slug):
 
 @app.route('/deals/<slug>/delete', methods=['POST'])
 def delete_deal_route(slug):
-    """Delete a saved deal."""
+    """Delete a saved deal from DB + GCS + local disk."""
+    deleted_any = False
+    # Delete from PostgreSQL (CASCADE removes all child rows)
+    if db.is_available():
+        try:
+            if db.delete_deal_from_db(slug):
+                deleted_any = True
+        except Exception as e:
+            log.error("DB delete failed for %s: %s", slug, e)
+    # Delete GCS files
+    if storage.is_available():
+        try:
+            storage.delete_deal_files(slug)
+        except Exception as e:
+            log.error("GCS cleanup failed for %s: %s", slug, e)
+    # Delete local files
     deal_dir = os.path.join(DEALS_DIR, slug)
     if os.path.isdir(deal_dir):
         shutil.rmtree(deal_dir)
+        deleted_any = True
+    if deleted_any:
         flash(f'Deal "{slug}" deleted.', 'success')
     else:
         flash(f'Deal "{slug}" not found.', 'error')
@@ -5914,12 +6632,9 @@ def edit_deal_route(slug):
                 'fx_currency': c.fx_currency,
                 'fx_rate': c.fx_rate,
                 'statement_type': c.statement_type,
+                'deal_type': getattr(c, 'deal_type', 'artist'),
                 'artist_split': c.artist_split,
-                'matching_right': c.matching_right,
-                'contract_term': c.contract_term,
                 'territory': c.territory,
-                'advance': c.advance,
-                'contract_pdf_path': c.contract_pdf_path,
                 'expected_start': c.expected_start,
                 'expected_end': c.expected_end,
                 'statements_dir': c.statements_dir,
@@ -5982,32 +6697,23 @@ def edit_deal_post(slug):
             fx_rate = float(fxrate_raw) if fxrate_raw else 1.0
             statement_type = request.form.get(f'payor_stype_{idx}', 'masters')
 
+            deal_type = request.form.get(f'payor_deal_type_{idx}', 'artist').strip()
             split_raw = request.form.get(f'payor_split_{idx}', '').strip()
             artist_split = float(split_raw) if split_raw else None
-            matching_raw = request.form.get(f'payor_matching_{idx}', '').strip()
-            matching_right = True if matching_raw == 'yes' else (False if matching_raw == 'no' else None)
-            contract_term = request.form.get(f'payor_term_{idx}', '').strip() or None
             territory = request.form.get(f'payor_territory_{idx}', '').strip() or None
-            advance_raw = request.form.get(f'payor_advance_{idx}', '').strip()
-            advance = float(advance_raw) if advance_raw else None
+
+            # Preserve existing contract summary & path from saved deal
+            contract_summary = None
+            contract_pdf_path = None
+            if code.strip() in old_payor_results:
+                old_cfg = old_payor_results[code.strip()].config
+                contract_summary = getattr(old_cfg, 'contract_summary', None)
+                contract_pdf_path = getattr(old_cfg, 'contract_pdf_path', None)
 
             period_start_raw = request.form.get(f'payor_period_start_{idx}', '').strip()
             expected_start = int(period_start_raw) if period_start_raw and period_start_raw.isdigit() and len(period_start_raw) == 6 else None
             period_end_raw = request.form.get(f'payor_period_end_{idx}', '').strip()
             expected_end = int(period_end_raw) if period_end_raw and period_end_raw.isdigit() and len(period_end_raw) == 6 else None
-
-            # Contract PDF upload
-            contract_pdf_path = None
-            # Preserve existing contract if no new one uploaded
-            if code.strip() in old_payor_results and old_payor_results[code.strip()].config.contract_pdf_path:
-                contract_pdf_path = old_payor_results[code.strip()].config.contract_pdf_path
-            contract_file = request.files.get(f'payor_contract_{idx}')
-            if contract_file and contract_file.filename and contract_file.filename.lower().endswith('.pdf'):
-                contracts_dir = os.path.join(DEALS_DIR, slug, 'contracts')
-                os.makedirs(contracts_dir, exist_ok=True)
-                pdf_filename = f"contract_{code.strip()}.pdf"
-                contract_pdf_path = os.path.join(contracts_dir, pdf_filename)
-                contract_file.save(contract_pdf_path)
 
             # Determine statements directory: reuse existing if available
             payor_dir = existing_dirs.get(code.strip())
@@ -6038,12 +6744,11 @@ def edit_deal_post(slug):
                 fx_rate=fx_rate,
                 statements_dir=payor_dir,
                 statement_type=statement_type,
+                deal_type=deal_type,
                 artist_split=artist_split,
-                matching_right=matching_right,
-                contract_term=contract_term,
                 territory=territory,
-                advance=advance,
                 contract_pdf_path=contract_pdf_path,
+                contract_summary=contract_summary,
                 expected_start=expected_start,
                 expected_end=expected_end,
             ))
@@ -6236,8 +6941,8 @@ def ingest_upload():
 
     filename = f.filename
     ext = os.path.splitext(filename)[1].lower()
-    if ext not in ('.xlsx', '.xls', '.csv'):
-        flash('Unsupported file type. Please upload XLSX, XLS, or CSV.', 'error')
+    if ext not in ('.xlsx', '.xls', '.xlsb', '.csv'):
+        flash('Unsupported file type. Please upload XLSX, XLS, XLSB, or CSV.', 'error')
         return redirect(url_for('upload_page'))
 
     filepath = os.path.join(INGEST_TEMP, filename)

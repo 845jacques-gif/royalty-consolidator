@@ -38,10 +38,32 @@ except ImportError:
 _isrc_cache = {}  # ISRC -> {'release_date': ..., 'track_name': ..., 'artist_name': ...}
 _isrc_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'isrc_cache.json')
 
+# Lazy DB module reference
+_db_mod = None
+
+def _db():
+    """Lazy-load db module and check availability."""
+    global _db_mod
+    if _db_mod is None:
+        try:
+            import db as _d
+            _db_mod = _d
+        except ImportError:
+            return None
+    return _db_mod if _db_mod.is_available() else None
+
 
 def _load_isrc_cache():
-    """Load ISRC lookup cache from disk."""
+    """Load ISRC lookup cache from DB first, then disk."""
     global _isrc_cache
+    dbm = _db()
+    if dbm:
+        try:
+            _isrc_cache = dbm.load_full_isrc_cache_db()
+            if _isrc_cache:
+                return
+        except Exception as e:
+            log.debug("DB isrc_cache load failed: %s", e)
     if os.path.exists(_isrc_cache_path):
         try:
             with open(_isrc_cache_path, 'r') as f:
@@ -51,12 +73,18 @@ def _load_isrc_cache():
 
 
 def _save_isrc_cache():
-    """Save ISRC lookup cache to disk."""
+    """Save ISRC lookup cache to DB + disk."""
+    dbm = _db()
+    if dbm:
+        try:
+            dbm.save_isrc_cache_db(_isrc_cache)
+        except Exception as e:
+            log.debug("DB isrc_cache save failed: %s", e)
     try:
         with open(_isrc_cache_path, 'w') as f:
             json.dump(_isrc_cache, f, indent=2)
-    except IOError:
-        pass
+    except IOError as e:
+        log.warning("Failed to save isrc_cache.json: %s", e)
 
 
 def lookup_isrc_musicbrainz(isrc: str) -> dict:
@@ -90,8 +118,10 @@ def lookup_isrc_musicbrainz(isrc: str) -> dict:
     except (HTTPError, URLError) as e:
         if hasattr(e, 'code') and e.code == 503:
             time.sleep(2)  # Back off on rate limit
-    except Exception:
-        pass
+        else:
+            log.debug("MusicBrainz HTTP error for %s: %s", isrc, e)
+    except Exception as e:
+        log.debug("MusicBrainz lookup error for %s: %s", isrc, e)
 
     # Cache result (even empty ones to avoid re-lookups)
     _isrc_cache[isrc] = result
@@ -166,12 +196,14 @@ class PayorConfig:
     fx_currency: str = 'USD'
     fx_rate: float = 1.0   # Multiply local currency amounts by this to get USD
     statement_type: str = 'masters'  # masters, publishing, neighboring, pro, sync, other
-    artist_split: Optional[float] = None       # Artist/label split % (e.g. 80 = artist gets 80%)
+    deal_type: str = 'artist'                  # 'artist' or 'label' — whose perspective the earnings are from
+    artist_split: Optional[float] = None       # Split % — your share after distro fees (e.g. 50 = you keep 50%)
     matching_right: Optional[bool] = None      # Whether payor has matching right
     contract_term: Optional[str] = None        # e.g. "3 years", "Life of copyright"
     territory: Optional[str] = None            # e.g. "Worldwide", "North America"
     advance: Optional[float] = None            # Advance amount in deal currency
     contract_pdf_path: Optional[str] = None    # Path to uploaded contract PDF
+    contract_summary: Optional[Dict] = None    # Gemini-extracted contract summary
     expected_start: Optional[int] = None       # Expected first period YYYYMM (for missing month detection)
     expected_end: Optional[int] = None         # Expected last period YYYYMM (for missing month detection)
 
@@ -225,6 +257,22 @@ def parse_period_from_filename(filename):
         year, month = int(m.group(1)), int(m.group(2))
         if 2000 <= year <= 2099 and 1 <= month <= 12:
             return year * 100 + month
+
+    # Match M_DD_YYYY / MM_DD_YYYY / MM/DD/YYYY full date patterns:
+    # "1_31_2022", "10_31_2022", "4_30-2024", "12/31/2023"
+    m_full = re.search(r'(\d{1,2})[\s._/-](\d{1,2})[\s._/-](\d{4})', filename)
+    if m_full:
+        month, day, year = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+        if 2000 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31:
+            return year * 100 + month
+
+    # Match MM-YY / MM.YY patterns: "12-23 ADA", "03-23", "06_24"
+    # Negative lookahead avoids matching "1_31" in "1_31_2022" (day followed by year)
+    m_mmyy = re.search(r'(?:^|[^\d])(\d{1,2})[\s._-](\d{2})(?![_.\-/]\d)', filename)
+    if m_mmyy:
+        month, year_short = int(m_mmyy.group(1)), int(m_mmyy.group(2))
+        if 1 <= month <= 12 and 20 <= year_short <= 99:
+            return (2000 + year_short) * 100 + month
 
     # Match text month + year: "January 2022", "Nov 2025"
     m2 = re.search(r'([A-Za-z]{3,})\s*(\d{4})', filename)
@@ -389,9 +437,11 @@ def _find_header_row(filepath, ext, max_scan=50):
                     try:
                         parsed = next(csv.reader(io.StringIO(line)))
                         rows.append(parsed)
-                    except Exception:
+                    except Exception as e:
+                        log.debug("CSV line parse fallback in %s row %d: %s", filepath, i, e)
                         rows.append([line.strip()])
-        except Exception:
+        except Exception as e:
+            log.debug("_find_header_row CSV open failed for %s: %s", filepath, e)
             return 0
     else:
         try:
@@ -401,7 +451,8 @@ def _find_header_row(filepath, ext, max_scan=50):
             for idx in range(len(preview)):
                 row_vals = [str(v).strip() for v in preview.iloc[idx] if pd.notna(v)]
                 rows.append(row_vals)
-        except Exception:
+        except Exception as e:
+            log.debug("_find_header_row Excel read failed for %s: %s", filepath, e)
             return 0
 
     best_row = 0
@@ -426,32 +477,54 @@ def _read_raw_dataframe(filepath, filename):
     ext = os.path.splitext(filename)[1].lower()
 
     if ext == '.csv':
-        try:
-            df = pd.read_csv(filepath)
-        except Exception:
-            df = None
+        df = None
+        # Try common encodings
+        for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+            try:
+                df = pd.read_csv(filepath, encoding=enc)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except Exception as e:
+                log.debug("CSV read failed for %s (enc=%s): %s", filename, enc, e)
+                break
         # Check if we got useful columns; if not, scan for the real header row
         if df is None or len(_fuzzy_match_columns(df.columns)) < 2:
             header_row = _find_header_row(filepath, ext)
             if header_row > 0:
-                try:
-                    df = pd.read_csv(filepath, skiprows=header_row)
-                except Exception:
-                    pass
+                for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+                    try:
+                        df = pd.read_csv(filepath, skiprows=header_row, encoding=enc)
+                        break
+                    except (UnicodeDecodeError, UnicodeError):
+                        continue
+                    except Exception as e:
+                        log.debug("CSV read with skiprows failed for %s (enc=%s): %s", filename, enc, e)
+                        break
         return df
 
-    elif ext in ('.xlsx', '.xls'):
+    elif ext in ('.xlsx', '.xls', '.xlsb'):
+        # Auto-pick the best sheet (e.g. "Digital Sales" over "Summary")
+        engine = 'pyxlsb' if ext == '.xlsb' else None
         try:
-            df = pd.read_excel(filepath, sheet_name=0)
-        except Exception:
+            xls = pd.ExcelFile(filepath, engine=engine)
+            from mapper import _pick_best_sheet
+            best_sheet = _pick_best_sheet(xls.sheet_names)
+        except Exception as e:
+            log.debug("Excel sheet pick failed for %s: %s", filename, e)
+            best_sheet = 0
+        try:
+            df = pd.read_excel(filepath, sheet_name=best_sheet, engine=engine)
+        except Exception as e:
+            log.debug("Excel read failed for %s (sheet=%s): %s", filename, best_sheet, e)
             df = None
         if df is None or len(_fuzzy_match_columns(df.columns)) < 2:
             header_row = _find_header_row(filepath, ext)
             if header_row > 0:
                 try:
-                    df = pd.read_excel(filepath, sheet_name=0, skiprows=header_row)
-                except Exception:
-                    pass
+                    df = pd.read_excel(filepath, sheet_name=best_sheet, skiprows=header_row, engine=engine)
+                except Exception as e:
+                    log.debug("Excel read with skiprows failed for %s: %s", filename, e)
         return df
 
     elif ext == '.pdf':
@@ -542,7 +615,13 @@ def parse_file_universal(filepath, filename, fmt='auto', fallback_period=None):
                     break
                 parent = os.path.dirname(parent)
         if period is None:
-            # Try to find a date-like column
+            # Try peeking inside file for date columns
+            try:
+                period = peek_statement_date(filepath, filename)
+            except Exception as e:
+                log.debug("peek_statement_date failed for %s: %s", filename, e)
+        if period is None:
+            # Try to find a date-like value in any column
             for c in df.columns:
                 sample = str(df[c].dropna().iloc[0]) if len(df[c].dropna()) > 0 else ''
                 m = re.search(r'(\d{4})[\s._/-]?(\d{2})', sample)
@@ -636,8 +715,9 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
     if header_row is not None and header_row > 0:
         skip = list(range(header_row))
         ext = os.path.splitext(filepath)[1].lower()
-        if ext in ('.xlsx', '.xls'):
-            df = pd.read_excel(filepath, sheet_name=sheet or 0, header=header_row, dtype=str)
+        if ext in ('.xlsx', '.xls', '.xlsb'):
+            engine = 'pyxlsb' if ext == '.xlsb' else None
+            df = pd.read_excel(filepath, sheet_name=sheet or 0, header=header_row, dtype=str, engine=engine)
         elif ext == '.csv':
             for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
                 try:
@@ -718,6 +798,22 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
         period_col = raw_period.apply(_parse_period_value)
     else:
         period = parse_period_from_filename(filename)
+        # Try parent folder names
+        if period is None:
+            parent = os.path.dirname(filepath)
+            while parent and len(parent) > 3:
+                folder_name = os.path.basename(parent)
+                period = parse_period_from_filename(folder_name)
+                if period:
+                    break
+                parent = os.path.dirname(parent)
+        # Try peeking inside file content
+        if period is None:
+            try:
+                period = peek_statement_date(filepath, filename)
+            except Exception as e:
+                log.debug("peek_statement_date failed for %s: %s", filename, e)
+                pass
         if period is None and fallback_period:
             period = fallback_period
         if period is None:
@@ -780,6 +876,87 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
 # Per-payor loading and aggregation
 # ---------------------------------------------------------------------------
 
+def peek_statement_date(filepath: str, filename: str) -> Optional[int]:
+    """Peek inside a file to find a statement date/period without full parsing.
+    Returns YYYYMM int or None.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    try:
+        if ext == '.csv':
+            df = pd.read_csv(filepath, nrows=20, encoding='utf-8', on_bad_lines='skip')
+        elif ext in ('.xlsx', '.xls', '.xlsb'):
+            engine = 'pyxlsb' if ext == '.xlsb' else None
+            df = pd.read_excel(filepath, nrows=20, engine=engine)
+        else:
+            return None
+    except Exception as e:
+        log.debug("peek_statement_date read failed for %s: %s", filename, e)
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # Normalise column headers
+    col_lower = {c: str(c).strip().lower() for c in df.columns}
+
+    # Check for known period/date column names
+    period_names = ['period', 'reporting period', 'statement period', 'statement date',
+                    'sale period', 'accounting period', 'royalty period', 'month',
+                    'reporting_period', 'statement_date', 'sale_period', 'pay period']
+
+    for orig_col, low in col_lower.items():
+        if low in period_names:
+            # Try to parse first non-null value
+            vals = df[orig_col].dropna()
+            if vals.empty:
+                continue
+            sample = str(vals.iloc[0]).strip()
+            # Try YYYYMM, YYYY-MM
+            m = re.search(r'(\d{4})[\s._/-]?(\d{2})', sample)
+            if m:
+                yr, mo = int(m.group(1)), int(m.group(2))
+                if 2000 <= yr <= 2099 and 1 <= mo <= 12:
+                    return yr * 100 + mo
+            # Try month name + year
+            m2 = re.search(r'([A-Za-z]{3,})\s*(\d{4})', sample)
+            if m2:
+                ms = m2.group(1)[:3].lower()
+                yr = int(m2.group(2))
+                if ms in _MONTH_NAMES and 2000 <= yr <= 2099:
+                    return yr * 100 + _MONTH_NAMES[ms]
+            # Try MM/DD/YYYY or DD/MM/YYYY
+            m3 = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', sample)
+            if m3:
+                a, b, yr = int(m3.group(1)), int(m3.group(2)), int(m3.group(3))
+                if 2000 <= yr <= 2099:
+                    mo = a if 1 <= a <= 12 else b
+                    return yr * 100 + mo
+
+    # Scan all columns for date-like values as last resort
+    for orig_col in df.columns:
+        vals = df[orig_col].dropna()
+        if vals.empty:
+            continue
+        sample = str(vals.iloc[0]).strip()
+        m = re.search(r'(\d{4})[\s._/-](\d{2})', sample)
+        if m:
+            yr, mo = int(m.group(1)), int(m.group(2))
+            if 2000 <= yr <= 2099 and 1 <= mo <= 12:
+                return yr * 100 + mo
+
+    return None
+
+
+def _file_hash(filepath: str) -> str:
+    """Compute a fast content hash (SHA-256) for duplicate detection."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, str]] = None,
                           column_mappings: Optional[Dict[str, dict]] = None) -> Optional[PayorResult]:
     """Load and aggregate all statement files for one payor.
@@ -799,8 +976,9 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     currencies_seen = set()
     file_inventory = []
     fee_detected = config.fee > 0  # Skip auto-detect if user provided a fee
+    seen_hashes = {}  # hash -> filename (for duplicate detection)
 
-    SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.pdf')
+    SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.xlsb', '.pdf')
 
     for root, dirs, files in os.walk(config.statements_dir):
         for f in sorted(files):
@@ -810,6 +988,30 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             if ext not in SUPPORTED_EXT:
                 continue
             filepath = os.path.join(root, f)
+
+            # ---- Duplicate file detection ----
+            try:
+                fhash = _file_hash(filepath)
+            except OSError:
+                fhash = None
+            if fhash and fhash in seen_hashes:
+                rel_folder = os.path.relpath(root, config.statements_dir)
+                if rel_folder == '.':
+                    rel_folder = ''
+                file_inventory.append({
+                    'filename': f,
+                    'folder': rel_folder,
+                    'period': None,
+                    'period_source': 'none',
+                    'rows': 0,
+                    'status': 'duplicate',
+                    'gross': 0,
+                    'duplicate_of': seen_hashes[fhash],
+                })
+                log.warning("  Duplicate file skipped: %s (same as %s)", f, seen_hashes[fhash])
+                continue
+            if fhash:
+                seen_hashes[fhash] = f
 
             # Detect period from filepath (filename + folder names)
             path_period, path_source = parse_period_from_path(filepath, config.statements_dir)
@@ -1095,19 +1297,29 @@ def _build_detail_23col(pr: 'PayorResult', deal_name: str = '',
     def _col(name, default=''):
         return d[name] if name in d.columns else pd.Series([default] * n, dtype=object)
 
-    artist_split = cfg.artist_split if cfg.artist_split is not None else 100.0
+    split_pct = cfg.artist_split if cfg.artist_split is not None else 100.0
+    deal_type = getattr(cfg, 'deal_type', 'artist')  # 'artist' or 'label'
     net_vals = d['net'] if 'net' in d.columns else pd.Series([0.0] * n)
 
     # Handle per-row percent columns if available from Phase 2 mapping
     if 'payable_pct' in d.columns and d['payable_pct'].abs().sum() > 0:
         payable_share = net_vals * (d['payable_pct'] / 100.0)
+    elif 'third_party_pct' in d.columns and d['third_party_pct'].abs().sum() > 0:
+        third_party_share_tmp = net_vals * (d['third_party_pct'] / 100.0)
+        payable_share = net_vals - third_party_share_tmp
     else:
-        payable_share = net_vals * (artist_split / 100.0)
+        # Use the configured split %:
+        # split_pct is "your share" — the payable portion after distro fees
+        # The other party gets the remainder
+        payable_share = net_vals * (split_pct / 100.0)
 
     if 'third_party_pct' in d.columns and d['third_party_pct'].abs().sum() > 0:
         third_party_share = net_vals * (d['third_party_pct'] / 100.0)
+    elif 'payable_pct' in d.columns and d['payable_pct'].abs().sum() > 0:
+        third_party_share = net_vals - payable_share
     else:
-        third_party_share = pd.Series([0.0] * n)
+        # Other party's share is the remainder
+        third_party_share = net_vals - payable_share
 
     net_earnings = payable_share - third_party_share
 
@@ -1631,8 +1843,9 @@ def load_supplemental_metadata(paths: List[str]) -> Optional[pd.DataFrame]:
             continue
         if p.endswith('.csv'):
             df = pd.read_csv(p)
-        elif p.endswith('.xlsx') or p.endswith('.xls'):
-            df = pd.read_excel(p, sheet_name=0)
+        elif p.endswith('.xlsx') or p.endswith('.xls') or p.endswith('.xlsb'):
+            engine = 'pyxlsb' if p.endswith('.xlsb') else None
+            df = pd.read_excel(p, sheet_name=0, engine=engine)
         else:
             continue
 
@@ -1750,6 +1963,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'artist': str(row['artist'])[:30],
             'title': str(row['title'])[:40],
             'gross': f"{row['total_gross']:,.2f}",
+            'gross_raw': round(float(row['total_gross']), 2),
             'yearly': yearly,
             'yoy': song_yoy,
         })
@@ -1766,7 +1980,9 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         annual_earnings.append({
             'year': int(row['year']),
             'gross': f"{row['gross']:,.2f}",
+            'gross_raw': round(float(row['gross']), 2),
             'net': f"{row['net']:,.2f}",
+            'net_raw': round(float(row['net']), 2),
         })
 
     # --- LTM (Last Twelve Months) earnings by song ---
@@ -1794,6 +2010,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'earnings_grand_total_fmt': csym + '0',
             'coverage_months': [], 'coverage_rows': [],
             'currency_symbol': csym,
+            'currency_code': _currency_code(payor_results),
+            'payor_currencies': {code: pr.config.fx_currency for code, pr in payor_results.items()},
             'waterfall': _compute_waterfall(payor_results, formulas),
             'weighted_avg_age': _compute_weighted_average_age(payor_results),
             'source_breakdown': _compute_source_breakdown(enrichment_stats),
@@ -1866,6 +2084,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'artist': str(row['artist'])[:30],
             'title': str(row['title'])[:40],
             'gross': f"{row['gross']:,.2f}",
+            'gross_raw': round(float(row['gross']), 2),
         })
 
     # Add LTM gross to top_songs (hero card) and re-sort by LTM gross descending
@@ -1893,7 +2112,9 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         yoy_decay.append({
             'period': f"{prev_year} → {curr_year}",
             'prev_gross': f"{prev_val:,.2f}",
+            'prev_gross_raw': round(float(prev_val), 2),
             'curr_gross': f"{curr_val:,.2f}",
+            'curr_gross_raw': round(float(curr_val), 2),
             'change_pct': f"{pct_change:+.1f}%",
         })
 
@@ -1965,16 +2186,17 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'files': pr.file_count,
             'isrcs': len(pr.isrc_meta),
             'total_gross': f"{pr.isrc_meta['total_gross'].sum():,.2f}",
+            'total_gross_raw': round(float(pr.isrc_meta['total_gross'].sum()), 2),
+            'currency_code': pr.config.fx_currency,
             'fee': f"{pr.config.fee:.0%}",
             'fx': pr.config.fx_currency,
+            'currency_symbol': _CURRENCY_SYMBOLS.get(pr.config.fx_currency, '$'),
             'detected_currency': ', '.join(getattr(pr, 'detected_currencies', [])),
             'statement_type': STATEMENT_TYPES.get(pr.config.statement_type, pr.config.statement_type),
+            'deal_type': getattr(pr.config, 'deal_type', 'artist'),
             'artist_split': pr.config.artist_split,
-            'matching_right': pr.config.matching_right,
-            'contract_term': pr.config.contract_term,
             'territory': pr.config.territory,
-            'advance': f"{pr.config.advance:,.2f}" if pr.config.advance is not None else None,
-            'has_contract': bool(pr.config.contract_pdf_path and os.path.exists(pr.config.contract_pdf_path)),
+            'contract_summary': getattr(pr.config, 'contract_summary', None),
             'latest_statement': latest_statement,
             'latest_period': latest_period,
             'missing_months': missing_months,
@@ -2074,6 +2296,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
 
     # --- LTM by payor ---
     ltm_by_payor = []
+    payor_csyms = _payor_currency_symbols(payor_results)
     for code, pr in payor_results.items():
         payor_ltm = pr.monthly[pr.monthly['period'] >= ltm_start_period]
         ltm_gross = float(payor_ltm['gross'].sum())
@@ -2085,6 +2308,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'ltm_gross_fmt': f"{ltm_gross:,.2f}",
             'ltm_net': round(ltm_net, 2),
             'ltm_net_fmt': f"{ltm_net:,.2f}",
+            'currency_symbol': payor_csyms.get(code, '$'),
+            'currency_code': pr.config.fx_currency,
         })
 
     # --- Annual by payor (for stacked bar chart) ---
@@ -2112,6 +2337,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         earnings_matrix.append({
             'code': code,
             'name': pr.config.name,
+            'currency_symbol': payor_csyms.get(code, '$'),
+            'currency_code': pr.config.fx_currency,
             'years': {y: {'gross': round(lookup.get(y, 0), 2),
                           'gross_fmt': f"{lookup.get(y, 0):,.2f}",
                           'net': round(net_lookup.get(y, 0), 2),
@@ -2252,6 +2479,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         'coverage_rows': coverage_rows,
         # Currency
         'currency_symbol': _currency_symbol(payor_results),
+        'currency_code': _currency_code(payor_results),
+        'payor_currencies': {code: pr.config.fx_currency for code, pr in payor_results.items()},
         # Phase 3: Waterfall, WAA, Source Breakdown
         'waterfall': waterfall,
         'weighted_avg_age': weighted_avg_age,
@@ -2406,16 +2635,35 @@ def _compute_source_breakdown(enrichment_stats: Optional[dict]) -> dict:
     return {'rows': rows, 'total': total}
 
 
+_CURRENCY_SYMBOLS = {'USD': '$', 'EUR': '\u20ac', 'GBP': '\u00a3', 'CAD': 'C$', 'AUD': 'A$', 'JPY': '\u00a5'}
+
+
 def _currency_symbol(payor_results):
     """Determine display currency symbol from payor configs."""
-    symbols = {'USD': '$', 'EUR': '\u20ac', 'GBP': '\u00a3', 'CAD': 'C$', 'AUD': 'A$', 'JPY': '\u00a5'}
     currencies = [pr.config.fx_currency for pr in payor_results.values()]
     if not currencies:
         return '$'
     # Use most common currency
     from collections import Counter
     most_common = Counter(currencies).most_common(1)[0][0]
-    return symbols.get(most_common, most_common + ' ')
+    return _CURRENCY_SYMBOLS.get(most_common, most_common + ' ')
+
+
+def _currency_code(payor_results):
+    """Determine the primary ISO currency code from payor configs."""
+    currencies = [pr.config.fx_currency for pr in payor_results.values()]
+    if not currencies:
+        return 'USD'
+    from collections import Counter
+    return Counter(currencies).most_common(1)[0][0]
+
+
+def _payor_currency_symbols(payor_results):
+    """Return a dict mapping payor code -> currency symbol."""
+    return {
+        code: _CURRENCY_SYMBOLS.get(pr.config.fx_currency, pr.config.fx_currency + ' ')
+        for code, pr in payor_results.items()
+    }
 
 
 # ---------------------------------------------------------------------------
