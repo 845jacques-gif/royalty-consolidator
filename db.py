@@ -721,6 +721,177 @@ def get_deal_id_by_slug(slug: str) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Forecasts CRUD
+# ---------------------------------------------------------------------------
+
+def save_forecast(deal_id: int, config: dict, result_summary: dict = None) -> Optional[int]:
+    """Save a forecast result. Returns the forecast ID."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO forecasts (deal_id, config, result_summary)
+            VALUES (%s, %s, %s) RETURNING id
+        """, (deal_id, json.dumps(config), json.dumps(result_summary) if result_summary else None))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def get_latest_forecast(deal_id: int) -> Optional[dict]:
+    """Get the most recent forecast for a deal."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, config, result_summary, created_at
+            FROM forecasts WHERE deal_id = %s
+            ORDER BY created_at DESC LIMIT 1
+        """, (deal_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            'id': row[0],
+            'config': row[1] if isinstance(row[1], dict) else json.loads(row[1]) if row[1] else {},
+            'result_summary': row[2] if isinstance(row[2], dict) else json.loads(row[2]) if row[2] else None,
+            'created_at': row[3].isoformat() if row[3] else None,
+        }
+
+
+def list_forecasts(deal_id: int) -> list:
+    """List all forecasts for a deal."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, config, result_summary, created_at
+            FROM forecasts WHERE deal_id = %s
+            ORDER BY created_at DESC
+        """, (deal_id,))
+        rows = cur.fetchall()
+        return [{
+            'id': r[0],
+            'config': r[1] if isinstance(r[1], dict) else json.loads(r[1]) if r[1] else {},
+            'result_summary': r[2] if isinstance(r[2], dict) else json.loads(r[2]) if r[2] else None,
+            'created_at': r[3].isoformat() if r[3] else None,
+        } for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Deal Templates CRUD
+# ---------------------------------------------------------------------------
+
+def save_template(name: str, payor_configs: list, settings: dict = None) -> Optional[int]:
+    """Save or update a deal template. Returns template ID."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO deal_templates (name, payor_configs, settings)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (name) DO UPDATE SET
+                payor_configs = EXCLUDED.payor_configs,
+                settings = EXCLUDED.settings,
+                updated_at = now()
+            RETURNING id
+        """, (name, json.dumps(payor_configs), json.dumps(settings or {})))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def list_templates() -> list:
+    """List all deal templates."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, payor_configs, settings, created_at, updated_at
+            FROM deal_templates ORDER BY updated_at DESC
+        """)
+        rows = cur.fetchall()
+        return [{
+            'id': r[0],
+            'name': r[1],
+            'payor_configs': r[2] if isinstance(r[2], list) else json.loads(r[2]) if r[2] else [],
+            'settings': r[3] if isinstance(r[3], dict) else json.loads(r[3]) if r[3] else {},
+            'created_at': r[4].isoformat() if r[4] else None,
+            'updated_at': r[5].isoformat() if r[5] else None,
+        } for r in rows]
+
+
+def get_template(name: str) -> Optional[dict]:
+    """Get a deal template by name."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, payor_configs, settings, created_at, updated_at
+            FROM deal_templates WHERE name = %s
+        """, (name,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            'id': row[0],
+            'name': row[1],
+            'payor_configs': row[2] if isinstance(row[2], list) else json.loads(row[2]) if row[2] else [],
+            'settings': row[3] if isinstance(row[3], dict) else json.loads(row[3]) if row[3] else {},
+            'created_at': row[4].isoformat() if row[4] else None,
+            'updated_at': row[5].isoformat() if row[5] else None,
+        }
+
+
+def delete_template(name: str) -> bool:
+    """Delete a deal template."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM deal_templates WHERE name = %s", (name,))
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Delta Reports CRUD
+# ---------------------------------------------------------------------------
+
+def save_delta_report(deal_id: int, report: dict) -> Optional[int]:
+    """Save a delta report. Returns the report ID."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO delta_reports (deal_id, report)
+            VALUES (%s, %s) RETURNING id
+        """, (deal_id, json.dumps(report)))
+        # Also update deals.latest_delta
+        cur.execute("""
+            UPDATE deals SET latest_delta = %s WHERE id = %s
+        """, (json.dumps(report), deal_id))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def get_latest_delta(deal_id: int) -> Optional[dict]:
+    """Get the most recent delta report for a deal."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, report, created_at
+            FROM delta_reports WHERE deal_id = %s
+            ORDER BY created_at DESC LIMIT 1
+        """, (deal_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            'id': row[0],
+            'report': row[1] if isinstance(row[1], dict) else json.loads(row[1]) if row[1] else {},
+            'created_at': row[2].isoformat() if row[2] else None,
+        }
+
+
+def update_deal_forecast_config(slug: str, config: dict):
+    """Update the forecast_config on a deal."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE deals SET forecast_config = %s WHERE slug = %s
+        """, (json.dumps(config), slug))
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

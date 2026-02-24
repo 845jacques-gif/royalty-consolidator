@@ -2214,6 +2214,11 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'waterfall': _compute_waterfall(payor_results, formulas),
             'weighted_avg_age': _compute_weighted_average_age(payor_results),
             'source_breakdown': _compute_source_breakdown(enrichment_stats),
+            'cohort_analysis': {'cohorts': [], 'years': []},
+            'revenue_concentration': {'top_1_pct': 0, 'top_5_pct': 0, 'top_10_pct': 0,
+                                      'top_20_pct': 0, 'top_50_pct': 0, 'herfindahl_index': 0},
+            'catalog_age_distribution': {'buckets': []},
+            'ltm_comparison': None,
         }
     max_period = max(periods)
     max_year = int(str(max_period)[:4])
@@ -2258,12 +2263,42 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         (monthly['period'] <= prior_ltm_end_period)
     ]
     prior_ltm_gross = float(prior_ltm_monthly['gross'].sum())
+    prior_ltm_net = float(prior_ltm_monthly['net'].sum())
+    prior_ltm_isrcs = int(prior_ltm_monthly['identifier'].nunique()) if len(prior_ltm_monthly) > 0 else 0
 
     if prior_ltm_gross > 0:
         ltm_yoy_pct = (ltm_gross_total - prior_ltm_gross) / prior_ltm_gross * 100
     else:
         ltm_yoy_pct = 0.0
     ltm_yoy_direction = 'up' if ltm_yoy_pct >= 0 else 'down'
+
+    # Structured prior-LTM comparison (A4)
+    ltm_isrc_count = int(ltm_monthly['identifier'].nunique()) if len(ltm_monthly) > 0 else 0
+    prior_ltm = {
+        'gross': round(prior_ltm_gross, 2),
+        'net': round(prior_ltm_net, 2),
+        'isrc_count': prior_ltm_isrcs,
+        'avg_per_isrc': round(prior_ltm_gross / prior_ltm_isrcs, 2) if prior_ltm_isrcs > 0 else 0,
+    }
+    ltm_comparison = {
+        'ltm': {
+            'gross': round(ltm_gross_total, 2),
+            'net': round(ltm_net_total, 2),
+            'isrc_count': ltm_isrc_count,
+            'avg_per_isrc': round(ltm_gross_total / ltm_isrc_count, 2) if ltm_isrc_count > 0 else 0,
+        },
+        'prior_ltm': prior_ltm,
+        'changes': {
+            'gross_pct': round(ltm_yoy_pct, 1),
+            'net_pct': round(((ltm_net_total - prior_ltm_net) / prior_ltm_net * 100) if prior_ltm_net > 0 else 0, 1),
+            'isrc_pct': round(((ltm_isrc_count - prior_ltm_isrcs) / prior_ltm_isrcs * 100) if prior_ltm_isrcs > 0 else 0, 1),
+            'avg_per_isrc_pct': round((
+                ((ltm_gross_total / ltm_isrc_count if ltm_isrc_count else 0) -
+                 (prior_ltm_gross / prior_ltm_isrcs if prior_ltm_isrcs else 0)) /
+                (prior_ltm_gross / prior_ltm_isrcs if prior_ltm_isrcs else 1) * 100
+            ) if prior_ltm_isrcs > 0 else 0, 1),
+        },
+    }
 
     ltm_by_song = (
         ltm_monthly.groupby('identifier')
@@ -2566,6 +2601,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
     # --- Top stores across all payors (all-time) ---
     all_dist = []
     for code, pr in payor_results.items():
+        if not hasattr(pr, 'by_store') or pr.by_store is None:
+            continue
         d = pr.by_store.copy()
         d.columns = ['store', 'gross', 'net', 'sales']
         all_dist.append(d)
@@ -2591,6 +2628,8 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
     # --- LTM stores & media types ---
     all_ltm_detail = []
     for code, pr in payor_results.items():
+        if not hasattr(pr, 'detail') or pr.detail is None:
+            continue
         d = pr.detail.copy()
         d = d[d['period'] >= ltm_start_period]
         all_ltm_detail.append(d)
@@ -2599,37 +2638,39 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
     if all_ltm_detail:
         ltm_detail = pd.concat(all_ltm_detail, ignore_index=True)
         # LTM stores
-        ltm_dist = (
-            ltm_detail.groupby('store')
-            .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
-            .reset_index()
-            .sort_values('gross', ascending=False)
-        )
-        for _, row in ltm_dist.head(15).iterrows():
-            name = str(row['store']).strip()
-            if name:
-                ltm_dist_list.append({
-                    'name': name,
-                    'gross': round(float(row['gross']), 2),
-                    'gross_fmt': f"{row['gross']:,.2f}",
-                    'sales': int(row['sales']),
-                })
+        if 'store' in ltm_detail.columns:
+            ltm_dist = (
+                ltm_detail.groupby('store')
+                .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
+                .reset_index()
+                .sort_values('gross', ascending=False)
+            )
+            for _, row in ltm_dist.head(15).iterrows():
+                name = str(row['store']).strip()
+                if name:
+                    ltm_dist_list.append({
+                        'name': name,
+                        'gross': round(float(row['gross']), 2),
+                        'gross_fmt': f"{row['gross']:,.2f}",
+                        'sales': int(row['sales']),
+                    })
         # LTM media types
-        ltm_types = (
-            ltm_detail.groupby('media_type')
-            .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
-            .reset_index()
-            .sort_values('gross', ascending=False)
-        )
-        for _, row in ltm_types.iterrows():
-            name = str(row['media_type']).strip()
-            if name:
-                ltm_media_types.append({
-                    'name': name,
-                    'gross': round(float(row['gross']), 2),
-                    'gross_fmt': f"{row['gross']:,.2f}",
-                    'sales': int(row['sales']),
-                })
+        if 'media_type' in ltm_detail.columns:
+            ltm_types = (
+                ltm_detail.groupby('media_type')
+                .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
+                .reset_index()
+                .sort_values('gross', ascending=False)
+            )
+            for _, row in ltm_types.iterrows():
+                name = str(row['media_type']).strip()
+                if name:
+                    ltm_media_types.append({
+                        'name': name,
+                        'gross': round(float(row['gross']), 2),
+                        'gross_fmt': f"{row['gross']:,.2f}",
+                        'sales': int(row['sales']),
+                    })
 
     # --- Earnings waterfall ---
     waterfall = _compute_waterfall(payor_results, formulas)
@@ -2639,6 +2680,11 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
 
     # --- Source breakdown ---
     source_breakdown = _compute_source_breakdown(enrichment_stats)
+
+    # --- Phase 4: Cohort analysis, Revenue concentration, Age distribution ---
+    cohort_analysis = _compute_cohort_analysis(payor_results, ltm_start_period, monthly, meta)
+    revenue_concentration = _compute_revenue_concentration(ltm_monthly, ltm_gross_total)
+    catalog_age_distribution = _compute_catalog_age_distribution(payor_results, ltm_monthly, ltm_gross_total)
 
     return {
         'total_files': total_files,
@@ -2685,6 +2731,11 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         'waterfall': waterfall,
         'weighted_avg_age': weighted_avg_age,
         'source_breakdown': source_breakdown,
+        # Phase 4: Cohort, Concentration, Age Distribution, LTM Comparison
+        'cohort_analysis': cohort_analysis,
+        'revenue_concentration': revenue_concentration,
+        'catalog_age_distribution': catalog_age_distribution,
+        'ltm_comparison': ltm_comparison,
     }
 
 
@@ -2833,6 +2884,177 @@ def _compute_source_breakdown(enrichment_stats: Optional[dict]) -> dict:
         rows.append({'label': label, 'key': key, 'count': count, 'pct': pct})
 
     return {'rows': rows, 'total': total}
+
+
+def _compute_cohort_analysis(payor_results, ltm_start_period, monthly, meta):
+    """A1: Group ISRCs by release year, compute revenue per calendar year per cohort."""
+    try:
+        # Gather release dates from all payors
+        release_dates = {}  # isrc -> release_year
+        for code, pr in payor_results.items():
+            detail = pr.detail if hasattr(pr, 'detail') and pr.detail is not None else None
+            if detail is not None and 'Release Date' in detail.columns and 'ISRC' in detail.columns:
+                for _, row in detail[['ISRC', 'Release Date']].drop_duplicates('ISRC').iterrows():
+                    isrc = str(row['ISRC']).strip()
+                    rd = str(row['Release Date']).strip()
+                    if isrc and rd and len(rd) >= 4 and rd[:4].isdigit() and isrc not in release_dates:
+                        release_dates[isrc] = int(rd[:4])
+            # Also try isrc_meta if it has release_date column
+            if hasattr(pr, 'isrc_meta') and 'release_date' in pr.isrc_meta.columns:
+                for _, row in pr.isrc_meta.iterrows():
+                    isrc = str(row['identifier']).strip()
+                    rd = str(row.get('release_date', '')).strip()
+                    if isrc and rd and len(rd) >= 4 and rd[:4].isdigit() and isrc not in release_dates:
+                        release_dates[isrc] = int(rd[:4])
+
+        if not release_dates:
+            return {'cohorts': [], 'years': []}
+
+        # Map identifiers in monthly to release years
+        monthly_copy = monthly.copy()
+        monthly_copy['release_year'] = monthly_copy['identifier'].map(release_dates)
+        monthly_copy = monthly_copy.dropna(subset=['release_year'])
+        monthly_copy['release_year'] = monthly_copy['release_year'].astype(int)
+
+        if 'year' not in monthly_copy.columns:
+            monthly_copy['year'] = monthly_copy['period'].astype(str).str[:4].astype(int)
+
+        # Group by cohort (release_year) and calendar year
+        cohort_rev = (
+            monthly_copy.groupby(['release_year', 'year'])
+            .agg({'gross': 'sum'})
+            .reset_index()
+        )
+
+        # Get unique ISRCs per cohort for track count
+        cohort_tracks = monthly_copy.groupby('release_year')['identifier'].nunique().to_dict()
+
+        years = sorted(cohort_rev['year'].unique().tolist())
+        release_years = sorted(cohort_rev['release_year'].unique().tolist())
+
+        cohorts = []
+        for ry in release_years:
+            subset = cohort_rev[cohort_rev['release_year'] == ry]
+            rev_by_year = {}
+            for _, r in subset.iterrows():
+                rev_by_year[int(r['year'])] = round(float(r['gross']), 2)
+            cohorts.append({
+                'release_year': ry,
+                'track_count': int(cohort_tracks.get(ry, 0)),
+                'revenue_by_year': rev_by_year,
+            })
+
+        return {'cohorts': cohorts, 'years': [int(y) for y in years]}
+    except Exception as e:
+        log.warning("Cohort analysis failed: %s", e)
+        return {'cohorts': [], 'years': []}
+
+
+def _compute_revenue_concentration(ltm_monthly, ltm_gross_total):
+    """A2: LTM gross by ISRC sorted descending, cumulative share + Herfindahl."""
+    try:
+        if len(ltm_monthly) == 0 or ltm_gross_total <= 0:
+            return {'top_1_pct': 0, 'top_5_pct': 0, 'top_10_pct': 0,
+                    'top_20_pct': 0, 'top_50_pct': 0, 'herfindahl_index': 0}
+
+        by_isrc = (
+            ltm_monthly.groupby('identifier')
+            .agg({'gross': 'sum'})
+            .reset_index()
+            .sort_values('gross', ascending=False)
+        )
+        n_total = len(by_isrc)
+        if n_total == 0:
+            return {'top_1_pct': 0, 'top_5_pct': 0, 'top_10_pct': 0,
+                    'top_20_pct': 0, 'top_50_pct': 0, 'herfindahl_index': 0}
+
+        gross_values = by_isrc['gross'].values
+        cumsum = gross_values.cumsum()
+
+        def top_n_share(n_tracks):
+            if n_tracks <= 0:
+                return 0
+            n_tracks = min(n_tracks, n_total)
+            return round(float(cumsum[n_tracks - 1]) / ltm_gross_total * 100, 1)
+
+        # Calculate share for top N tracks (not percentage of catalog)
+        top_1 = top_n_share(max(1, int(round(n_total * 0.01))))
+        top_5 = top_n_share(max(1, int(round(n_total * 0.05))))
+        top_10 = top_n_share(max(1, int(round(n_total * 0.10))))
+        top_20 = top_n_share(max(1, int(round(n_total * 0.20))))
+        top_50 = top_n_share(max(1, int(round(n_total * 0.50))))
+
+        # Herfindahl-Hirschman Index (sum of squared market shares)
+        shares = gross_values / ltm_gross_total
+        hhi = round(float((shares ** 2).sum()) * 10000, 1)  # Scale to 0-10000
+
+        return {
+            'top_1_pct': top_1,
+            'top_5_pct': top_5,
+            'top_10_pct': top_10,
+            'top_20_pct': top_20,
+            'top_50_pct': top_50,
+            'herfindahl_index': hhi,
+            'total_isrcs': n_total,
+        }
+    except Exception as e:
+        log.warning("Revenue concentration failed: %s", e)
+        return {'top_1_pct': 0, 'top_5_pct': 0, 'top_10_pct': 0,
+                'top_20_pct': 0, 'top_50_pct': 0, 'herfindahl_index': 0}
+
+
+def _compute_catalog_age_distribution(payor_results, ltm_monthly, ltm_gross_total):
+    """A3: ISRCs grouped by release year bucket with track count + LTM revenue."""
+    try:
+        # Gather release dates from all payors
+        release_dates = {}  # isrc -> release_year
+        for code, pr in payor_results.items():
+            detail = pr.detail if hasattr(pr, 'detail') and pr.detail is not None else None
+            if detail is not None and 'Release Date' in detail.columns and 'ISRC' in detail.columns:
+                for _, row in detail[['ISRC', 'Release Date']].drop_duplicates('ISRC').iterrows():
+                    isrc = str(row['ISRC']).strip()
+                    rd = str(row['Release Date']).strip()
+                    if isrc and rd and len(rd) >= 4 and rd[:4].isdigit() and isrc not in release_dates:
+                        release_dates[isrc] = int(rd[:4])
+            if hasattr(pr, 'isrc_meta') and 'release_date' in pr.isrc_meta.columns:
+                for _, row in pr.isrc_meta.iterrows():
+                    isrc = str(row['identifier']).strip()
+                    rd = str(row.get('release_date', '')).strip()
+                    if isrc and rd and len(rd) >= 4 and rd[:4].isdigit() and isrc not in release_dates:
+                        release_dates[isrc] = int(rd[:4])
+
+        if not release_dates:
+            return {'buckets': []}
+
+        # LTM gross by ISRC
+        ltm_by_isrc = {}
+        if len(ltm_monthly) > 0:
+            grp = ltm_monthly.groupby('identifier')['gross'].sum()
+            ltm_by_isrc = grp.to_dict()
+
+        # Build buckets by release year
+        year_data = {}  # year -> {'track_count': set, 'ltm_gross': float}
+        for isrc, ry in release_dates.items():
+            if ry not in year_data:
+                year_data[ry] = {'tracks': set(), 'ltm_gross': 0.0}
+            year_data[ry]['tracks'].add(isrc)
+            year_data[ry]['ltm_gross'] += ltm_by_isrc.get(isrc, 0.0)
+
+        buckets = []
+        for year in sorted(year_data.keys()):
+            d = year_data[year]
+            ltm_g = round(d['ltm_gross'], 2)
+            buckets.append({
+                'year': year,
+                'track_count': len(d['tracks']),
+                'ltm_gross': ltm_g,
+                'ltm_gross_pct': round(ltm_g / ltm_gross_total * 100, 1) if ltm_gross_total > 0 else 0,
+            })
+
+        return {'buckets': buckets}
+    except Exception as e:
+        log.warning("Catalog age distribution failed: %s", e)
+        return {'buckets': []}
 
 
 _CURRENCY_SYMBOLS = {'USD': '$', 'EUR': '\u20ac', 'GBP': '\u00a3', 'CAD': 'C$', 'AUD': 'A$', 'JPY': '\u00a5'}
