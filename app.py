@@ -33,7 +33,7 @@ log = logging.getLogger('royalty')
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, render_template_string, request, send_file, flash, redirect, url_for, jsonify, make_response
+from flask import Flask, render_template_string, request, send_file, flash, redirect, url_for, jsonify, make_response, session
 import pandas as pd
 
 # Lazy Gemini import to avoid ~2-3s delay from deprecation warnings on startup
@@ -64,6 +64,8 @@ import validator
 import enrichment
 import db
 import storage
+import delta as delta_engine
+import forecast as forecast_engine
 
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24).hex())
@@ -429,7 +431,8 @@ def load_deal(slug):
     with open(analytics_path, 'r') as f:
         analytics = json.load(f)
 
-    if 'ltm_stores' not in analytics or 'ltm_media_types' not in analytics:
+    if ('ltm_stores' not in analytics or 'ltm_media_types' not in analytics
+            or 'cohort_analysis' not in analytics or 'revenue_concentration' not in analytics):
         try:
             analytics = compute_analytics(payor_results)
             with open(analytics_path, 'w') as f:
@@ -597,6 +600,15 @@ DASHBOARD_HTML = r"""
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ deal_name or 'Royalty Consolidator' }}</title>
+    <script>
+        // Apply saved theme immediately to prevent flash
+        (function(){
+            var t = localStorage.getItem('rc-theme');
+            if (t === 'light' || (!t && window.matchMedia('(prefers-color-scheme: light)').matches)) {
+                document.documentElement.setAttribute('data-theme', 'light');
+            }
+        })();
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -623,10 +635,54 @@ DASHBOARD_HTML = r"""
             --yellow: #fbbf24;
             --purple: #a78bfa;
             --cyan: #22d3ee;
+            --bg-secondary: #18181b;
             --radius: 12px;
             --radius-sm: 8px;
             --radius-xs: 6px;
         }
+
+        /* Light theme */
+        html[data-theme="light"] {
+            --bg-primary: #f8f9fa;
+            --bg-card: #ffffff;
+            --bg-card-hover: #f1f3f5;
+            --bg-inset: #eef0f2;
+            --border: #dee2e6;
+            --border-hover: #adb5bd;
+            --text-primary: #111827;
+            --text-secondary: #4b5563;
+            --text-muted: #9ca3af;
+            --text-dim: #d1d5db;
+            --accent: #2563eb;
+            --accent-hover: #1d4ed8;
+            --green: #16a34a;
+            --green-dim: #bbf7d0;
+            --red: #dc2626;
+            --red-dim: #fee2e2;
+            --yellow: #d97706;
+            --purple: #7c3aed;
+            --cyan: #0891b2;
+            --bg-secondary: #e5e7eb;
+        }
+        html[data-theme="light"] .nav { background: #ffffff; border-bottom-color: #dee2e6; }
+        html[data-theme="light"] .card { box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        html[data-theme="light"] table th { background: #f1f3f5; }
+        html[data-theme="light"] .form-input, html[data-theme="light"] select.form-input {
+            background: #ffffff; border-color: #dee2e6; color: #111827;
+        }
+        html[data-theme="light"] .pill-tab { background: #e5e7eb; color: #4b5563; }
+        html[data-theme="light"] .pill-tab.active { background: var(--accent); color: #ffffff; }
+        html[data-theme="light"] .btn-submit { background: var(--accent); }
+        html[data-theme="light"] code, html[data-theme="light"] pre { background: #f1f3f5; }
+
+        /* Theme toggle button */
+        .theme-toggle {
+            background: none; border: 1px solid var(--border); color: var(--text-muted);
+            width: 32px; height: 32px; border-radius: 50%; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; font-size: 15px;
+            transition: border-color 0.2s, color 0.2s;
+        }
+        .theme-toggle:hover { border-color: var(--border-hover); color: var(--text-primary); }
 
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -988,6 +1044,9 @@ DASHBOARD_HTML = r"""
         <a href="/download/consolidated" class="nav-btn">Export .xlsx</a>
         <a href="/download/csv" class="nav-btn primary">Export .csv</a>
         {% endif %}
+        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode" aria-label="Toggle theme">
+            <span id="themeIcon">&#9790;</span>
+        </button>
     </div>
 </nav>
 
@@ -2977,9 +3036,12 @@ function _submitViaFetch() {
 
 {% elif page == 'deals' %}
 {# ==================== DEALS PAGE ==================== #}
-<div class="page-header">
-    <h1>Saved Deals</h1>
-    <p>Load a previous consolidation run or delete old ones.</p>
+<div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap;">
+    <div>
+        <h1>Saved Deals</h1>
+        <p>Load a previous consolidation run or delete old ones.</p>
+    </div>
+    <a href="/templates" class="nav-btn" style="padding:8px 16px; font-size:12px;">Templates</a>
 </div>
 
 {% if deals %}
@@ -3016,12 +3078,23 @@ function _submitViaFetch() {
                 <div style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ deal.total_files }}</div>
             </div>
         </div>
-        <div style="display:flex; gap:8px;">
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
             <a href="/deals/{{ deal.slug }}/load" class="nav-btn primary" style="flex:1; text-align:center; padding:9px 0; font-size:13px;">Load</a>
             <a href="/deals/{{ deal.slug }}/edit" class="nav-btn" style="padding:9px 14px; font-size:13px;">Edit</a>
+            <form method="POST" action="/deals/{{ deal.slug }}/rerun-quick" style="margin:0;" onsubmit="showLoading();">
+                <button type="submit" class="nav-btn" style="padding:9px 14px; font-size:13px; color:var(--cyan);" title="Quick re-run with same config">Re-run</button>
+            </form>
             <form method="POST" action="/deals/{{ deal.slug }}/delete" style="margin:0;" onsubmit="return confirm('Delete deal {{ deal.name }}?');">
                 <button type="submit" class="nav-btn" style="padding:9px 14px; font-size:13px; color:var(--red); border-color:var(--red-dim);">Delete</button>
             </form>
+        </div>
+        <div style="margin-top:6px; display:flex; gap:6px;">
+            <form method="POST" action="/deals/{{ deal.slug }}/save-template" style="margin:0; flex:1;">
+                <input type="hidden" name="template_name" value="Template from {{ deal.name }}">
+                <button type="submit" class="nav-btn" style="width:100%; padding:6px 0; font-size:11px; color:var(--text-muted);">Save as Template</button>
+            </form>
+            <a href="/deals/{{ deal.slug }}/delta" class="nav-btn" style="padding:6px 12px; font-size:11px; color:var(--text-muted);">Delta</a>
+            <a href="/deals/{{ deal.slug }}/forecast" class="nav-btn" style="padding:6px 12px; font-size:11px; color:var(--cyan);">{{ 'Forecast' if session.get('forecast_unlocked') else 'Forecast (Beta)' }}</a>
         </div>
     </div>
     {% endfor %}
@@ -3031,6 +3104,171 @@ function _submitViaFetch() {
     <div style="font-size:48px; color:var(--text-dim); margin-bottom:16px;">&#128190;</div>
     <p style="color:var(--text-muted); margin-bottom:24px;">No saved deals yet. Run a consolidation with a deal name to save it here.</p>
     <a href="/upload" class="nav-btn primary" style="padding:10px 24px; font-size:13px;">Go to Upload</a>
+</div>
+{% endif %}
+
+{% elif page == 'templates' %}
+{# ==================== TEMPLATES PAGE ==================== #}
+<div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap;">
+    <div>
+        <h1>Deal Templates</h1>
+        <p>Reusable payor configurations for quick deal setup. <a href="/deals" class="nav-btn" style="margin-left:12px; padding:6px 14px; font-size:12px;">Back to Deals</a></p>
+    </div>
+</div>
+
+{% if templates is defined and templates %}
+<div class="grid grid-3">
+    {% for tpl in templates %}
+    <div class="card">
+        <div style="font-size:16px; font-weight:700; color:var(--text-primary); margin-bottom:8px;">{{ tpl.name }}</div>
+        {% if tpl.get('settings', {}).get('source_deal') %}
+        <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px;">From: {{ tpl.settings.source_deal }}</div>
+        {% endif %}
+        <div style="display:flex; flex-wrap:wrap; gap:4px; margin-bottom:12px;">
+            {% for pc in tpl.get('payor_configs', []) %}
+            <span style="font-size:11px; color:var(--accent); background:rgba(59,130,246,0.1); padding:2px 8px; border-radius:4px;">{{ pc.get('code', pc.get('name', '?')) }}</span>
+            {% endfor %}
+        </div>
+        <div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">{{ tpl.get('payor_configs', []) | length }} payor{{ 's' if tpl.get('payor_configs', []) | length != 1 }}</div>
+        <div style="display:flex; gap:8px;">
+            <form method="POST" action="/templates/{{ tpl.name }}/apply" style="margin:0; flex:1;">
+                <button type="submit" class="nav-btn primary" style="width:100%; padding:9px 0; font-size:13px;">Apply</button>
+            </form>
+            <form method="POST" action="/templates/{{ tpl.name }}/delete" style="margin:0;" onsubmit="return confirm('Delete template?');">
+                <button type="submit" class="nav-btn" style="padding:9px 14px; font-size:13px; color:var(--red); border-color:var(--red-dim);">Delete</button>
+            </form>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card" style="text-align:center; padding:60px;">
+    <p style="color:var(--text-muted); margin-bottom:24px;">No templates saved yet. Save a deal as a template from the Deals page.</p>
+    <a href="/deals" class="nav-btn primary" style="padding:10px 24px; font-size:13px;">Go to Deals</a>
+</div>
+{% endif %}
+
+{% elif page == 'delta' %}
+{# ==================== DELTA REPORT PAGE ==================== #}
+<div class="page-header">
+    <h1>Delta Report</h1>
+    <p>Changes since last re-run for <strong>{{ delta_slug }}</strong>. <a href="/deals" class="nav-btn" style="margin-left:12px; padding:6px 14px; font-size:12px;">Back to Deals</a></p>
+</div>
+
+{% if delta_report %}
+{# Summary banner #}
+<div class="card" style="margin-bottom:16px; border:1px solid var(--accent);">
+    <div style="font-size:14px; font-weight:600; color:var(--text-primary); margin-bottom:8px;">Summary</div>
+    <div style="font-size:13px; color:var(--text-secondary);">{{ delta_report.summary }}</div>
+    <div style="font-size:10px; color:var(--text-dim); margin-top:4px;">Generated {{ delta_report.created_at }}</div>
+</div>
+
+{# Period + ISRC changes #}
+<div class="grid grid-2" style="margin-bottom:16px;">
+    <div class="card">
+        <div class="card-header"><span class="card-title">Period Changes</span></div>
+        {% if delta_report.new_periods %}
+        <div style="margin-bottom:8px;">
+            <span style="font-size:11px; color:var(--green); font-weight:600;">+{{ delta_report.new_periods | length }} new:</span>
+            {% for p in delta_report.new_periods[:12] %}
+            <span class="mono" style="font-size:11px; color:var(--text-secondary);">{{ p }}</span>{% if not loop.last %}, {% endif %}
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% if delta_report.removed_periods %}
+        <div>
+            <span style="font-size:11px; color:var(--red); font-weight:600;">-{{ delta_report.removed_periods | length }} removed:</span>
+            {% for p in delta_report.removed_periods[:12] %}
+            <span class="mono" style="font-size:11px; color:var(--text-secondary);">{{ p }}</span>{% if not loop.last %}, {% endif %}
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% if not delta_report.new_periods and not delta_report.removed_periods %}
+        <div style="font-size:12px; color:var(--text-dim);">No period changes</div>
+        {% endif %}
+    </div>
+    <div class="card">
+        <div class="card-header"><span class="card-title">ISRC Changes</span></div>
+        <div style="display:flex; gap:16px;">
+            <div>
+                <span style="font-size:11px; color:var(--green); font-weight:600;">+{{ delta_report.new_isrcs | length }} new</span>
+            </div>
+            <div>
+                <span style="font-size:11px; color:var(--red); font-weight:600;">-{{ delta_report.removed_isrcs | length }} removed</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+{# Revenue comparison #}
+<div class="grid grid-3" style="margin-bottom:16px;">
+    <div class="card">
+        <div class="card-header"><span class="card-title">LTM Gross</span></div>
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <div>
+                <div style="font-size:11px; color:var(--text-dim);">Before</div>
+                <div class="mono" style="font-size:14px; color:var(--text-muted);">{{ '{:,.2f}'.format(delta_report.old_ltm_gross) }}</div>
+            </div>
+            <div style="font-size:20px; color:var(--text-dim);">→</div>
+            <div>
+                <div style="font-size:11px; color:var(--text-dim);">After</div>
+                <div class="mono" style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ '{:,.2f}'.format(delta_report.new_ltm_gross) }}</div>
+            </div>
+        </div>
+        <div class="stat-change {{ 'up' if delta_report.ltm_gross_change_pct >= 0 else 'down' }}" style="margin-top:8px;">
+            {{ '%+.1f' | format(delta_report.ltm_gross_change_pct) }}%
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header"><span class="card-title">LTM Net</span></div>
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <div>
+                <div style="font-size:11px; color:var(--text-dim);">Before</div>
+                <div class="mono" style="font-size:14px; color:var(--text-muted);">{{ '{:,.2f}'.format(delta_report.old_ltm_net) }}</div>
+            </div>
+            <div style="font-size:20px; color:var(--text-dim);">→</div>
+            <div>
+                <div style="font-size:11px; color:var(--text-dim);">After</div>
+                <div class="mono" style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ '{:,.2f}'.format(delta_report.new_ltm_net) }}</div>
+            </div>
+        </div>
+        <div class="stat-change {{ 'up' if delta_report.ltm_net_change_pct >= 0 else 'down' }}" style="margin-top:8px;">
+            {{ '%+.1f' | format(delta_report.ltm_net_change_pct) }}%
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header"><span class="card-title">ISRCs</span></div>
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <div class="mono" style="font-size:14px; color:var(--text-muted);">{{ delta_report.old_isrc_count }}</div>
+            <div style="font-size:20px; color:var(--text-dim);">→</div>
+            <div class="mono" style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ delta_report.new_isrc_count }}</div>
+        </div>
+    </div>
+</div>
+
+{# Per-payor variance #}
+{% if delta_report.payor_variance %}
+<div class="card" style="margin-bottom:16px;">
+    <div class="card-header"><span class="card-title">Revenue Variance by Payor</span></div>
+    <table>
+        <thead><tr><th>Payor</th><th class="text-right">Before</th><th class="text-right">After</th><th class="text-right">Change</th><th class="text-right">%</th></tr></thead>
+        <tbody>
+        {% for pv in delta_report.payor_variance %}
+        <tr>
+            <td style="font-weight:500; color:var(--text-primary);">{{ pv.name }}</td>
+            <td class="text-right mono">{{ '{:,.2f}'.format(pv.old_gross) }}</td>
+            <td class="text-right mono">{{ '{:,.2f}'.format(pv.new_gross) }}</td>
+            <td class="text-right mono {{ 'text-green' if pv.change >= 0 else 'text-red' }}">{{ '{:+,.2f}'.format(pv.change) }}</td>
+            <td class="text-right"><span class="stat-change {{ 'up' if pv.change_pct >= 0 else 'down' }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(pv.change_pct) }}%</span></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% else %}
+<div class="card" style="text-align:center; padding:40px;">
+    <p style="color:var(--text-muted);">No delta report available.</p>
 </div>
 {% endif %}
 
@@ -3589,6 +3827,776 @@ function addEditPayor() {
 </script>
 {% endif %}
 
+{% elif page == 'forecast' %}
+{# ==================== FORECAST PAGE ==================== #}
+<div class="page-header">
+    <h1>Forecast: {{ forecast_deal_name }}</h1>
+    <p>DCF projection with dual terminal value methods, sensitivity &amp; returns analysis. <a href="/deals" class="nav-btn" style="margin-left:12px; padding:6px 14px; font-size:12px;">Back to Deals</a></p>
+</div>
+
+{# ---- Config Form: 3-Card Grid ---- #}
+<form method="POST" action="/deals/{{ forecast_slug }}/forecast">
+<div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-bottom:16px;">
+    {# Card 1: Projection Settings #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Projection Settings</span></div>
+        <div class="form-group">
+            <label class="form-label">Default Genre Curve</label>
+            <select name="genre_default" class="form-input">
+                {% for val, label in genre_choices %}
+                <option value="{{ val }}" {% if forecast_result and forecast_result.config.genre_default == val %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div class="form-group">
+                <label class="form-label">Exit Year (Horizon)</label>
+                <input type="number" name="horizon_years" class="form-input" value="{{ forecast_result.config.horizon_years if forecast_result else 5 }}" min="1" max="20">
+            </div>
+            <div class="form-group">
+                <label class="form-label">WACC (%)</label>
+                <input type="number" name="discount_rate" class="form-input" value="{{ (forecast_result.config.discount_rate * 100) | round(3) if forecast_result else 9.375 }}" min="1" max="30" step="0.125">
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div class="form-group">
+                <label class="form-label">TGR (%)</label>
+                <input type="number" name="terminal_growth" class="form-input" value="{{ (forecast_result.summary.terminal_growth * 100) | round(1) if forecast_result and forecast_result.summary else 1 }}" min="-5" max="5" step="0.5">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Exit Multiple (x)</label>
+                <input type="number" name="exit_multiple" class="form-input" value="{{ forecast_result.config.exit_multiple if forecast_result else 15 }}" min="1" max="50" step="0.5">
+            </div>
+        </div>
+    </div>
+
+    {# Card 2: Transaction Assumptions #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Transaction Assumptions</span></div>
+        <div class="form-group">
+            <label class="form-label">Purchase Price ($)</label>
+            <input type="number" name="purchase_price" class="form-input" placeholder="Leave blank to skip returns" value="{{ '{:.0f}'.format(forecast_result.config.purchase_price) if forecast_result and forecast_result.config.purchase_price else '' }}" min="0" step="1000">
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div class="form-group">
+                <label class="form-label">Holdback ($)</label>
+                <input type="number" name="holdback" class="form-input" placeholder="0" value="{{ '{:.0f}'.format(forecast_result.config.holdback) if forecast_result and forecast_result.config.holdback else '' }}" min="0" step="1000">
+            </div>
+            <div class="form-group">
+                <label class="form-label">PCDPCDR ($)</label>
+                <input type="number" name="pcdpcdr" class="form-input" placeholder="0" value="{{ '{:.0f}'.format(forecast_result.config.pcdpcdr) if forecast_result and forecast_result.config.pcdpcdr else '' }}" min="0" step="1000">
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div class="form-group">
+                <label class="form-label">LTV (%)</label>
+                <input type="number" name="ltv" class="form-input" value="{{ (forecast_result.config.ltv * 100) | round(0) | int if forecast_result else 55 }}" min="0" max="90" step="5">
+            </div>
+            <div class="form-group">
+                <label class="form-label">CF Sweep (%)</label>
+                <input type="number" name="cash_flow_sweep" class="form-input" value="{{ (forecast_result.config.cash_flow_sweep * 100) | round(0) | int if forecast_result else 100 }}" min="0" max="100" step="5">
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;">
+            <div class="form-group">
+                <label class="form-label">SOFR (%)</label>
+                <input type="number" name="sofr_rate" class="form-input" value="{{ (forecast_result.config.sofr_rate * 100) | round(2) if forecast_result else 4.5 }}" min="0" max="15" step="0.25">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Floor (%)</label>
+                <input type="number" name="sofr_floor" class="form-input" value="{{ (forecast_result.config.sofr_floor * 100) | round(1) if forecast_result else 2.0 }}" min="0" max="10" step="0.25">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Spread (bps)</label>
+                <input type="number" name="sofr_spread" class="form-input" value="{{ (forecast_result.config.sofr_spread * 10000) | round(0) | int if forecast_result else 275 }}" min="0" max="1000" step="25">
+            </div>
+        </div>
+    </div>
+
+    {# Card 3: Synergy Assumptions #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Synergy Assumptions</span></div>
+        <div class="form-group">
+            <label class="form-label">New Fee Rate (% — blank = no synergy)</label>
+            <input type="number" name="new_fee_rate" class="form-input" placeholder="e.g. 8" value="{{ (forecast_result.config.new_fee_rate * 100) | round(1) if forecast_result and forecast_result.config.new_fee_rate else '' }}" min="0" max="50" step="0.5">
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div class="form-group">
+                <label class="form-label">Start Year</label>
+                <input type="number" name="synergy_start_year" class="form-input" value="{{ forecast_result.config.synergy_start_year if forecast_result else 1 }}" min="1" max="10">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Ramp (months)</label>
+                <input type="number" name="synergy_ramp_months" class="form-input" value="{{ forecast_result.config.synergy_ramp_months if forecast_result else 12 }}" min="1" max="60">
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="form-label">3P Synergy Rate (% — blank = none)</label>
+            <input type="number" name="third_party_synergy_rate" class="form-input" placeholder="e.g. 5" value="{{ (forecast_result.config.third_party_synergy_rate * 100) | round(1) if forecast_result and forecast_result.config.third_party_synergy_rate else '' }}" min="0" max="100" step="1">
+        </div>
+    </div>
+</div>
+
+{# ---- Row 2: Deal Metadata + Advanced Config ---- #}
+<details style="margin-bottom:16px;">
+    <summary style="cursor:pointer; font-weight:600; color:var(--cyan); font-size:13px; padding:8px 0;">
+        Advanced: Deal Metadata, SOFR Curve, Per-Payor Config &amp; FX
+    </summary>
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-top:8px;">
+        {# Card 4: Deal Metadata #}
+        <div class="card">
+            <div class="card-header"><span class="card-title">Deal Metadata</span></div>
+            <div class="form-group">
+                <label class="form-label">Opportunity Name</label>
+                <input type="text" name="opportunity_name" class="form-input" value="{{ forecast_result.config.opportunity_name if forecast_result and forecast_result.config.opportunity_name else forecast_deal_name }}" placeholder="{{ forecast_deal_name }}">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Rights Included</label>
+                <select name="rights_included" class="form-input">
+                    {% for val in ['Masters', 'Publishing', 'Neighboring Rights', 'Masters + Publishing', 'Masters + NR'] %}
+                    <option value="{{ val }}" {% if forecast_result and forecast_result.config.rights_included == val %}selected{% endif %}>{{ val }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Deal Type</label>
+                <select name="deal_type" class="form-input">
+                    {% for val in ['Catalog', 'Corporate', 'JV'] %}
+                    <option value="{{ val }}" {% if forecast_result and forecast_result.config.deal_type == val %}selected{% endif %}>{{ val }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                <div class="form-group">
+                    <label class="form-label">Cash Date</label>
+                    <input type="date" name="cash_date" class="form-input" value="{{ forecast_result.config.cash_date if forecast_result and forecast_result.config.cash_date else '' }}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Close Date</label>
+                    <input type="date" name="close_date" class="form-input" value="{{ forecast_result.config.close_date if forecast_result and forecast_result.config.close_date else '' }}">
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Virtu WACC (% — blank = skip)</label>
+                <input type="number" name="virtu_wacc" class="form-input" placeholder="e.g. 9" value="{{ (forecast_result.config.virtu_wacc * 100) | round(2) if forecast_result and forecast_result.config.virtu_wacc else '' }}" min="0" max="30" step="0.125">
+            </div>
+        </div>
+
+        {# Card 5: SOFR Forward Curve — Excel Import #}
+        <div class="card">
+            <div class="card-header"><span class="card-title">SOFR Forward Curve</span></div>
+            <div class="form-group">
+                <label class="form-label">Import from Excel (Chatham SOFR sheet)</label>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <input type="file" id="sofrFileInput" accept=".xlsx,.xls" style="flex:1; font-size:11px;">
+                    <button type="button" onclick="importSofrExcel()" class="nav-btn" style="padding:5px 14px; font-size:11px; white-space:nowrap;">Import</button>
+                </div>
+                <div id="sofrStatus" style="font-size:11px; margin-top:4px; color:var(--text-dim);"></div>
+            </div>
+            <input type="hidden" name="sofr_curve_json" id="sofrCurveJson" value="{{ forecast_result.config.sofr_curve | tojson if forecast_result and forecast_result.config.sofr_curve else '' }}">
+            <div id="sofrPreview" style="max-height:180px; overflow-y:auto; font-size:10px; display:none;">
+                <table style="width:100%; border-collapse:collapse;">
+                    <thead><tr style="position:sticky; top:0; background:var(--bg-card);">
+                        <th style="text-align:left; padding:2px 6px; border-bottom:1px solid var(--border);">Date</th>
+                        <th style="text-align:right; padding:2px 6px; border-bottom:1px solid var(--border);">SOFR %</th>
+                    </tr></thead>
+                    <tbody id="sofrPreviewBody"></tbody>
+                </table>
+            </div>
+            <div style="font-size:10px; color:var(--text-dim); margin-top:4px;">If populated, overrides flat SOFR rate from Card 2. Flat rate fields (SOFR Rate, Floor, Spread) still apply as fallback.</div>
+        </div>
+
+        {# Card 6: Per-Payor Config — Auto-Populated Table #}
+        <div class="card" style="grid-column: span 2;">
+            <div class="card-header"><span class="card-title">Per-Payor Config</span></div>
+            <input type="hidden" name="payor_configs_json" id="payorConfigsJson" value="{{ forecast_result.config.payor_configs | tojson if forecast_result and forecast_result.config.payor_configs else '' }}">
+            <input type="hidden" name="fx_rates_json" id="fxRatesJson" value="{{ forecast_result.config.fx_rates | tojson if forecast_result and forecast_result.config.fx_rates else '' }}">
+            <div style="overflow-x:auto;">
+                <table id="payorConfigTable" style="width:100%; border-collapse:collapse; font-size:11px;">
+                    <thead><tr>
+                        <th style="text-align:left; padding:4px 6px; border-bottom:1px solid var(--border);">Payor</th>
+                        <th style="text-align:left; padding:4px 6px; border-bottom:1px solid var(--border);">Rights</th>
+                        <th style="text-align:right; padding:4px 6px; border-bottom:1px solid var(--border);">Fee %</th>
+                        <th style="text-align:center; padding:4px 6px; border-bottom:1px solid var(--border);">Source Ccy</th>
+                        <th style="text-align:left; padding:4px 6px; border-bottom:1px solid var(--border);">Target Ccy</th>
+                        <th style="text-align:right; padding:4px 6px; border-bottom:1px solid var(--border);">FX Rate</th>
+                        <th style="text-align:center; padding:4px 6px; border-bottom:1px solid var(--border);">Synergy</th>
+                    </tr></thead>
+                    <tbody>
+                    {% set saved_pc = forecast_result.config.payor_configs if forecast_result and forecast_result.config.payor_configs else {} %}
+                    {% for ps in results.get('payor_summaries', []) %}
+                    {% set pc = saved_pc.get(ps.code, {}) %}
+                    <tr data-payor="{{ ps.code }}">
+                        <td style="padding:4px 6px; font-weight:600;">{{ ps.name }}</td>
+                        <td style="padding:4px 6px;">
+                            <select class="pc-rights form-input" style="font-size:11px; padding:2px 4px;">
+                                {% for val in ['Masters', 'Publishing', 'Neighboring Rights'] %}
+                                <option value="{{ val }}" {% if pc.get('income_rights') == val %}selected{% elif not pc and ps.statement_type == val %}selected{% endif %}>{{ val }}</option>
+                                {% endfor %}
+                            </select>
+                        </td>
+                        <td style="padding:4px 6px;">
+                            <input type="number" class="pc-fee form-input" style="font-size:11px; padding:2px 4px; width:60px; text-align:right;"
+                                   value="{{ pc.get('fee_rate', ps.fee | replace('%','') | float / 100) }}" min="0" max="1" step="0.01">
+                        </td>
+                        <td style="padding:4px 6px; text-align:center; color:var(--text-muted);" class="pc-source-ccy">{{ ps.currency_code or ps.fx or 'USD' }}</td>
+                        <td style="padding:4px 6px;">
+                            <select class="pc-target-ccy form-input" style="font-size:11px; padding:2px 4px;">
+                                {% for ccy in ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF'] %}
+                                <option value="{{ ccy }}" {% if pc.get('fx_currency') == ccy %}selected{% elif not pc and ccy == 'USD' %}selected{% endif %}>{{ ccy }}</option>
+                                {% endfor %}
+                            </select>
+                        </td>
+                        <td style="padding:4px 6px;">
+                            <input type="number" class="pc-fx-rate form-input" style="font-size:11px; padding:2px 4px; width:70px; text-align:right;"
+                                   value="{{ pc.get('fx_rate', '') }}" min="0" step="0.0001"
+                                   {% if (ps.currency_code or ps.fx or 'USD') == (pc.get('fx_currency', 'USD')) %}disabled{% endif %}>
+                        </td>
+                        <td style="padding:4px 6px; text-align:center;">
+                            <input type="checkbox" class="pc-synergy" {% if pc.get('synergy') %}checked{% endif %}>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <div style="font-size:10px; color:var(--text-dim); margin-top:4px;">Auto-populated from deal analytics. FX Rate only needed when Source != Target currency.</div>
+        </div>
+    </div>
+</details>
+
+<div style="margin-top:8px; margin-bottom:16px;">
+    <button type="submit" class="btn-submit" style="padding:10px 32px; font-size:14px;">Run Forecast</button>
+</div>
+</form>
+
+{# ---- Forecast Form JS ---- #}
+<script>
+function importSofrExcel() {
+    const fileInput = document.getElementById('sofrFileInput');
+    const status = document.getElementById('sofrStatus');
+    const preview = document.getElementById('sofrPreview');
+    const body = document.getElementById('sofrPreviewBody');
+    const hidden = document.getElementById('sofrCurveJson');
+
+    if (!fileInput.files.length) {
+        status.textContent = 'Please select an Excel file first.';
+        status.style.color = 'var(--red)';
+        return;
+    }
+
+    status.textContent = 'Importing...';
+    status.style.color = 'var(--text-dim)';
+
+    const fd = new FormData();
+    fd.append('sofr_file', fileInput.files[0]);
+
+    fetch('/api/parse-sofr-excel', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                status.textContent = 'Error: ' + data.error;
+                status.style.color = 'var(--red)';
+                return;
+            }
+            hidden.value = JSON.stringify(data.curve);
+            renderSofrPreview(data.curve);
+            status.textContent = data.count + ' data points imported.';
+            status.style.color = 'var(--green, #22c55e)';
+        })
+        .catch(err => {
+            status.textContent = 'Upload failed: ' + err.message;
+            status.style.color = 'var(--red)';
+        });
+}
+
+function renderSofrPreview(curve) {
+    const preview = document.getElementById('sofrPreview');
+    const body = document.getElementById('sofrPreviewBody');
+    body.innerHTML = '';
+    if (!curve || !curve.length) { preview.style.display = 'none'; return; }
+    curve.forEach(pt => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td style="padding:1px 6px;">' + pt.date + '</td>'
+            + '<td style="padding:1px 6px; text-align:right;">' + (pt.rate * 100).toFixed(3) + '%</td>';
+        body.appendChild(tr);
+    });
+    preview.style.display = '';
+}
+
+function collectPayorConfigs() {
+    const rows = document.querySelectorAll('#payorConfigTable tbody tr');
+    const configs = {};
+    const fxRates = {};
+    rows.forEach(tr => {
+        const code = tr.dataset.payor;
+        const rights = tr.querySelector('.pc-rights').value;
+        const fee = parseFloat(tr.querySelector('.pc-fee').value) || 0;
+        const sourceCcy = tr.querySelector('.pc-source-ccy').textContent.trim();
+        const targetCcy = tr.querySelector('.pc-target-ccy').value;
+        const fxInput = tr.querySelector('.pc-fx-rate');
+        const fxRate = fxInput.disabled ? null : (parseFloat(fxInput.value) || null);
+        const synergy = tr.querySelector('.pc-synergy').checked;
+
+        configs[code] = {
+            income_rights: rights,
+            fee_rate: fee,
+            fx_currency: targetCcy,
+            synergy: synergy
+        };
+        if (fxRate && sourceCcy !== targetCcy) {
+            configs[code].fx_rate = fxRate;
+            fxRates[sourceCcy] = fxRate;
+        }
+    });
+    document.getElementById('payorConfigsJson').value = JSON.stringify(configs);
+    document.getElementById('fxRatesJson').value = JSON.stringify(fxRates);
+}
+
+/* Enable/disable FX rate inputs when target currency changes */
+document.querySelectorAll('.pc-target-ccy').forEach(sel => {
+    sel.addEventListener('change', function() {
+        const tr = this.closest('tr');
+        const sourceCcy = tr.querySelector('.pc-source-ccy').textContent.trim();
+        const fxInput = tr.querySelector('.pc-fx-rate');
+        fxInput.disabled = (sourceCcy === this.value);
+        if (fxInput.disabled) fxInput.value = '';
+    });
+});
+
+/* Collect configs before form submit */
+document.querySelector('form[action*="/forecast"]').addEventListener('submit', function() {
+    collectPayorConfigs();
+});
+
+/* On load: render SOFR preview if data exists from previous run */
+(function() {
+    const hidden = document.getElementById('sofrCurveJson');
+    if (hidden && hidden.value) {
+        try {
+            const curve = JSON.parse(hidden.value);
+            if (Array.isArray(curve) && curve.length) {
+                renderSofrPreview(curve);
+                document.getElementById('sofrStatus').textContent = curve.length + ' data points loaded from previous run.';
+            }
+        } catch(e) {}
+    }
+})();
+</script>
+
+{# ==================== RESULTS (Tabbed Interface) ==================== #}
+{% if forecast_result %}
+
+{# ---- Coverage Warning ---- #}
+{% if forecast_result.isrc_coverage is defined and forecast_result.isrc_coverage < 0.95 %}
+<div style="padding:10px 16px; margin-bottom:12px; border-radius:6px; font-size:12px;
+    background:{% if forecast_result.isrc_coverage < 0.5 %}rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); color:var(--red);{% else %}rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.3); color:#92400e;{% endif %}">
+    <strong>ISRC Coverage: {{ forecast_result.ltm_waterfall.coverage_pct }}%</strong> &mdash;
+    Only {{ CSYM }}{{ '{:,.0f}'.format(forecast_result.ltm_waterfall.gross) }} of {{ CSYM }}{{ '{:,.0f}'.format(forecast_result.ltm_waterfall.gross_all) }} LTM gross is attributed to identified ISRCs.
+    Revenue without ISRC identifiers is not projected. The LTM column in the waterfall reflects ISRC-attributed revenue only.
+</div>
+{% endif %}
+
+{# ---- Tab Bar ---- #}
+<div style="display:flex; gap:4px; margin-bottom:16px; border-bottom:2px solid var(--border); padding-bottom:0;">
+    {% set fc_tabs = [('fc-summary','Summary'),('fc-waterfall','Waterfall'),('fc-dcf','DCF Analysis'),('fc-sensitivity','Sensitivity'),('fc-returns','Returns'),('fc-isrcs','Top ISRCs')] %}
+    {% for tid, tlabel in fc_tabs %}
+    <button class="pill-tab{% if loop.first %} active{% endif %}" onclick="document.querySelectorAll('.fc-panel').forEach(p=>p.style.display='none');document.getElementById('{{tid}}').style.display='block';document.querySelectorAll('.pill-tab').forEach(b=>b.classList.remove('active'));this.classList.add('active');" style="padding:8px 16px; font-size:12px; font-weight:600; border:none; background:{% if loop.first %}var(--accent){% else %}transparent{% endif %}; color:{% if loop.first %}#fff{% else %}var(--text-secondary){% endif %}; border-radius:6px 6px 0 0; cursor:pointer;">{{ tlabel }}</button>
+    {% endfor %}
+</div>
+
+{% set CSYM = results.currency_symbol | default('$') %}
+{% set CCY = results.currency_code | default('USD') %}
+
+{# ==================== Tab 1: Summary ==================== #}
+<div id="fc-summary" class="fc-panel" style="display:block;">
+
+{# Hero Cards #}
+<div style="display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:16px;">
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Implied Valuation</span></div>
+        <div class="stat-value" style="font-size:22px;"><span class="data-money" data-raw="{{ forecast_result.summary.npv }}" data-ccy="{{ CCY }}">{{ CSYM }}{{ '{:,.0f}'.format(forecast_result.summary.npv) }}</span></div>
+        <div class="stat-subtitle">{{ '%.1f' | format(forecast_result.summary.implied_multiple_net) }}x Net &middot; TM Method</div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Perpetuity Value</span></div>
+        <div class="stat-value" style="font-size:22px;"><span class="data-money" data-raw="{{ forecast_result.summary.npv_perpetuity }}" data-ccy="{{ CCY }}">{{ CSYM }}{{ '{:,.0f}'.format(forecast_result.summary.npv_perpetuity) }}</span></div>
+        <div class="stat-subtitle">PG Method &middot; TGR {{ '%.1f' | format(forecast_result.summary.terminal_growth * 100) }}%</div>
+    </div>
+    {% if forecast_result.unlevered_returns and forecast_result.unlevered_returns.irr is defined %}
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Unlev. IRR</span></div>
+        <div class="stat-value" style="font-size:22px;">{{ '%.1f' | format((forecast_result.unlevered_returns.irr or 0) * 100) }}%</div>
+        <div class="stat-subtitle">MOIC: {{ '%.2f' | format(forecast_result.unlevered_returns.moic) }}x</div>
+    </div>
+    {% else %}
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Unlev. IRR</span></div>
+        <div class="stat-value medium" style="color:var(--text-dim);">--</div>
+        <div class="stat-subtitle">Set purchase price</div>
+    </div>
+    {% endif %}
+    {% if forecast_result.levered_returns and forecast_result.levered_returns.irr is defined %}
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Lev. IRR</span></div>
+        <div class="stat-value" style="font-size:22px;">{{ '%.1f' | format((forecast_result.levered_returns.irr or 0) * 100) }}%</div>
+        <div class="stat-subtitle">MOIC: {{ '%.2f' | format(forecast_result.levered_returns.moic) }}x</div>
+    </div>
+    {% else %}
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Lev. IRR</span></div>
+        <div class="stat-value medium" style="color:var(--text-dim);">--</div>
+        <div class="stat-subtitle">Set purchase price</div>
+    </div>
+    {% endif %}
+    {% if forecast_result.virtu_levered_returns and forecast_result.virtu_levered_returns.irr is defined %}
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Virtu IRR</span></div>
+        <div class="stat-value" style="font-size:22px;">{{ '%.1f' | format((forecast_result.virtu_levered_returns.irr or 0) * 100) }}%</div>
+        <div class="stat-subtitle">MOIC: {{ '%.2f' | format(forecast_result.virtu_levered_returns.moic) }}x</div>
+    </div>
+    {% endif %}
+    <div class="card" style="text-align:center;">
+        <div class="card-header"><span class="card-title" style="font-size:11px;">Projected Total</span></div>
+        <div class="stat-value" style="font-size:22px;"><span class="data-money" data-raw="{{ forecast_result.aggregate.total_net_incl }}" data-ccy="{{ CCY }}">{{ CSYM }}{{ '{:,.0f}'.format(forecast_result.aggregate.total_net_incl) }}</span></div>
+        <div class="stat-subtitle">{{ forecast_result.config.horizon_years }}-yr NE (Incl) &middot; {{ forecast_result.isrc_count }} ISRCs</div>
+    </div>
+</div>
+
+{# Projection Chart #}
+<div class="card" style="margin-bottom:16px;">
+    <div class="card-header">
+        <span class="card-title">Projected Revenue by Year</span>
+        <a href="/deals/{{ forecast_slug }}/forecast/download" class="nav-btn" style="font-size:11px; padding:4px 12px;">Download Excel</a>
+    </div>
+    <div class="chart-wrap tall">
+        <canvas id="forecastChart"></canvas>
+    </div>
+</div>
+</div>
+
+{# ==================== Tab 2: Earnings Waterfall ==================== #}
+<div id="fc-waterfall" class="fc-panel" style="display:none;">
+<div class="card" style="margin-bottom:16px;">
+    <div class="card-header"><span class="card-title">Full Earnings Waterfall</span></div>
+    <div style="overflow-x:auto;">
+    <table style="font-size:12px; white-space:nowrap;">
+        <thead>
+        <tr>
+            <th style="min-width:180px;">Metric</th>
+            <th class="text-right" style="min-width:110px;">LTM</th>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <th class="text-right" style="min-width:110px;">Yr {{ yt.year }} ({{ yt.calendar_year }})</th>
+            {% endfor %}
+        </tr>
+        </thead>
+        <tbody>
+        {% set ltm_wf = forecast_result.ltm_waterfall %}
+        {# Gross #}
+        <tr>
+            <td style="font-weight:600;">Gross Revenue</td>
+            <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(ltm_wf.gross) }}</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(yt.gross) }}</td>
+            {% endfor %}
+        </tr>
+        {# Fees #}
+        <tr style="color:var(--red);">
+            <td style="font-weight:500;">Less: Distribution Fees</td>
+            <td class="text-right mono">({{ CSYM }}{{ '{:,.0f}'.format(ltm_wf.fees) }})</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono">({{ CSYM }}{{ '{:,.0f}'.format(yt.fees_original) }})</td>
+            {% endfor %}
+        </tr>
+        {# Net Receipts #}
+        <tr style="border-top:1px solid var(--border);">
+            <td style="font-weight:600;">Net Receipts</td>
+            <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(ltm_wf.net_receipts) }}</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(yt.net_receipts_excl) }}</td>
+            {% endfor %}
+        </tr>
+        {# Third Party #}
+        <tr style="color:var(--red);">
+            <td style="font-weight:500;">Less: Third Party</td>
+            <td class="text-right mono">({{ CSYM }}{{ '{:,.0f}'.format(ltm_wf.third_party) }})</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono">({{ CSYM }}{{ '{:,.0f}'.format(yt.third_party_excl) }})</td>
+            {% endfor %}
+        </tr>
+        {# NE Excl #}
+        <tr style="border-top:1px solid var(--border); background:rgba(59,130,246,0.04);">
+            <td style="font-weight:700;">Net Earnings (Excl Synergies)</td>
+            <td class="text-right mono" style="font-weight:700;">{{ CSYM }}{{ '{:,.0f}'.format(ltm_wf.net_earnings) }}</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono" style="font-weight:700;">{{ CSYM }}{{ '{:,.0f}'.format(yt.net_earnings_excl) }}</td>
+            {% endfor %}
+        </tr>
+        {# Blank separator #}
+        <tr><td colspan="{{ forecast_result.aggregate.year_totals | length + 2 }}" style="height:8px; border:none;"></td></tr>
+        {# Fee Savings #}
+        <tr style="color:var(--green);">
+            <td style="font-weight:500;">Plus: Fee Savings</td>
+            <td class="text-right mono">--</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(yt.fee_savings) }}</td>
+            {% endfor %}
+        </tr>
+        {# 3P Savings #}
+        <tr style="color:var(--green);">
+            <td style="font-weight:500;">Plus: 3P Savings</td>
+            <td class="text-right mono">--</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(yt.tp_savings) }}</td>
+            {% endfor %}
+        </tr>
+        {# NE Incl #}
+        <tr style="border-top:2px solid var(--accent); background:rgba(34,197,94,0.06);">
+            <td style="font-weight:700; color:var(--accent);">Net Earnings (Incl Synergies)</td>
+            <td class="text-right mono" style="font-weight:700; color:var(--accent);">{{ CSYM }}{{ '{:,.0f}'.format(ltm_wf.net_earnings) }}</td>
+            {% for yt in forecast_result.aggregate.year_totals %}
+            <td class="text-right mono" style="font-weight:700; color:var(--accent);">{{ CSYM }}{{ '{:,.0f}'.format(yt.net_earnings_incl) }}</td>
+            {% endfor %}
+        </tr>
+        </tbody>
+    </table>
+    </div>
+</div>
+</div>
+
+{# ==================== Tab 3: DCF Analysis ==================== #}
+<div id="fc-dcf" class="fc-panel" style="display:none;">
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+    {% for method_label, method_key in [('Terminal Multiple','terminal_multiple'), ('Perpetuity Growth','perpetuity_growth')] %}
+    {% for track_label, track_key in [('Excl Synergies','excl'), ('Incl Synergies','incl')] %}
+    {% set d = forecast_result.dcf[method_key][track_key] %}
+    <div class="card">
+        <div class="card-header"><span class="card-title" style="font-size:12px;">{{ method_label }} — {{ track_label }}</span></div>
+        <table style="font-size:12px;">
+            <tbody>
+            <tr><td>PV of Cash Flows</td><td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(d.pv_cash_flows) }}</td></tr>
+            <tr><td>PV of Terminal Value</td><td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(d.pv_terminal_value) }}</td></tr>
+            <tr style="border-top:2px solid var(--border);"><td style="font-weight:700;">Implied Valuation</td><td class="text-right mono" style="font-weight:700; color:var(--accent); font-size:14px;">{{ CSYM }}{{ '{:,.0f}'.format(d.implied_valuation) }}</td></tr>
+            <tr><td style="color:var(--text-dim);">Implied LTM Multiple</td><td class="text-right mono" style="color:var(--text-dim);">{{ '%.1f' | format(d.implied_ltm_multiple) }}x</td></tr>
+            </tbody>
+        </table>
+    </div>
+    {% endfor %}
+    {% endfor %}
+</div>
+</div>
+
+{# ==================== Tab 4: Sensitivity ==================== #}
+<div id="fc-sensitivity" class="fc-panel" style="display:none;">
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+    {# Terminal Multiple Sensitivity #}
+    {% set tm_sens = forecast_result.sensitivity.terminal_multiple %}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Terminal Multiple (WACC × Exit Mult) — Incl</span></div>
+        <table style="font-size:12px;">
+            <thead>
+            <tr>
+                <th>WACC \ Exit Mult</th>
+                {% for em in tm_sens.exit_mult_values %}
+                <th class="text-right">{{ '%.1f' | format(em) }}x</th>
+                {% endfor %}
+            </tr>
+            </thead>
+            <tbody>
+            {% for wi in range(tm_sens.wacc_values | length) %}
+            <tr>
+                <td style="font-weight:600;">{{ '%.2f' | format(tm_sens.wacc_values[wi]) }}%</td>
+                {% for ci in range(tm_sens.exit_mult_values | length) %}
+                <td class="text-right mono" style="{% if wi == 1 and ci == 1 %}background:rgba(251,191,36,0.15); font-weight:700;{% endif %}">{{ CSYM }}{{ '{:,.0f}'.format(tm_sens.matrix_incl[wi][ci]) }}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {# Perpetuity Growth Sensitivity #}
+    {% set pg_sens = forecast_result.sensitivity.perpetuity_growth %}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Perpetuity Growth (WACC × TGR) — Incl</span></div>
+        <table style="font-size:12px;">
+            <thead>
+            <tr>
+                <th>WACC \ TGR</th>
+                {% for tg in pg_sens.tgr_values %}
+                <th class="text-right">{{ '%.2f' | format(tg) }}%</th>
+                {% endfor %}
+            </tr>
+            </thead>
+            <tbody>
+            {% for wi in range(pg_sens.wacc_values | length) %}
+            <tr>
+                <td style="font-weight:600;">{{ '%.2f' | format(pg_sens.wacc_values[wi]) }}%</td>
+                {% for ci in range(pg_sens.tgr_values | length) %}
+                <td class="text-right mono" style="{% if wi == 1 and ci == 1 %}background:rgba(251,191,36,0.15); font-weight:700;{% endif %}">{{ CSYM }}{{ '{:,.0f}'.format(pg_sens.matrix_incl[wi][ci]) }}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+</div>
+
+{# ==================== Tab 5: Returns ==================== #}
+<div id="fc-returns" class="fc-panel" style="display:none;">
+{% if forecast_result.unlevered_returns and forecast_result.unlevered_returns.schedule is defined %}
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+    {# Unlevered Returns #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Unlevered Returns</span></div>
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin-bottom:12px; padding:8px; background:var(--bg-inset); border-radius:6px;">
+            <div style="text-align:center;"><div style="font-size:10px; color:var(--text-dim);">IRR</div><div style="font-size:16px; font-weight:700;">{{ '%.1f' | format((forecast_result.unlevered_returns.irr or 0) * 100) }}%</div></div>
+            <div style="text-align:center;"><div style="font-size:10px; color:var(--text-dim);">MOIC</div><div style="font-size:16px; font-weight:700;">{{ '%.2f' | format(forecast_result.unlevered_returns.moic) }}x</div></div>
+            <div style="text-align:center;"><div style="font-size:10px; color:var(--text-dim);">Exit EV</div><div style="font-size:16px; font-weight:700;">{{ CSYM }}{{ '{:,.0f}'.format(forecast_result.unlevered_returns.exit_ev) }}</div></div>
+        </div>
+        <table style="font-size:11px;">
+            <thead><tr><th>Year</th><th class="text-right">UFCF</th><th class="text-right">Exit</th><th class="text-right">Total</th></tr></thead>
+            <tbody>
+            {% for s in forecast_result.unlevered_returns.schedule %}
+            <tr>
+                <td>Yr {{ s.year }} ({{ s.calendar_year }})</td>
+                <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(s.ufcf) }}</td>
+                <td class="text-right mono" style="color:{% if s.exit_proceeds > 0 %}var(--green){% else %}var(--text-dim){% endif %};">{{ CSYM }}{{ '{:,.0f}'.format(s.exit_proceeds) }}</td>
+                <td class="text-right mono" style="font-weight:600;">{{ CSYM }}{{ '{:,.0f}'.format(s.total) }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {# Levered Returns #}
+    {% if forecast_result.levered_returns and forecast_result.levered_returns.debt_schedule is defined %}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Levered Returns</span></div>
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin-bottom:12px; padding:8px; background:var(--bg-inset); border-radius:6px;">
+            <div style="text-align:center;"><div style="font-size:10px; color:var(--text-dim);">IRR</div><div style="font-size:16px; font-weight:700;">{{ '%.1f' | format((forecast_result.levered_returns.irr or 0) * 100) }}%</div></div>
+            <div style="text-align:center;"><div style="font-size:10px; color:var(--text-dim);">MOIC</div><div style="font-size:16px; font-weight:700;">{{ '%.2f' | format(forecast_result.levered_returns.moic) }}x</div></div>
+            <div style="text-align:center;"><div style="font-size:10px; color:var(--text-dim);">Exit Equity</div><div style="font-size:16px; font-weight:700;">{{ CSYM }}{{ '{:,.0f}'.format(forecast_result.levered_returns.exit_equity) }}</div></div>
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px;">
+            Equity: {{ CSYM }}{{ '{:,.0f}'.format(forecast_result.levered_returns.equity) }} &middot;
+            Debt: {{ CSYM }}{{ '{:,.0f}'.format(forecast_result.levered_returns.debt_initial) }} &middot;
+            Rate: {{ '%.2f' | format(forecast_result.levered_returns.interest_rate * 100) }}%
+        </div>
+        <table style="font-size:11px;">
+            <thead><tr><th>Year</th><th class="text-right">UFCF</th><th class="text-right">Interest</th><th class="text-right">Principal</th><th class="text-right">LFCF</th><th class="text-right">Debt Bal.</th></tr></thead>
+            <tbody>
+            {% for ds in forecast_result.levered_returns.debt_schedule %}
+            <tr>
+                <td>Yr {{ ds.year }}</td>
+                <td class="text-right mono">{{ CSYM }}{{ '{:,.0f}'.format(ds.ufcf) }}</td>
+                <td class="text-right mono" style="color:var(--red);">({{ CSYM }}{{ '{:,.0f}'.format(ds.interest) }})</td>
+                <td class="text-right mono" style="color:var(--red);">({{ CSYM }}{{ '{:,.0f}'.format(ds.principal) }})</td>
+                <td class="text-right mono" style="font-weight:600;">{{ CSYM }}{{ '{:,.0f}'.format(ds.lfcf) }}</td>
+                <td class="text-right mono" style="color:var(--text-dim);">{{ CSYM }}{{ '{:,.0f}'.format(ds.closing_balance) }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% else %}
+<div class="card" style="margin-bottom:16px; text-align:center; padding:40px;">
+    <div style="font-size:14px; color:var(--text-dim);">Set a Purchase Price in the config above to see returns analysis.</div>
+</div>
+{% endif %}
+</div>
+
+{# ==================== Tab 6: Top ISRCs ==================== #}
+<div id="fc-isrcs" class="fc-panel" style="display:none;">
+{% if forecast_result.top_isrcs %}
+<div class="card" style="margin-bottom:16px;">
+    <div class="card-header"><span class="card-title">Top Projected ISRCs</span></div>
+    <table>
+        <thead><tr><th>#</th><th>Artist</th><th>Title</th><th>Genre</th><th class="text-right">LTM Gross</th><th class="text-right">Projected Total</th></tr></thead>
+        <tbody>
+        {% for ti in forecast_result.top_isrcs[:30] %}
+        <tr>
+            <td><span class="rank">{{ loop.index }}</span></td>
+            <td style="font-size:12px;">{{ ti.artist }}</td>
+            <td style="font-weight:500; color:var(--text-primary); font-size:12px;">{{ ti.title }}</td>
+            <td style="font-size:11px; color:var(--text-dim);">{{ ti.genre }}</td>
+            <td class="text-right mono" style="font-size:12px;"><span class="data-money" data-raw="{{ ti.ltm_gross }}" data-ccy="{{ CCY }}">{{ CSYM }}{{ '{:,.2f}'.format(ti.ltm_gross) }}</span></td>
+            <td class="text-right mono" style="font-size:12px;"><span class="data-money" data-raw="{{ ti.projected_total }}" data-ccy="{{ CCY }}">{{ CSYM }}{{ '{:,.2f}'.format(ti.projected_total) }}</span></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+</div>
+
+{# ---- Forecast Chart JS ---- #}
+<script>
+(function() {
+    const YT = {{ forecast_result.aggregate.year_totals | tojson }};
+    const labels = ['LTM'].concat(YT.map(d => 'Yr ' + d.year));
+    const grossData = [{{ forecast_result.summary.ltm_gross }}].concat(YT.map(d => d.gross));
+    const neExclData = [{{ forecast_result.ltm_waterfall.net_earnings }}].concat(YT.map(d => d.net_earnings_excl));
+    const neInclData = [{{ forecast_result.ltm_waterfall.net_earnings }}].concat(YT.map(d => d.net_earnings_incl));
+    const CSYM = '{{ results.currency_symbol | default("$") }}';
+
+    new Chart(document.getElementById('forecastChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'Gross Revenue',
+                    data: grossData,
+                    backgroundColor: 'rgba(59,130,246,0.5)',
+                    borderRadius: 3,
+                    barPercentage: 0.5,
+                },
+                {
+                    label: 'NE (Excl)',
+                    type: 'line',
+                    data: neExclData,
+                    borderColor: '#94a3b8',
+                    borderDash: [4,3],
+                    backgroundColor: 'transparent',
+                    pointRadius: 3,
+                    pointBackgroundColor: '#94a3b8',
+                    fill: false,
+                    tension: 0.3,
+                },
+                {
+                    label: 'NE (Incl Synergies)',
+                    type: 'line',
+                    data: neInclData,
+                    borderColor: '#22d3ee',
+                    backgroundColor: 'rgba(34,211,238,0.1)',
+                    pointRadius: 4,
+                    pointBackgroundColor: '#22d3ee',
+                    fill: true,
+                    tension: 0.3,
+                }
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+                legend: { position: 'top', labels: { boxWidth: 12, padding: 16 } },
+                tooltip: {
+                    callbacks: { label: ctx => ctx.dataset.label + ': ' + CSYM + ctx.parsed.y.toLocaleString(undefined, {minimumFractionDigits:0}) }
+                }
+            },
+            scales: {
+                x: { grid: { display: false } },
+                y: { ticks: { callback: v => CSYM + (v >= 1000000 ? (v/1000000).toFixed(1) + 'M' : (v/1000).toFixed(0) + 'k') } }
+            }
+        }
+    });
+})();
+</script>
+{% endif %}
+
 {% elif page == 'dashboard' and results %}
 {# ==================== DASHBOARD ==================== #}
 <div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
@@ -3609,6 +4617,84 @@ function addEditPayor() {
         </select>
         <span id="currencyStatus" style="font-size:10px; color:var(--text-dim);"></span>
     </div>
+</div>
+
+{# ---- B1: Period Gap Alert Banner ---- #}
+{% set total_missing = [] %}
+{% for ps in results.get('payor_summaries', []) %}
+  {% if ps.get('missing_count', 0) > 0 %}
+    {% if total_missing.append({'name': ps.name, 'count': ps.missing_count}) %}{% endif %}
+  {% endif %}
+{% endfor %}
+{% if total_missing %}
+{% set max_missing = total_missing | map(attribute='count') | max %}
+{% set severity = 'red' if max_missing >= 3 else 'yellow' %}
+<div id="sec-overview" style="margin-bottom:12px; padding:10px 16px; border-radius:8px; border:1px solid var(--{{ severity }}); background:{% if severity == 'red' %}rgba(248,113,113,0.08){% else %}rgba(251,191,36,0.08){% endif %}; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <span style="font-size:14px;">{% if severity == 'red' %}&#9888;{% else %}&#9888;{% endif %}</span>
+    <span style="font-size:12px; color:var(--{{ severity }}); font-weight:600;">Period Gap Alert</span>
+    {% for mg in total_missing %}
+    <span style="font-size:12px; color:var(--{{ severity }});">{{ mg.name }}: {{ mg.count }} missing month{{ 's' if mg.count != 1 }}</span>
+    {% if not loop.last %}<span style="color:var(--text-dim);">&middot;</span>{% endif %}
+    {% endfor %}
+    <span style="font-size:11px; color:var(--text-dim); margin-left:auto;">LTM may be understated</span>
+</div>
+{% else %}
+<div id="sec-overview"></div>
+{% endif %}
+
+{# ---- Delta Report Banner (after re-run) ---- #}
+{% if delta_summary is defined and delta_summary %}
+<div style="margin-bottom:12px; padding:10px 16px; border-radius:8px; border:1px solid var(--accent); background:rgba(59,130,246,0.06); display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <span style="font-size:13px; color:var(--accent); font-weight:600;">Re-run Delta:</span>
+    <span style="font-size:12px; color:var(--text-secondary);">{{ delta_summary.summary }}</span>
+    {% if delta_summary.deal_slug %}
+    <a href="/deals/{{ delta_summary.deal_slug }}/delta" style="margin-left:auto; font-size:11px; color:var(--accent); text-decoration:none; border:1px solid var(--accent); padding:3px 10px; border-radius:4px;">View Full Report</a>
+    {% endif %}
+</div>
+{% endif %}
+
+{# ---- B2: Quick Stats Sticky Bar ---- #}
+<div style="position:sticky; top:56px; z-index:99; background:var(--bg-inset); border-bottom:1px solid var(--border); margin:-16px -24px 16px -24px; padding:8px 24px; display:flex; align-items:center; gap:24px; flex-wrap:wrap;">
+    <div style="display:flex; align-items:baseline; gap:4px;">
+        <span style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">LTM Gross</span>
+        <span class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);"><span class="data-money" data-raw="{{ results.ltm_gross_total }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ results.ltm_gross_total_fmt }}</span></span>
+    </div>
+    <div style="display:flex; align-items:baseline; gap:4px;">
+        <span style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">LTM Net</span>
+        <span class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);"><span class="data-money" data-raw="{{ results.ltm_net_total }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ results.ltm_net_total_fmt }}</span></span>
+    </div>
+    <div style="display:flex; align-items:baseline; gap:4px;">
+        <span style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">ISRCs</span>
+        <span class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);">{{ results.isrc_count }}</span>
+    </div>
+    {% if results.get('weighted_avg_age') %}
+    <div style="display:flex; align-items:baseline; gap:4px;">
+        <span style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">WAA</span>
+        <span class="mono" style="font-size:14px; font-weight:700; color:var(--text-primary);">{{ results.weighted_avg_age.waa_display }}</span>
+    </div>
+    {% endif %}
+    <div style="display:flex; align-items:baseline; gap:4px;">
+        <span style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">Period</span>
+        <span class="mono" style="font-size:12px; color:var(--text-secondary);">{{ results.period_range }}</span>
+    </div>
+    {% if results.ltm_yoy_pct is defined %}
+    <div style="margin-left:auto;">
+        <span class="stat-change {{ results.ltm_yoy_direction }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(results.ltm_yoy_pct) }}% YoY</span>
+    </div>
+    {% endif %}
+</div>
+
+{# ---- B3: Section Navigation Tabs ---- #}
+<div style="margin-bottom:16px; display:flex; gap:4px; flex-wrap:wrap; border-bottom:1px solid var(--border); padding-bottom:8px;" id="dashNav">
+    <button class="pill-tab active" onclick="scrollToSection('sec-overview', this)">Overview</button>
+    <button class="pill-tab" onclick="scrollToSection('sec-charts', this)">Charts</button>
+    <button class="pill-tab" onclick="scrollToSection('sec-songs', this)">Songs</button>
+    <button class="pill-tab" onclick="scrollToSection('sec-payors', this)">Payors</button>
+    {% if results.get('cohort_analysis') and results.cohort_analysis.get('cohorts') %}
+    <button class="pill-tab" onclick="scrollToSection('sec-cohorts', this)">Cohorts</button>
+    {% endif %}
+    <button class="pill-tab" onclick="scrollToSection('sec-coverage', this)">Coverage</button>
+    <button class="pill-tab" onclick="scrollToSection('sec-valuation', this)">Valuation</button>
 </div>
 
 {# ---- ROW 1: Hero stats ---- #}
@@ -3747,8 +4833,62 @@ function addEditPayor() {
     </div>
 </div>
 
+{# ---- B8: Contract Term Summary Card ---- #}
+{% set all_contracts = [] %}
+{% for ps in results.get('payor_summaries', []) %}
+  {% if ps.get('contract_summary') %}
+    {% if all_contracts.append(ps) %}{% endif %}
+  {% endif %}
+{% endfor %}
+{% if all_contracts %}
+<div class="grid" style="margin-bottom:16px;">
+    <div class="card span-full">
+        <div class="card-header"><span class="card-title">Contract Term Summary</span></div>
+        <div style="overflow-x:auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Payor</th>
+                        <th>Term</th>
+                        <th>Matching Right</th>
+                        <th>Fee %</th>
+                        <th>Split %</th>
+                        <th>Assignment</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for ps in all_contracts %}
+                {% set cs = ps.contract_summary %}
+                <tr>
+                    <td style="font-weight:500; color:var(--text-primary);">{{ ps.name }}</td>
+                    <td class="mono" style="font-size:12px;">{{ cs.get('license_term', '--') }}</td>
+                    <td>
+                        {% if cs.get('matching_right') is not none %}
+                        <span style="color:{% if cs.matching_right %}var(--red){% else %}var(--green){% endif %}; font-size:12px;">{{ 'Yes' if cs.matching_right else 'No' }}</span>
+                        {% else %}
+                        <span style="color:var(--text-dim);">--</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono text-right" style="font-size:12px;">{% if cs.get('distro_fee') is not none %}{{ cs.distro_fee }}%{% else %}--{% endif %}</td>
+                    <td class="mono text-right" style="font-size:12px;">{% if cs.get('split_pct') is not none %}{{ cs.split_pct }}%{% else %}--{% endif %}</td>
+                    <td>
+                        {% if cs.get('assignment_language') is not none %}
+                        <span style="color:{% if cs.assignment_language %}var(--yellow){% else %}var(--green){% endif %}; font-size:12px;">{{ 'Yes' if cs.assignment_language else 'No' }}</span>
+                        {% else %}
+                        <span style="color:var(--text-dim);">--</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 {# ---- ROW 2: Charts ---- #}
-<div class="grid grid-2" style="margin-bottom:16px;">
+<div id="sec-charts" class="grid grid-2" style="margin-bottom:16px;">
     <div class="card">
         <div class="card-header"><span class="card-title">Monthly Revenue by Payor</span></div>
         <div class="chart-wrap tall">
@@ -3764,7 +4904,7 @@ function addEditPayor() {
 </div>
 
 {# ---- ROW 3: LTM Top Songs + Per Payor Breakdown ---- #}
-<div class="grid grid-wide" style="margin-bottom:16px;">
+<div id="sec-songs" class="grid grid-wide" style="margin-bottom:16px;">
     <div class="card">
         <div class="card-header"><span class="card-title">LTM Top 20 Songs</span></div>
         <table>
@@ -3785,7 +4925,7 @@ function addEditPayor() {
         </table>
     </div>
 
-    <div class="card">
+    <div id="sec-payors" class="card">
         <div class="card-header"><span class="card-title">Per-Payor Summary</span></div>
         {% for ps in results.payor_summaries %}
         <div style="padding:12px 0; border-bottom:1px solid var(--border);">
@@ -3990,6 +5130,170 @@ function addEditPayor() {
 </div>
 {% endif %}
 
+{# ---- B4: Cohort/Vintage Analysis Card ---- #}
+{% if results.get('cohort_analysis') and results.cohort_analysis.get('cohorts') %}
+<div id="sec-cohorts" class="grid" style="margin-bottom:16px;">
+    <div class="card span-full">
+        <div class="card-header">
+            <span class="card-title">Cohort / Vintage Analysis</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+                <button class="pill-tab active" id="cohortAbsBtn" onclick="setCohortMode('abs')">Absolute</button>
+                <button class="pill-tab" id="cohortPctBtn" onclick="setCohortMode('pct')">% Decay</button>
+            </div>
+        </div>
+        <div class="chart-wrap" style="height:320px;">
+            <canvas id="cohortChart"></canvas>
+        </div>
+        <div style="margin-top:8px; font-size:11px; color:var(--text-dim);">
+            Shows how each release-year vintage earns across calendar years. Toggle to see decay from peak.
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{# ---- B5: Revenue Concentration + B6: Age Distribution + B7: LTM Comparison ---- #}
+{% set has_concentration = results.get('revenue_concentration') and results.revenue_concentration.get('total_isrcs', 0) > 0 %}
+{% set has_age_dist = results.get('catalog_age_distribution') and results.catalog_age_distribution.get('buckets') %}
+{% set has_ltm_cmp = results.get('ltm_comparison') and results.ltm_comparison.get('prior_ltm') and results.ltm_comparison.prior_ltm.gross > 0 %}
+
+<div id="sec-valuation" class="grid grid-3" style="margin-bottom:16px;">
+
+    {# -- B5: Revenue Concentration -- #}
+    {% if has_concentration %}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Revenue Concentration</span></div>
+        {% set rc = results.revenue_concentration %}
+        <div style="padding:8px 0;">
+            {% for label, val in [('Top 1%', rc.top_1_pct), ('Top 5%', rc.top_5_pct), ('Top 10%', rc.top_10_pct), ('Top 20%', rc.top_20_pct), ('Top 50%', rc.top_50_pct)] %}
+            <div style="margin-bottom:8px;">
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:3px;">
+                    <span style="color:var(--text-secondary);">{{ label }} tracks</span>
+                    <span class="mono" style="color:var(--text-primary); font-weight:600;">{{ val }}%</span>
+                </div>
+                <div style="height:6px; background:var(--bg-inset); border-radius:3px; overflow:hidden;">
+                    <div style="height:100%; width:{{ val }}%; background:var(--accent); border-radius:3px; transition:width 0.3s;"></div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:11px; color:var(--text-dim);">Herfindahl Index</span>
+                <span class="mono" style="font-size:14px; font-weight:600; color:var(--text-primary);">{{ rc.herfindahl_index }}</span>
+            </div>
+            <div style="font-size:10px; color:var(--text-dim); margin-top:2px;">
+                {% if rc.herfindahl_index < 1500 %}Low concentration (diversified){% elif rc.herfindahl_index < 2500 %}Moderate concentration{% else %}High concentration{% endif %}
+                &middot; {{ rc.total_isrcs }} ISRCs
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    {# -- B6: Catalog Age Distribution -- #}
+    {% if has_age_dist %}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Catalog Age Distribution</span></div>
+        <div class="chart-wrap" style="height:220px;">
+            <canvas id="ageDistChart"></canvas>
+        </div>
+    </div>
+    {% endif %}
+
+    {# -- B7: LTM vs Prior-Year-LTM -- #}
+    {% if has_ltm_cmp %}
+    {% set cmp = results.ltm_comparison %}
+    <div class="card">
+        <div class="card-header"><span class="card-title">LTM vs Prior-Year-LTM</span></div>
+        <table>
+            <thead><tr><th>Metric</th><th class="text-right">LTM</th><th class="text-right">Prior LTM</th><th class="text-right">Change</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td style="font-size:12px; color:var(--text-secondary);">Gross</td>
+                    <td class="text-right mono" style="font-size:12px;"><span class="data-money" data-raw="{{ cmp.ltm.gross }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(cmp.ltm.gross) }}</span></td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--text-muted);"><span class="data-money" data-raw="{{ cmp.prior_ltm.gross }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(cmp.prior_ltm.gross) }}</span></td>
+                    <td class="text-right"><span class="stat-change {{ 'up' if cmp.changes.gross_pct >= 0 else 'down' }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(cmp.changes.gross_pct) }}%</span></td>
+                </tr>
+                <tr>
+                    <td style="font-size:12px; color:var(--text-secondary);">Net</td>
+                    <td class="text-right mono" style="font-size:12px;"><span class="data-money" data-raw="{{ cmp.ltm.net }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(cmp.ltm.net) }}</span></td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--text-muted);"><span class="data-money" data-raw="{{ cmp.prior_ltm.net }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(cmp.prior_ltm.net) }}</span></td>
+                    <td class="text-right"><span class="stat-change {{ 'up' if cmp.changes.net_pct >= 0 else 'down' }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(cmp.changes.net_pct) }}%</span></td>
+                </tr>
+                <tr>
+                    <td style="font-size:12px; color:var(--text-secondary);"># ISRCs</td>
+                    <td class="text-right mono" style="font-size:12px;">{{ '{:,}'.format(cmp.ltm.isrc_count) }}</td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--text-muted);">{{ '{:,}'.format(cmp.prior_ltm.isrc_count) }}</td>
+                    <td class="text-right"><span class="stat-change {{ 'up' if cmp.changes.isrc_pct >= 0 else 'down' }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(cmp.changes.isrc_pct) }}%</span></td>
+                </tr>
+                <tr>
+                    <td style="font-size:12px; color:var(--text-secondary);">Avg/ISRC</td>
+                    <td class="text-right mono" style="font-size:12px;"><span class="data-money" data-raw="{{ cmp.ltm.avg_per_isrc }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(cmp.ltm.avg_per_isrc) }}</span></td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--text-muted);"><span class="data-money" data-raw="{{ cmp.prior_ltm.avg_per_isrc }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ '{:,.2f}'.format(cmp.prior_ltm.avg_per_isrc) }}</span></td>
+                    <td class="text-right"><span class="stat-change {{ 'up' if cmp.changes.avg_per_isrc_pct >= 0 else 'down' }}" style="margin:0; font-size:11px;">{{ '%+.1f' | format(cmp.changes.avg_per_isrc_pct) }}%</span></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    {# -- Offer Multiple Calculator -- #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Offer Multiple</span></div>
+        <div style="padding:8px 0;">
+            <label style="font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">Offer Price</label>
+            <div style="position:relative; margin-top:4px; margin-bottom:12px;">
+                <span style="position:absolute; left:10px; top:50%; transform:translateY(-50%); font-size:13px; color:var(--text-muted);">{{ results.currency_symbol | default('$') }}</span>
+                <input type="text" id="offerPriceInput" class="form-input" placeholder="e.g. 500,000"
+                    style="padding-left:24px; font-family:'SF Mono',monospace; font-size:14px; width:100%;"
+                    oninput="calcOfferMultiple()">
+            </div>
+            <div id="offerResults" style="display:none;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; padding:8px 0; border-top:1px solid var(--border);">
+                    <span style="font-size:12px; color:var(--text-secondary);">Net Multiple</span>
+                    <span id="offerNetMultiple" class="mono" style="font-size:20px; font-weight:700; color:var(--accent);"></span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:baseline; padding:8px 0; border-top:1px solid var(--border);">
+                    <span style="font-size:12px; color:var(--text-secondary);">Gross Multiple</span>
+                    <span id="offerGrossMultiple" class="mono" style="font-size:16px; font-weight:600; color:var(--text-primary);"></span>
+                </div>
+                <div style="padding:8px 0; border-top:1px solid var(--border);">
+                    <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-dim);">
+                        <span>LTM Net</span>
+                        <span class="mono">{{ results.currency_symbol | default('$') }}{{ results.ltm_net_total_fmt }}</span>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-dim); margin-top:2px;">
+                        <span>LTM Gross</span>
+                        <span class="mono">{{ results.currency_symbol | default('$') }}{{ results.ltm_gross_total_fmt }}</span>
+                    </div>
+                </div>
+            </div>
+            <div id="offerHint" style="font-size:11px; color:var(--text-dim); margin-top:4px;">Enter an offer price to see the implied multiple</div>
+        </div>
+    </div>
+</div>
+
+<script>
+var _ltmNet = {{ results.ltm_net_total | default(0) }};
+var _ltmGross = {{ results.ltm_gross_total | default(0) }};
+function calcOfferMultiple() {
+    var raw = document.getElementById('offerPriceInput').value.replace(/[^0-9.]/g, '');
+    var price = parseFloat(raw);
+    var results = document.getElementById('offerResults');
+    var hint = document.getElementById('offerHint');
+    if (!price || price <= 0) {
+        results.style.display = 'none';
+        hint.style.display = 'block';
+        return;
+    }
+    results.style.display = 'block';
+    hint.style.display = 'none';
+    var netMult = _ltmNet > 0 ? (price / _ltmNet) : 0;
+    var grossMult = _ltmGross > 0 ? (price / _ltmGross) : 0;
+    document.getElementById('offerNetMultiple').textContent = netMult.toFixed(1) + 'x';
+    document.getElementById('offerGrossMultiple').textContent = grossMult.toFixed(1) + 'x';
+}
+</script>
+
 {# ---- Audit Trail Card ---- #}
 {% if results.get('audit_summary') %}
 <div class="grid" style="margin-bottom:16px;">
@@ -4051,7 +5355,7 @@ function addEditPayor() {
 
 {# ---- ROW 6: Statement Coverage Grid ---- #}
 {% if results.get('coverage_rows') and results.get('coverage_months') %}
-<div class="grid" style="margin-bottom:16px;">
+<div id="sec-coverage" class="grid" style="margin-bottom:16px;">
     <div class="card span-full">
         <div class="card-header">
             <span class="card-title">Statement Coverage</span>
@@ -4614,6 +5918,184 @@ window.CHARTS = {};
     renderWaterfall(waterfallData.overall);
 })();
 {% endif %}
+
+/* ---- B3: Section navigation smooth scroll ---- */
+window.scrollToSection = function(id, btn) {
+    const el = document.getElementById(id);
+    if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    /* Update active tab */
+    document.querySelectorAll('#dashNav .pill-tab').forEach(t => t.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+};
+
+/* ---- Theme toggle ---- */
+window.toggleTheme = function() {
+    const html = document.documentElement;
+    const current = html.getAttribute('data-theme');
+    const next = current === 'light' ? 'dark' : 'light';
+    if (next === 'dark') {
+        html.removeAttribute('data-theme');
+    } else {
+        html.setAttribute('data-theme', 'light');
+    }
+    localStorage.setItem('rc-theme', next);
+    _updateThemeIcon();
+    _updateChartColors();
+};
+function _updateThemeIcon() {
+    const icon = document.getElementById('themeIcon');
+    if (!icon) return;
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    icon.innerHTML = isLight ? '&#9728;' : '&#9790;';
+    icon.parentElement.title = isLight ? 'Switch to dark mode' : 'Switch to light mode';
+}
+function _updateChartColors() {
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    const gridColor = isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.06)';
+    const tickColor = isLight ? '#4b5563' : '#a1a1aa';
+    Object.values(Chart.instances || {}).forEach(function(chart) {
+        if (!chart.options || !chart.options.scales) return;
+        Object.values(chart.options.scales).forEach(function(scale) {
+            if (scale.grid) scale.grid.color = gridColor;
+            if (scale.ticks) scale.ticks.color = tickColor;
+        });
+        chart.update('none');
+    });
+}
+/* Set icon on page load */
+document.addEventListener('DOMContentLoaded', _updateThemeIcon);
+
+/* ---- B4: Cohort/Vintage chart ---- */
+{% if results.get('cohort_analysis') and results.cohort_analysis.get('cohorts') %}
+(function() {
+    const COHORT_DATA = {{ results.cohort_analysis | tojson }};
+    const cohortColors = ['#3b82f6', '#a78bfa', '#22d3ee', '#fbbf24', '#f87171', '#34d399', '#fb923c', '#e879f9', '#94a3b8', '#6ee7b7'];
+    let cohortMode = 'abs';
+    let cohortChart = null;
+
+    function buildCohortChart(mode) {
+        const ctx = document.getElementById('cohortChart');
+        if (cohortChart) cohortChart.destroy();
+
+        const years = COHORT_DATA.years;
+        const datasets = COHORT_DATA.cohorts.map((c, i) => {
+            let data;
+            if (mode === 'pct') {
+                const peak = Math.max(...Object.values(c.revenue_by_year), 0.01);
+                data = years.map(y => {
+                    const v = c.revenue_by_year[y] || 0;
+                    return Math.round(v / peak * 100 * 10) / 10;
+                });
+            } else {
+                data = years.map(y => c.revenue_by_year[y] || 0);
+            }
+            return {
+                label: c.release_year + ' (' + c.track_count + ')',
+                data: data,
+                backgroundColor: cohortColors[i % cohortColors.length],
+                borderRadius: 2,
+                barPercentage: 0.7,
+            };
+        });
+
+        cohortChart = new Chart(ctx, {
+            type: 'bar',
+            data: { labels: years.map(String), datasets },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: {
+                    legend: { position: 'top', labels: { boxWidth: 10, padding: 8, font: { size: 10 } } },
+                    tooltip: {
+                        callbacks: {
+                            label: ctx => {
+                                const v = ctx.parsed.y;
+                                return ctx.dataset.label + ': ' + (mode === 'pct' ? v + '%' : CSYM + v.toLocaleString(undefined, {minimumFractionDigits:2}));
+                            }
+                        }
+                    },
+                },
+                scales: {
+                    x: { grid: { display: false } },
+                    y: { ticks: { callback: v => mode === 'pct' ? v + '%' : CSYM + (v/1000).toFixed(0) + 'k' } }
+                }
+            }
+        });
+        window.CHARTS.cohort = cohortChart;
+    }
+
+    window.setCohortMode = function(mode) {
+        cohortMode = mode;
+        document.getElementById('cohortAbsBtn').classList.toggle('active', mode === 'abs');
+        document.getElementById('cohortPctBtn').classList.toggle('active', mode === 'pct');
+        buildCohortChart(mode);
+    };
+
+    buildCohortChart('abs');
+})();
+{% endif %}
+
+/* ---- B6: Catalog Age Distribution chart ---- */
+{% if results.get('catalog_age_distribution') and results.catalog_age_distribution.get('buckets') %}
+(function() {
+    const AGE_DATA = {{ results.catalog_age_distribution | tojson }};
+    const buckets = AGE_DATA.buckets;
+    if (!buckets.length) return;
+
+    const labels = buckets.map(b => String(b.year));
+    const trackCounts = buckets.map(b => b.track_count);
+    const ltmGross = buckets.map(b => b.ltm_gross);
+
+    window.CHARTS.ageDist = new Chart(document.getElementById('ageDistChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'LTM Revenue',
+                    data: ltmGross,
+                    backgroundColor: 'rgba(59,130,246,0.6)',
+                    borderRadius: 3,
+                    barPercentage: 0.6,
+                    yAxisID: 'y',
+                },
+                {
+                    label: 'Track Count',
+                    data: trackCounts,
+                    type: 'line',
+                    borderColor: '#fbbf24',
+                    backgroundColor: 'rgba(251,191,36,0.2)',
+                    pointRadius: 3,
+                    pointBackgroundColor: '#fbbf24',
+                    fill: false,
+                    tension: 0.3,
+                    yAxisID: 'y1',
+                }
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+                legend: { position: 'top', labels: { boxWidth: 10, padding: 8, font: { size: 10 } } },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => {
+                            if (ctx.datasetIndex === 0) return 'LTM: ' + CSYM + ctx.parsed.y.toLocaleString(undefined, {minimumFractionDigits:2});
+                            return 'Tracks: ' + ctx.parsed.y;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 10 } } },
+                y: { position: 'left', ticks: { callback: v => CSYM + (v/1000).toFixed(0) + 'k', font: { size: 10 } } },
+                y1: { position: 'right', grid: { display: false }, ticks: { font: { size: 10 } } }
+            }
+        }
+    });
+})();
+{% endif %}
 </script>
 
 {% else %}
@@ -4718,6 +6200,28 @@ function showDashTab(name) {
 })();
 </script>
 
+<script>
+/* Global theme toggle (works on all pages) */
+if (typeof window.toggleTheme === 'undefined') {
+    window.toggleTheme = function() {
+        var html = document.documentElement;
+        var current = html.getAttribute('data-theme');
+        var next = current === 'light' ? 'dark' : 'light';
+        if (next === 'dark') { html.removeAttribute('data-theme'); }
+        else { html.setAttribute('data-theme', 'light'); }
+        localStorage.setItem('rc-theme', next);
+        _gUpdateIcon();
+    };
+    function _gUpdateIcon() {
+        var icon = document.getElementById('themeIcon');
+        if (!icon) return;
+        var isLight = document.documentElement.getAttribute('data-theme') === 'light';
+        icon.innerHTML = isLight ? '&#9728;' : '&#9790;';
+        icon.parentElement.title = isLight ? 'Switch to dark mode' : 'Switch to light mode';
+    }
+    document.addEventListener('DOMContentLoaded', _gUpdateIcon);
+}
+</script>
 </body>
 </html>
 """
@@ -4827,6 +6331,15 @@ def index():
                 if 'currency_symbol' not in item:
                     item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
 
+    # Check for recent delta report
+    delta_summary = None
+    if deal_name_copy:
+        slug = _make_slug(deal_name_copy)
+        deal_dir = os.path.join(DEALS_DIR, slug)
+        dr = delta_engine.load_delta_from_disk(deal_dir, slug)
+        if dr:
+            delta_summary = dr.to_dict()
+
     return render_template_string(
         DASHBOARD_HTML,
         page='dashboard',
@@ -4836,6 +6349,7 @@ def index():
         default_payors=[],
         deal_name=deal_name_copy,
         processing=processing_copy,
+        delta_summary=delta_summary,
     )
 
 
@@ -6935,6 +8449,568 @@ def edit_deal_post(slug):
         log.error("edit_deal POST failed for %s: %s", slug, e, exc_info=True)
         flash(f'Error editing deal: {str(e)}', 'error')
         return redirect(url_for('deals_page'))
+
+
+# ---------------------------------------------------------------------------
+# C1: Quick Re-run
+# ---------------------------------------------------------------------------
+
+@app.route('/deals/<slug>/rerun-quick', methods=['POST'])
+def rerun_quick_route(slug):
+    """One-click re-run: load deal config, re-run consolidation with same PayorConfigs."""
+    global _cached_deal_name, _processing_status
+    try:
+        deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
+        payor_configs = [pr.config for pr in payor_results.values()]
+
+        with _state_lock:
+            if _processing_status.get('running'):
+                flash('A consolidation is already running.', 'error')
+                return redirect(url_for('deals_page'))
+            _cached_deal_name = deal_name
+            _processing_status = {'running': True, 'progress': 'Starting quick re-run...', 'done': False, 'error': None}
+
+        # Snapshot analytics before re-run for delta report
+        deal_dir = os.path.join(DEALS_DIR, slug)
+        delta_engine.snapshot_analytics(deal_dir)
+
+        t = threading.Thread(
+            target=_run_in_background_with_delta,
+            args=(payor_configs, slug, deal_name),
+            daemon=True,
+        )
+        t.start()
+        flash(f'Quick re-running "{deal_name}"...', 'success')
+        return redirect(url_for('index'))
+    except Exception as e:
+        log.error("rerun_quick failed for %s: %s", slug, e, exc_info=True)
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('deals_page'))
+
+
+def _run_in_background_with_delta(payor_configs, slug, deal_name):
+    """Background worker that runs consolidation then computes delta."""
+    global _processing_status
+    log.info("Quick re-run started: slug=%s, deal=%s", slug, deal_name)
+    _log_memory()
+    with _state_lock:
+        _processing_status = {'running': True, 'progress': 'Re-running consolidation...', 'done': False, 'error': None}
+    try:
+        payor_results, analytics, consolidated_path = run_consolidation(
+            payor_configs, deal_name=deal_name)
+
+        if not payor_results:
+            with _state_lock:
+                _processing_status.update({'running': False, 'done': True, 'error': 'No data found.'})
+            return
+
+        # Compute delta report if previous analytics exist
+        deal_dir = os.path.join(DEALS_DIR, slug)
+        prev_path = os.path.join(deal_dir, 'analytics_prev.json')
+        if os.path.isfile(prev_path):
+            try:
+                with open(prev_path, 'r') as f:
+                    old_analytics = json.load(f)
+                report = delta_engine.compute_delta(old_analytics, analytics, slug)
+                delta_engine.save_delta_to_disk(deal_dir, report)
+                # Save to DB if available
+                if db.is_available():
+                    deal_id = db.get_deal_id_by_slug(slug)
+                    if deal_id:
+                        db.save_delta_report(deal_id, report.to_dict())
+                log.info("Delta report generated: %s", report.summary)
+            except Exception as e:
+                log.warning("Delta report failed: %s", e)
+
+        with _state_lock:
+            _processing_status.update({
+                'running': False,
+                'progress': f'Done: {analytics["total_files"]} files, {analytics["isrc_count"]} ISRCs.',
+                'done': True, 'error': None,
+            })
+    except Exception as e:
+        log.error("Quick re-run FAILED: %s", e, exc_info=True)
+        with _state_lock:
+            _processing_status.update({'running': False, 'done': True, 'error': str(e)})
+
+
+# ---------------------------------------------------------------------------
+# C2: Deal Templates
+# ---------------------------------------------------------------------------
+
+@app.route('/deals/<slug>/save-template', methods=['POST'])
+def save_template_route(slug):
+    """Save a deal's payor config as a named template."""
+    try:
+        deal_name, payor_results, _, _, _, _ = load_deal(slug)
+        template_name = request.form.get('template_name', '').strip()
+        if not template_name:
+            template_name = f"Template from {deal_name}"
+
+        payor_configs = []
+        for code, pr in payor_results.items():
+            c = pr.config
+            payor_configs.append({
+                'code': c.code,
+                'name': c.name,
+                'fmt': c.fmt,
+                'fee': c.fee,
+                'source_currency': getattr(c, 'source_currency', 'USD'),
+                'statement_type': c.statement_type,
+                'deal_type': getattr(c, 'deal_type', 'artist'),
+                'artist_split': c.artist_split,
+                'territory': c.territory,
+                'calc_payable': getattr(c, 'calc_payable', False),
+                'payable_pct': getattr(c, 'payable_pct', 0),
+                'calc_third_party': getattr(c, 'calc_third_party', False),
+                'third_party_pct': getattr(c, 'third_party_pct', 0),
+            })
+
+        settings = {'source_deal': deal_name, 'source_slug': slug}
+
+        # Save to DB
+        if db.is_available():
+            db.save_template(template_name, payor_configs, settings)
+
+        # Also save to local JSON
+        templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates_data')
+        os.makedirs(templates_dir, exist_ok=True)
+        tpl_path = os.path.join(templates_dir, f"{_make_slug(template_name)}.json")
+        with open(tpl_path, 'w') as f:
+            json.dump({'name': template_name, 'payor_configs': payor_configs, 'settings': settings}, f, indent=2)
+
+        flash(f'Template "{template_name}" saved.', 'success')
+    except Exception as e:
+        log.error("save_template failed: %s", e, exc_info=True)
+        flash(f'Error saving template: {str(e)}', 'error')
+    return redirect(url_for('deals_page'))
+
+
+@app.route('/templates')
+def templates_page():
+    """List all saved deal templates."""
+    templates = []
+    # Load from DB
+    if db.is_available():
+        try:
+            templates = db.list_templates()
+        except Exception:
+            pass
+    # Fallback: load from local JSON
+    if not templates:
+        templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates_data')
+        if os.path.isdir(templates_dir):
+            for fname in sorted(os.listdir(templates_dir)):
+                if fname.endswith('.json'):
+                    try:
+                        with open(os.path.join(templates_dir, fname), 'r') as f:
+                            tpl = json.load(f)
+                        templates.append(tpl)
+                    except Exception:
+                        pass
+    with _state_lock:
+        deal_name_copy = _cached_deal_name
+    return render_template_string(
+        DASHBOARD_HTML,
+        page='templates',
+        results=None,
+        payor_names=[],
+        payor_codes=[],
+        default_payors=[],
+        deal_name=deal_name_copy,
+        templates=templates,
+    )
+
+
+@app.route('/templates/<name>/apply', methods=['POST'])
+def apply_template_route(name):
+    """Apply a template to pre-populate the upload form."""
+    template = None
+    if db.is_available():
+        try:
+            template = db.get_template(name)
+        except Exception:
+            pass
+    if not template:
+        tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'templates_data', f"{_make_slug(name)}.json")
+        if os.path.isfile(tpl_path):
+            with open(tpl_path, 'r') as f:
+                template = json.load(f)
+    if not template:
+        flash(f'Template "{name}" not found.', 'error')
+        return redirect(url_for('templates_page'))
+
+    # Store template config in session-like flash data
+    flash(json.dumps(template.get('payor_configs', [])), 'template_config')
+    flash(f'Template "{name}" applied. Configure upload directories below.', 'success')
+    return redirect(url_for('upload_page'))
+
+
+@app.route('/templates/<name>/delete', methods=['POST'])
+def delete_template_route(name):
+    """Delete a deal template."""
+    deleted = False
+    if db.is_available():
+        try:
+            deleted = db.delete_template(name)
+        except Exception:
+            pass
+    tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'templates_data', f"{_make_slug(name)}.json")
+    if os.path.isfile(tpl_path):
+        os.remove(tpl_path)
+        deleted = True
+    if deleted:
+        flash(f'Template "{name}" deleted.', 'success')
+    else:
+        flash(f'Template "{name}" not found.', 'error')
+    return redirect(url_for('templates_page'))
+
+
+# ---------------------------------------------------------------------------
+# C3: Delta Reports
+# ---------------------------------------------------------------------------
+
+@app.route('/deals/<slug>/delta')
+def delta_report_page(slug):
+    """Show the delta report for a deal after re-run."""
+    deal_dir = os.path.join(DEALS_DIR, slug)
+    report = delta_engine.load_delta_from_disk(deal_dir, slug)
+    if not report:
+        flash('No delta report found. Run a re-run first.', 'error')
+        return redirect(url_for('deals_page'))
+    with _state_lock:
+        deal_name_copy = _cached_deal_name
+    return render_template_string(
+        DASHBOARD_HTML,
+        page='delta',
+        results=None,
+        payor_names=[],
+        payor_codes=[],
+        default_payors=[],
+        deal_name=deal_name_copy,
+        delta_report=report.to_dict(),
+        delta_slug=slug,
+    )
+
+
+# ---------------------------------------------------------------------------
+# D2: Forecast Routes
+# ---------------------------------------------------------------------------
+
+@app.route('/api/parse-sofr-excel', methods=['POST'])
+def api_parse_sofr_excel():
+    """Parse SOFR forward curve from uploaded Excel file."""
+    f = request.files.get('sofr_file')
+    if not f or not f.filename:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    import tempfile
+    tmp = None
+    try:
+        suffix = os.path.splitext(f.filename)[1] or '.xlsx'
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        f.save(tmp.name)
+        tmp.close()
+        curve = forecast_engine.parse_sofr_from_excel(tmp.name)
+        return jsonify({'curve': curve, 'count': len(curve)})
+    except Exception as e:
+        log.error("parse_sofr_from_excel failed: %s", e, exc_info=True)
+        return jsonify({'error': str(e)}), 400
+    finally:
+        if tmp and os.path.isfile(tmp.name):
+            os.unlink(tmp.name)
+
+
+FORECAST_BETA_PASSWORD = os.getenv('FORECAST_BETA_PASSWORD', 'virtu2025')
+
+_FORECAST_GATE_HTML = '''<!DOCTYPE html>
+<html><head><title>Forecast — Beta Access</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+.gate-card { background: #1e293b; border-radius: 12px; padding: 40px; max-width: 380px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.3); }
+.gate-card h2 { margin: 0 0 8px; font-size: 20px; }
+.gate-card p { color: #94a3b8; font-size: 13px; margin: 0 0 24px; }
+.gate-card input[type=password] { width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 14px; box-sizing: border-box; margin-bottom: 12px; }
+.gate-card button { width: 100%; padding: 10px; border-radius: 6px; border: none; background: #22d3ee; color: #0f172a; font-weight: 600; font-size: 14px; cursor: pointer; }
+.gate-card button:hover { background: #06b6d4; }
+.gate-error { color: #f87171; font-size: 12px; margin-bottom: 12px; }
+.gate-card a { color: #94a3b8; font-size: 12px; text-decoration: none; display: block; text-align: center; margin-top: 16px; }
+</style></head><body>
+<div class="gate-card">
+    <h2>Forecast Beta</h2>
+    <p>This feature is in beta testing. Enter the access password to continue.</p>
+    {% if error %}<div class="gate-error">{{ error }}</div>{% endif %}
+    <form method="POST">
+        <input type="password" name="beta_password" placeholder="Password" autofocus>
+        <button type="submit">Unlock</button>
+    </form>
+    <a href="/deals">Back to Deals</a>
+</div></body></html>'''
+
+
+def _check_forecast_gate(slug):
+    """Check if forecast beta gate is unlocked. Returns None if OK, or a Response to return."""
+    if session.get('forecast_unlocked'):
+        return None
+    if request.method == 'POST' and 'beta_password' in request.form:
+        if request.form['beta_password'] == FORECAST_BETA_PASSWORD:
+            session['forecast_unlocked'] = True
+            return redirect(url_for('forecast_page', slug=slug))
+        return render_template_string(_FORECAST_GATE_HTML, error='Incorrect password.')
+    return render_template_string(_FORECAST_GATE_HTML, error=None)
+
+
+@app.route('/deals/<slug>/forecast', methods=['GET', 'POST'])
+def forecast_page(slug):
+    """Show forecast configuration form (GET) or handle beta gate password (POST without forecast fields)."""
+    # Beta gate check
+    if not session.get('forecast_unlocked'):
+        if request.method == 'POST' and 'beta_password' in request.form:
+            if request.form['beta_password'] == FORECAST_BETA_PASSWORD:
+                session['forecast_unlocked'] = True
+                return redirect(url_for('forecast_page', slug=slug))
+            return render_template_string(_FORECAST_GATE_HTML, error='Incorrect password.')
+        if request.method == 'GET' or (request.method == 'POST' and 'beta_password' not in request.form):
+            return render_template_string(_FORECAST_GATE_HTML, error=None)
+
+    # POST with forecast form data → delegate to forecast_run
+    if request.method == 'POST' and 'genre_default' in request.form:
+        return forecast_run(slug)
+
+    try:
+        deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
+        with _state_lock:
+            deal_name_copy = _cached_deal_name
+        return render_template_string(
+            DASHBOARD_HTML,
+            page='forecast',
+            results=analytics,
+            payor_names=[pr.config.name for pr in payor_results.values()],
+            payor_codes=list(payor_results.keys()),
+            default_payors=[],
+            deal_name=deal_name_copy,
+            forecast_slug=slug,
+            forecast_deal_name=deal_name,
+            forecast_result=None,
+            genre_choices=forecast_engine.GENRE_CHOICES,
+        )
+    except Exception as e:
+        log.error("forecast_page failed for %s: %s", slug, e, exc_info=True)
+        flash(f'Error loading deal for forecast: {str(e)}', 'error')
+        return redirect(url_for('deals_page'))
+
+
+def forecast_run(slug):
+    """Run forecast projection (called from forecast_page POST handler)."""
+    try:
+        deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
+
+        # Parse config from form
+        purchase_price = float(request.form.get('purchase_price', 0) or 0)
+        exit_multiple = float(request.form.get('exit_multiple', 15) or 15)
+        ltv = float(request.form.get('ltv', 55) or 55) / 100
+        sofr_rate = float(request.form.get('sofr_rate', 4.5) or 4.5) / 100
+        sofr_floor = float(request.form.get('sofr_floor', 2.0) or 2.0) / 100
+        sofr_spread = float(request.form.get('sofr_spread', 275) or 275) / 10000
+        cash_flow_sweep = float(request.form.get('cash_flow_sweep', 100) or 100) / 100
+        synergy_ramp_months = int(request.form.get('synergy_ramp_months', 12) or 12)
+
+        # New fields: Virtu WACC
+        virtu_wacc_raw = request.form.get('virtu_wacc', '').strip()
+        virtu_wacc = float(virtu_wacc_raw) / 100 if virtu_wacc_raw else None
+
+        # New fields: Purchase structure
+        holdback = float(request.form.get('holdback', 0) or 0)
+        pcdpcdr = float(request.form.get('pcdpcdr', 0) or 0)
+        cash_date = request.form.get('cash_date', '').strip() or None
+        close_date = request.form.get('close_date', '').strip() or None
+
+        # New fields: Deal metadata
+        opportunity_name = request.form.get('opportunity_name', deal_name).strip()
+        rights_included = request.form.get('rights_included', 'Masters').strip()
+        deal_type = request.form.get('deal_type', 'Catalog').strip()
+
+        # New fields: SOFR curve (JSON textarea)
+        sofr_curve = []
+        sofr_curve_raw = request.form.get('sofr_curve_json', '').strip()
+        if sofr_curve_raw:
+            try:
+                sofr_curve = json.loads(sofr_curve_raw)
+                if not isinstance(sofr_curve, list):
+                    sofr_curve = []
+            except (json.JSONDecodeError, TypeError):
+                sofr_curve = []
+
+        # New fields: FX rates (JSON)
+        fx_rates = {}
+        fx_rates_raw = request.form.get('fx_rates_json', '').strip()
+        if fx_rates_raw:
+            try:
+                fx_rates = json.loads(fx_rates_raw)
+                if not isinstance(fx_rates, dict):
+                    fx_rates = {}
+            except (json.JSONDecodeError, TypeError):
+                fx_rates = {}
+
+        # New fields: Per-payor configs (JSON)
+        payor_configs = {}
+        payor_configs_raw = request.form.get('payor_configs_json', '').strip()
+        if payor_configs_raw:
+            try:
+                payor_configs = json.loads(payor_configs_raw)
+                if not isinstance(payor_configs, dict):
+                    payor_configs = {}
+            except (json.JSONDecodeError, TypeError):
+                payor_configs = {}
+
+        config = forecast_engine.ForecastConfig(
+            genre_default=request.form.get('genre_default', 'default'),
+            horizon_years=int(request.form.get('horizon_years', 5)),
+            discount_rate=float(request.form.get('discount_rate', 9.375) or 9.375) / 100,
+            terminal_growth=float(request.form.get('terminal_growth', 1)) / 100 if request.form.get('terminal_growth') else None,
+            purchase_price=purchase_price,
+            exit_multiple=exit_multiple,
+            ltv=ltv,
+            sofr_rate=sofr_rate,
+            sofr_floor=sofr_floor,
+            sofr_spread=sofr_spread,
+            cash_flow_sweep=cash_flow_sweep,
+            synergy_ramp_months=synergy_ramp_months,
+            virtu_wacc=virtu_wacc,
+            holdback=holdback,
+            pcdpcdr=pcdpcdr,
+            cash_date=cash_date,
+            close_date=close_date,
+            opportunity_name=opportunity_name,
+            rights_included=rights_included,
+            deal_type=deal_type,
+            sofr_curve=sofr_curve,
+            fx_rates=fx_rates,
+            payor_configs=payor_configs,
+        )
+
+        # Parse new fee rate synergy
+        new_fee_raw = request.form.get('new_fee_rate', '').strip()
+        if new_fee_raw:
+            config.new_fee_rate = float(new_fee_raw) / 100
+            config.synergy_start_year = int(request.form.get('synergy_start_year', 1))
+
+        # Parse third party synergy rate
+        tp_syn_raw = request.form.get('third_party_synergy_rate', '').strip()
+        if tp_syn_raw:
+            config.third_party_synergy_rate = float(tp_syn_raw) / 100
+
+        # Run forecast
+        result = forecast_engine.run_forecast(payor_results, analytics, config)
+
+        # Save to DB
+        if db.is_available():
+            deal_id = db.get_deal_id_by_slug(slug)
+            if deal_id:
+                db.save_forecast(deal_id, config.to_dict(), result.get('summary'))
+                db.update_deal_forecast_config(slug, config.to_dict())
+
+        # Save result to disk
+        deal_dir = os.path.join(DEALS_DIR, slug)
+        os.makedirs(deal_dir, exist_ok=True)
+        forecast_path = os.path.join(deal_dir, 'forecast_result.json')
+        with open(forecast_path, 'w') as f:
+            json.dump(result, f, indent=2, default=str)
+
+        with _state_lock:
+            deal_name_copy = _cached_deal_name
+
+        return render_template_string(
+            DASHBOARD_HTML,
+            page='forecast',
+            results=analytics,
+            payor_names=[pr.config.name for pr in payor_results.values()],
+            payor_codes=list(payor_results.keys()),
+            default_payors=[],
+            deal_name=deal_name_copy,
+            forecast_slug=slug,
+            forecast_deal_name=deal_name,
+            forecast_result=result,
+            genre_choices=forecast_engine.GENRE_CHOICES,
+        )
+    except Exception as e:
+        log.error("forecast_run failed for %s: %s", slug, e, exc_info=True)
+        flash(f'Forecast error: {str(e)}', 'error')
+        return redirect(url_for('forecast_page', slug=slug))
+
+
+@app.route('/deals/<slug>/forecast/download')
+def forecast_download(slug):
+    """Download forecast Excel file."""
+    if not session.get('forecast_unlocked'):
+        return redirect(url_for('forecast_page', slug=slug))
+    try:
+        deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
+        deal_dir = os.path.join(DEALS_DIR, slug)
+        forecast_path = os.path.join(deal_dir, 'forecast_result.json')
+
+        if not os.path.isfile(forecast_path):
+            flash('No forecast result found. Run a forecast first.', 'error')
+            return redirect(url_for('forecast_page', slug=slug))
+
+        with open(forecast_path, 'r') as f:
+            result = json.load(f)
+
+        exports_dir = os.path.join(deal_dir, 'exports')
+        os.makedirs(exports_dir, exist_ok=True)
+        xlsx_path = os.path.join(exports_dir, f'{slug}_Forecast_Model.xlsx')
+        forecast_engine.export_forecast_excel(result, xlsx_path, deal_name)
+
+        return send_file(xlsx_path, as_attachment=True,
+                         download_name=f'{deal_name}_Forecast_Model.xlsx')
+    except Exception as e:
+        log.error("forecast_download failed for %s: %s", slug, e, exc_info=True)
+        flash(f'Download error: {str(e)}', 'error')
+        return redirect(url_for('forecast_page', slug=slug))
+
+
+@app.route('/api/forecast-preview', methods=['POST'])
+def api_forecast_preview():
+    """AJAX single-ISRC forecast preview."""
+    try:
+        data = request.get_json(silent=True) or {}
+        isrc = data.get('isrc', '')
+        genre = data.get('genre', 'default')
+        ltm_gross = float(data.get('ltm_gross', 0))
+        release_date = data.get('release_date')
+        horizon = int(data.get('horizon_years', 5))
+        discount_rate = float(data.get('discount_rate', 10)) / 100
+
+        if ltm_gross <= 0:
+            return jsonify({'error': 'LTM gross must be > 0'}), 400
+
+        config = forecast_engine.ForecastConfig(
+            genre_default=genre,
+            horizon_years=horizon,
+            discount_rate=discount_rate,
+        )
+
+        baseline = {
+            'isrc': isrc,
+            'gross': ltm_gross,
+            'fees': ltm_gross * 0.15,
+            'net_receipts': ltm_gross * 0.85,
+            'net_earnings': ltm_gross * 0.70,
+            'release_date': release_date,
+        }
+
+        projections = forecast_engine.project_isrc(baseline, release_date, config, genre)
+        total_projected = sum(p['gross'] for p in projections)
+
+        return jsonify({
+            'projections': projections,
+            'total_projected': round(total_projected, 2),
+            'baseline_gross': ltm_gross,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
