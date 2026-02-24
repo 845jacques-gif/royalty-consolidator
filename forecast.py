@@ -373,6 +373,45 @@ def compute_synergy_ramp(year: int, config: ForecastConfig) -> float:
     return months_since_start / ramp_months
 
 
+def compute_synergy_ramp_for_payor(year: int, config: ForecastConfig,
+                                    payor_code: Optional[str] = None) -> tuple:
+    """Compute per-payor synergy ramp, fee rate, and TP synergy rate.
+
+    Checks payor_configs[code] for per-payor overrides, falls back to global config.
+
+    Returns:
+        (ramp, effective_new_fee_rate, effective_tp_synergy_rate)
+    """
+    pc = config.payor_configs.get(payor_code, {}) if payor_code else {}
+
+    # Per-payor synergy flag — if explicitly False, no synergy for this payor
+    payor_synergy = pc.get('synergy')
+    if payor_synergy is False:
+        return (0.0, None, 0.0)
+
+    # Resolve synergy parameters: per-payor overrides > global config
+    new_fee_rate = pc.get('synergy_new_fee_rate', config.new_fee_rate)
+    tp_synergy_rate = pc.get('synergy_tp_rate', config.third_party_synergy_rate) or 0.0
+    start_year = pc.get('synergy_start_year', config.synergy_start_year)
+    ramp_months = pc.get('synergy_ramp_months', config.synergy_ramp_months)
+
+    if new_fee_rate is None and tp_synergy_rate == 0:
+        return (0.0, None, 0.0)
+
+    ramp_months = max(1, ramp_months)
+    months_into_projection = year * 12
+    synergy_start_month = (start_year - 1) * 12
+    months_since_start = months_into_projection - synergy_start_month
+
+    if months_since_start <= 0:
+        return (0.0, new_fee_rate, tp_synergy_rate)
+    if months_since_start >= ramp_months:
+        return (1.0, new_fee_rate, tp_synergy_rate)
+
+    ramp = months_since_start / ramp_months
+    return (ramp, new_fee_rate, tp_synergy_rate)
+
+
 def lookup_sofr_rate(sofr_curve: List[dict], target_date: date,
                      floor: float = 0.02) -> float:
     """Find the SOFR rate for a given date from the forward curve.
@@ -590,7 +629,8 @@ def project_isrc(baseline: dict, release_date_str: Optional[str],
                  tp_share: Optional[float] = None,
                  curve_name: Optional[str] = None,
                  artist_share: float = 0.0,
-                 terminal_blend: float = 1.0) -> List[dict]:
+                 terminal_blend: float = 1.0,
+                 payor_code: Optional[str] = None) -> List[dict]:
     """Project revenue for a single ISRC over the forecast horizon.
 
     Args:
@@ -646,8 +686,6 @@ def project_isrc(baseline: dict, release_date_str: Optional[str],
     projections = []
     prev_gross = base_gross
 
-    tp_synergy_rate = config.third_party_synergy_rate or 0.0
-
     for y in range(1, horizon + 1):
         catalog_age = base_age + y
         decay_rate = interpolate_decay_rate(catalog_age, curve,
@@ -663,13 +701,13 @@ def project_isrc(baseline: dict, release_date_str: Optional[str],
         third_party_excl = after_artist * tp_ratio
         net_earnings_excl = after_artist - third_party_excl
 
-        # --- Synergy savings ---
-        ramp = compute_synergy_ramp(y, config)
+        # --- Synergy savings (per-payor aware) ---
+        ramp, eff_new_fee, eff_tp_syn = compute_synergy_ramp_for_payor(y, config, payor_code)
 
         # Fee savings
         fee_savings = 0.0
-        if config.new_fee_rate is not None and ramp > 0:
-            blended_fee_rate = fee_ratio * (1 - ramp) + config.new_fee_rate * ramp
+        if eff_new_fee is not None and ramp > 0:
+            blended_fee_rate = fee_ratio * (1 - ramp) + eff_new_fee * ramp
             fees_synergy = year_gross * blended_fee_rate
             fee_savings = fees_original - fees_synergy
         else:
@@ -677,8 +715,8 @@ def project_isrc(baseline: dict, release_date_str: Optional[str],
 
         # Third-party savings
         tp_savings = 0.0
-        if tp_synergy_rate > 0 and ramp > 0:
-            tp_savings = third_party_excl * tp_synergy_rate * ramp
+        if eff_tp_syn > 0 and ramp > 0:
+            tp_savings = third_party_excl * eff_tp_syn * ramp
 
         # --- Incl synergies track ---
         # Fee savings reduce fees → more NR → more after-artist → more NE
@@ -1045,7 +1083,8 @@ def project_isrc_monthly(baseline_annual_gross: float,
                           label_share: float,
                           tp_share: float,
                           forecast_start: date,
-                          seasonality: Optional[Dict[int, float]] = None) -> List[dict]:
+                          seasonality: Optional[Dict[int, float]] = None,
+                          payor_code: Optional[str] = None) -> List[dict]:
     """Project per-ISRC at monthly granularity.
 
     Distributes annual projected gross across months using LTM seasonality pattern
@@ -1090,16 +1129,15 @@ def project_isrc_monthly(baseline_annual_gross: float,
             month_tp = month_nr * tp_share
             month_ne_excl = month_nr - month_tp
 
-            ramp = compute_synergy_ramp(y, config)
+            ramp, eff_new_fee, eff_tp_syn = compute_synergy_ramp_for_payor(y, config, payor_code)
             fee_savings = 0.0
-            if config.new_fee_rate is not None and ramp > 0:
-                blended = fee_ratio * (1 - ramp) + config.new_fee_rate * ramp
+            if eff_new_fee is not None and ramp > 0:
+                blended = fee_ratio * (1 - ramp) + eff_new_fee * ramp
                 fee_savings = (fee_ratio - blended) * month_gross
 
             tp_savings = 0.0
-            tp_synergy_rate = config.third_party_synergy_rate or 0.0
-            if tp_synergy_rate > 0 and ramp > 0:
-                tp_savings = month_tp * tp_synergy_rate * ramp
+            if eff_tp_syn > 0 and ramp > 0:
+                tp_savings = month_tp * eff_tp_syn * ramp
 
             month_ne_incl = month_ne_excl + fee_savings + tp_savings
 
@@ -1196,6 +1234,25 @@ def run_forecast(payor_results: dict, analytics: dict,
     if not periods:
         return _empty_forecast(config)
 
+    # --- Per-payor LTM windows ---
+    # Each payor may have a different most-recent statement period.
+    # Compute trailing-12-month window per payor, then stitch together.
+    payor_max_periods = {}   # {code: int}  e.g. {'DITTO': 202502, 'PRS': 202512}
+    payor_ltm_starts = {}    # {code: int}  trailing 12-month start per payor
+    for code in payor_code_map:
+        payor_periods = monthly[monthly['payor_code'] == code]['period']
+        if payor_periods.empty:
+            continue
+        p_max = int(payor_periods.max())
+        payor_max_periods[code] = p_max
+        p_yr = p_max // 100
+        p_mn = p_max % 100
+        if p_mn == 12:
+            payor_ltm_starts[code] = p_yr * 100 + 1
+        else:
+            payor_ltm_starts[code] = (p_yr - 1) * 100 + (p_mn + 1)
+
+    # Global max period (for display, forecast_start, seasonality)
     max_period = max(periods)
     max_year = int(str(max_period)[:4])
     max_month = int(str(max_period)[4:6])
@@ -1204,7 +1261,31 @@ def run_forecast(payor_results: dict, analytics: dict,
     else:
         ltm_start_period = (max_year - 1) * 100 + (max_month + 1)
 
-    ltm_monthly = monthly[monthly['period'] >= ltm_start_period]
+    # Build ltm_monthly from per-payor windows: each payor's data filtered to
+    # its own trailing 12 months.  This prevents stale payors from having their
+    # ISRC baselines computed from a partial (non-trailing-12) window.
+    ltm_chunks = []
+    for code, ltm_s in payor_ltm_starts.items():
+        chunk = monthly[(monthly['payor_code'] == code) & (monthly['period'] >= ltm_s)]
+        ltm_chunks.append(chunk)
+    ltm_monthly = pd.concat(ltm_chunks, ignore_index=True) if ltm_chunks else monthly[monthly['period'] >= ltm_start_period]
+
+    # Stale payor warnings: payors >6 months behind the newest
+    payor_ltm_warnings = []
+    if payor_max_periods:
+        global_max = max(payor_max_periods.values())
+        for code, p_max in payor_max_periods.items():
+            # Compute month gap
+            gap_months = (global_max // 100 - p_max // 100) * 12 + (global_max % 100 - p_max % 100)
+            if gap_months > 6:
+                payor_ltm_warnings.append({
+                    'code': code,
+                    'name': payor_code_map.get(code, code),
+                    'max_period': p_max,
+                    'gap_months': gap_months,
+                })
+    if payor_ltm_warnings:
+        log.warning(f"Stale payors detected: {[(w['name'], w['gap_months']) for w in payor_ltm_warnings]}")
 
     # Get all unique ISRCs with LTM revenue
     ltm_by_isrc = ltm_monthly.groupby('identifier')['gross'].sum()
@@ -1216,9 +1297,12 @@ def run_forecast(payor_results: dict, analytics: dict,
     # Per-payor ISRC breakdown for per-payor models
     ltm_by_payor_isrc = ltm_monthly.groupby(['payor_code', 'identifier'])['gross'].sum()
 
-    # LTM seasonality pattern (month -> proportion of annual gross)
-    if 'period' in ltm_monthly.columns:
-        ltm_monthly_sums = ltm_monthly.copy()
+    # LTM seasonality pattern — use GLOBAL window for seasonality so that
+    # seasonal weights reflect the newest data's month distribution, not
+    # stale payors' partial windows.
+    ltm_monthly_global = monthly[monthly['period'] >= ltm_start_period]
+    if 'period' in ltm_monthly_global.columns:
+        ltm_monthly_sums = ltm_monthly_global.copy()
         ltm_monthly_sums['month_num'] = ltm_monthly_sums['period'].astype(str).str[4:6].astype(int)
         month_totals = ltm_monthly_sums.groupby('month_num')['gross'].sum()
         total_for_seasonality = month_totals.sum()
@@ -1549,6 +1633,7 @@ def run_forecast(payor_results: dict, analytics: dict,
             curve_name=curve_name,
             artist_share=isrc_artist_share,
             terminal_blend=t_blend,
+            payor_code=isrc_primary_payor.get(isrc),
         )
 
         isrc_projections[isrc] = {
@@ -1621,6 +1706,8 @@ def run_forecast(payor_results: dict, analytics: dict,
             'isrc_count': len(payor_isrcs),
             'ltm_gross': round(payor_ltm_gross, 2),
             'isrcs': payor_isrcs,
+            'ltm_start': payor_ltm_starts.get(code),
+            'ltm_end': payor_max_periods.get(code),
         }
 
     # --- By income type aggregation ---
@@ -1662,11 +1749,13 @@ def run_forecast(payor_results: dict, analytics: dict,
     levered_returns = {}
     virtu_levered_returns = None
     irr_sensitivity = {}
+    levered_sensitivity = {}
     if config.purchase_price > 0:
         unlevered_returns = _compute_unlevered_returns_dated(year_totals, config, forecast_start)
         levered_returns = _compute_levered_returns_dated(year_totals, config, forecast_start)
         virtu_levered_returns = compute_virtu_levered_returns(year_totals, config, forecast_start)
         irr_sensitivity = compute_irr_moic_sensitivity(year_totals, config, forecast_start)
+        levered_sensitivity = compute_levered_irr_moic_sensitivity(year_totals, config, forecast_start)
 
     # Cohort analysis
     cohorts = compute_forecast_cohorts(isrc_projections, meta_lookup, {}, config, forecast_start)
@@ -1747,6 +1836,7 @@ def run_forecast(payor_results: dict, analytics: dict,
         'forecast_start': forecast_start.isoformat(),
         'isrc_count': len(isrc_projections),
         'isrc_coverage': round(coverage_ratio, 4),
+        'payor_ltm_warnings': payor_ltm_warnings,
         'aggregate': {
             'year_totals': year_totals,
             'total_gross': round(total_gross, 2),
@@ -1770,6 +1860,7 @@ def run_forecast(payor_results: dict, analytics: dict,
         'dcf': dcf,
         'sensitivity': sensitivity,
         'irr_sensitivity': irr_sensitivity,
+        'levered_sensitivity': levered_sensitivity,
         'unlevered_returns': unlevered_returns,
         'levered_returns': levered_returns,
         'virtu_levered_returns': virtu_levered_returns,
@@ -2109,6 +2200,126 @@ def compute_irr_moic_sensitivity(year_totals: List[dict],
     }
 
 
+def compute_levered_irr_moic_sensitivity(year_totals: List[dict],
+                                          config: ForecastConfig,
+                                          forecast_start: date) -> dict:
+    """Compute levered IRR/MOIC sensitivity grid across purchase prices × exit multiples.
+
+    Uses the same axes as the unlevered grid. For each (price, exit_mult) combo,
+    runs the full debt schedule to get levered IRR and MOIC.
+    Returns {purchase_prices, exit_multiples, irr_matrix, moic_matrix}.
+    """
+    ne_key = 'net_earnings_incl'
+    if not year_totals:
+        return {}
+
+    # Build grid axes (same logic as unlevered)
+    if config.irr_purchase_prices:
+        prices = sorted(config.irr_purchase_prices)
+    elif config.purchase_price > 0:
+        base = config.purchase_price
+        prices = [round(base * m, 0) for m in [0.80, 0.90, 1.0, 1.10, 1.20]]
+    else:
+        return {}
+
+    if config.irr_exit_multiples:
+        exit_mults = sorted(config.irr_exit_multiples)
+    else:
+        exit_mults = [9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+
+    # Close date for XIRR
+    y0_date = forecast_start
+    if config.close_date:
+        try:
+            y0_date = date.fromisoformat(config.close_date[:10])
+        except (ValueError, TypeError):
+            pass
+
+    irr_matrix = []
+    moic_matrix = []
+
+    for pp in prices:
+        if pp <= 0:
+            irr_matrix.append([None] * len(exit_mults))
+            moic_matrix.append([None] * len(exit_mults))
+            continue
+
+        irr_row = []
+        moic_row = []
+        for em in exit_mults:
+            # Debt schedule for this (pp, em) combo
+            debt_initial = pp * config.ltv
+            equity = pp - debt_initial
+            if equity <= 0:
+                irr_row.append(None)
+                moic_row.append(None)
+                continue
+
+            balance = debt_initial
+            total_lfcf = 0.0
+            xirr_flows = [(y0_date, -equity)]
+
+            for i, yt in enumerate(year_totals):
+                ufcf = yt.get(ne_key, 0)
+                opening = balance
+                interest_rate = get_interest_rate_for_year(yt['year'], config, forecast_start)
+
+                # Iterative interest/principal solve
+                est_interest = opening * interest_rate
+                for _ in range(10):
+                    available = max(0, ufcf - est_interest) * config.cash_flow_sweep
+                    principal = min(opening, available)
+                    closing = opening - principal
+                    new_interest = ((opening + closing) / 2) * interest_rate
+                    if abs(new_interest - est_interest) < 0.01:
+                        est_interest = new_interest
+                        break
+                    est_interest = new_interest
+
+                interest = est_interest
+                available = max(0, ufcf - interest) * config.cash_flow_sweep
+                principal = min(opening, available)
+                closing = opening - principal
+                lfcf = ufcf - interest - principal
+
+                total_lfcf += lfcf
+                balance = closing
+
+                # Exit at horizon
+                is_exit = (yt['year'] == config.horizon_years)
+                last_ne = ufcf
+                exit_equity_cf = 0
+                if is_exit:
+                    exit_ev = last_ne * em
+                    exit_equity_cf = exit_ev - balance
+
+                cf = lfcf + exit_equity_cf
+                cf_date = date(y0_date.year + yt['year'], y0_date.month,
+                               min(y0_date.day, 28))
+                xirr_flows.append((cf_date, cf))
+
+            # Final exit equity for MOIC
+            last_ne_val = year_totals[-1].get(ne_key, 0) if year_totals else 0
+            exit_ev = last_ne_val * em
+            exit_equity_val = exit_ev - balance
+            total_distributions = total_lfcf + exit_equity_val
+            moic = total_distributions / equity if equity > 0 else 0
+
+            irr = _xirr(xirr_flows)
+            irr_row.append(round(irr, 4) if irr is not None else None)
+            moic_row.append(round(moic, 2))
+
+        irr_matrix.append(irr_row)
+        moic_matrix.append(moic_row)
+
+    return {
+        'purchase_prices': prices,
+        'exit_multiples': exit_mults,
+        'irr_matrix': irr_matrix,
+        'moic_matrix': moic_matrix,
+    }
+
+
 def compute_forecast_cohorts(isrc_projections: dict, isrc_metadata: dict,
                               historical_by_isrc: dict,
                               config: ForecastConfig,
@@ -2276,6 +2487,7 @@ def _empty_forecast(config: ForecastConfig) -> dict:
                 'perpetuity_growth': {'excl': {}, 'incl': {}}},
         'sensitivity': {'terminal_multiple': {}, 'perpetuity_growth': {}},
         'irr_sensitivity': {},
+        'levered_sensitivity': {},
         'unlevered_returns': {},
         'levered_returns': {},
         'virtu_levered_returns': None,
@@ -3197,14 +3409,30 @@ def export_forecast_excel(result: dict, output_path: str, deal_name: str = ''):
         wsm.cell(row=r, column=1).fill = gray
         r += 1
         pc = config.get('payor_configs', {}).get(code, {})
-        for lbl, val in [
+        # Format LTM window as YYYY-MM
+        ltm_s = pp_data.get('ltm_start')
+        ltm_e = pp_data.get('ltm_end')
+        ltm_window_str = ''
+        if ltm_s and ltm_e:
+            ltm_window_str = f"{ltm_s // 100}-{ltm_s % 100:02d} to {ltm_e // 100}-{ltm_e % 100:02d}"
+        assumptions_rows = [
             ('Payor', name),
             ('Income Rights', pp_data.get('income_rights', '')),
             ('Deal Type', config.get('deal_type', 'Catalog')),
+            ('LTM Window', ltm_window_str),
             ('FX Currency', pc.get('fx_currency', config.get('base_currency', 'USD'))),
             ('FX Rate', pc.get('fx_rate', 1.0)),
             ('Fee Rate', pc.get('fee_rate', '')),
-        ]:
+        ]
+        # Synergy assumptions
+        if pc.get('synergy'):
+            syn_fee = pc.get('synergy_new_fee_rate', config.get('new_fee_rate', ''))
+            syn_start = pc.get('synergy_start_year', config.get('synergy_start_year', ''))
+            syn_ramp = pc.get('synergy_ramp_months', config.get('synergy_ramp_months', ''))
+            assumptions_rows.append(('Synergy Fee Rate', syn_fee))
+            assumptions_rows.append(('Synergy Start Year', syn_start))
+            assumptions_rows.append(('Synergy Ramp (months)', syn_ramp))
+        for lbl, val in assumptions_rows:
             wsm.cell(row=r, column=1, value=lbl).font = bf
             wsm.cell(row=r, column=2, value=val)
             r += 1

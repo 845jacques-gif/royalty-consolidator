@@ -4021,6 +4021,9 @@ function addEditPayor() {
                         <th style="text-align:left; padding:4px 6px; border-bottom:1px solid var(--border);">Target Ccy</th>
                         <th style="text-align:right; padding:4px 6px; border-bottom:1px solid var(--border);">FX Rate</th>
                         <th style="text-align:center; padding:4px 6px; border-bottom:1px solid var(--border);">Synergy</th>
+                        <th style="text-align:right; padding:4px 6px; border-bottom:1px solid var(--border);">Syn Fee %</th>
+                        <th style="text-align:right; padding:4px 6px; border-bottom:1px solid var(--border);">Syn Start Yr</th>
+                        <th style="text-align:right; padding:4px 6px; border-bottom:1px solid var(--border);">Ramp (mo)</th>
                     </tr></thead>
                     <tbody>
                     {% set saved_pc = forecast_result.config.payor_configs if forecast_result and forecast_result.config.payor_configs else {} %}
@@ -4054,6 +4057,21 @@ function addEditPayor() {
                         </td>
                         <td style="padding:4px 6px; text-align:center;">
                             <input type="checkbox" class="pc-synergy" {% if pc.get('synergy') %}checked{% endif %}>
+                        </td>
+                        <td style="padding:4px 6px;">
+                            <input type="number" class="pc-syn-fee form-input" style="font-size:11px; padding:2px 4px; width:60px; text-align:right;"
+                                   value="{{ pc.get('synergy_new_fee_rate', '') }}" min="0" max="1" step="0.01"
+                                   placeholder="Gbl" {% if not pc.get('synergy') %}disabled{% endif %}>
+                        </td>
+                        <td style="padding:4px 6px;">
+                            <input type="number" class="pc-syn-start form-input" style="font-size:11px; padding:2px 4px; width:50px; text-align:right;"
+                                   value="{{ pc.get('synergy_start_year', '') }}" min="1" max="10" step="1"
+                                   placeholder="Gbl" {% if not pc.get('synergy') %}disabled{% endif %}>
+                        </td>
+                        <td style="padding:4px 6px;">
+                            <input type="number" class="pc-syn-ramp form-input" style="font-size:11px; padding:2px 4px; width:50px; text-align:right;"
+                                   value="{{ pc.get('synergy_ramp_months', '') }}" min="1" max="120" step="1"
+                                   placeholder="Gbl" {% if not pc.get('synergy') %}disabled{% endif %}>
                         </td>
                     </tr>
                     {% endfor %}
@@ -4137,6 +4155,9 @@ function collectPayorConfigs() {
         const fxInput = tr.querySelector('.pc-fx-rate');
         const fxRate = fxInput.disabled ? null : (parseFloat(fxInput.value) || null);
         const synergy = tr.querySelector('.pc-synergy').checked;
+        const synFee = tr.querySelector('.pc-syn-fee');
+        const synStart = tr.querySelector('.pc-syn-start');
+        const synRamp = tr.querySelector('.pc-syn-ramp');
 
         configs[code] = {
             income_rights: rights,
@@ -4144,6 +4165,14 @@ function collectPayorConfigs() {
             fx_currency: targetCcy,
             synergy: synergy
         };
+        if (synergy) {
+            const sf = parseFloat(synFee.value);
+            const ss = parseInt(synStart.value);
+            const sr = parseInt(synRamp.value);
+            if (!isNaN(sf)) configs[code].synergy_new_fee_rate = sf;
+            if (!isNaN(ss)) configs[code].synergy_start_year = ss;
+            if (!isNaN(sr)) configs[code].synergy_ramp_months = sr;
+        }
         if (fxRate && sourceCcy !== targetCcy) {
             configs[code].fx_rate = fxRate;
             fxRates[sourceCcy] = fxRate;
@@ -4161,6 +4190,18 @@ document.querySelectorAll('.pc-target-ccy').forEach(sel => {
         const fxInput = tr.querySelector('.pc-fx-rate');
         fxInput.disabled = (sourceCcy === this.value);
         if (fxInput.disabled) fxInput.value = '';
+    });
+});
+
+/* Enable/disable per-payor synergy inputs when synergy checkbox changes */
+document.querySelectorAll('.pc-synergy').forEach(cb => {
+    cb.addEventListener('change', function() {
+        const tr = this.closest('tr');
+        const synInputs = tr.querySelectorAll('.pc-syn-fee, .pc-syn-start, .pc-syn-ramp');
+        synInputs.forEach(inp => {
+            inp.disabled = !this.checked;
+            if (!this.checked) inp.value = '';
+        });
     });
 });
 
@@ -4194,6 +4235,18 @@ document.querySelector('form[action*="/forecast"]').addEventListener('submit', f
     <strong>ISRC Coverage: {{ forecast_result.ltm_waterfall.coverage_pct }}%</strong> &mdash;
     Only {{ CSYM }}{{ '{:,.0f}'.format(forecast_result.ltm_waterfall.gross) }} of {{ CSYM }}{{ '{:,.0f}'.format(forecast_result.ltm_waterfall.gross_all) }} LTM gross is attributed to identified ISRCs.
     Revenue without ISRC identifiers is not projected. The LTM column in the waterfall reflects ISRC-attributed revenue only.
+</div>
+{% endif %}
+
+{# ---- Stale Payor Warning ---- #}
+{% if forecast_result.payor_ltm_warnings is defined and forecast_result.payor_ltm_warnings | length > 0 %}
+<div style="padding:10px 16px; margin-bottom:12px; border-radius:6px; font-size:12px;
+    background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.3); color:#92400e;">
+    <strong>Stale Payor Data</strong> &mdash;
+    {% for w in forecast_result.payor_ltm_warnings %}
+    {{ w.name }} ({{ w.gap_months }} months behind{% set ym = w.max_period // 100 %}{% set mm = w.max_period % 100 %}, last: {{ '%04d-%02d' | format(ym, mm) }}){{ ', ' if not loop.last else '' }}
+    {% endfor %}
+    — Per-payor LTM windows are applied automatically; each payor uses its own trailing 12 months.
 </div>
 {% endif %}
 
@@ -4440,6 +4493,129 @@ document.querySelector('form[action*="/forecast"]').addEventListener('submit', f
         </table>
     </div>
 </div>
+
+{# ---- IRR/MOIC Sensitivity Grids (Purchase Price × Exit Multiple) ---- #}
+{% if forecast_result.irr_sensitivity and forecast_result.irr_sensitivity.purchase_prices is defined %}
+{% set irrs = forecast_result.irr_sensitivity %}
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+    {# Unlevered IRR Grid #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Unlevered IRR (Price × Exit Multiple)</span></div>
+        <div style="overflow-x:auto;">
+        <table style="font-size:11px; width:100%;">
+            <thead>
+            <tr>
+                <th style="font-size:10px;">Price \ Exit</th>
+                {% for em in irrs.exit_multiples %}
+                <th class="text-right" style="font-size:10px;">{{ '%.0f' | format(em) }}x</th>
+                {% endfor %}
+            </tr>
+            </thead>
+            <tbody>
+            {% for pi in range(irrs.purchase_prices | length) %}
+            <tr>
+                <td style="font-weight:600; white-space:nowrap;">{{ CSYM }}{{ '{:,.0f}'.format(irrs.purchase_prices[pi]) }}{% if irrs.xntm_values[pi] %} <span style="color:var(--text-dim); font-weight:400;">({{ irrs.xntm_values[pi] }}x)</span>{% endif %}</td>
+                {% for ci in range(irrs.exit_multiples | length) %}
+                {% set v = irrs.irr_matrix[pi][ci] %}
+                <td class="text-right mono" style="{% if pi == 2 and ci == (irrs.exit_multiples | length - 1) %}background:rgba(251,191,36,0.15); font-weight:700;{% endif %}{% if v is not none and v > 0 %}color:var(--green);{% elif v is not none and v < 0 %}color:var(--red);{% endif %}">{% if v is not none %}{{ '%.1f' | format(v * 100) }}%{% else %}&mdash;{% endif %}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+    {# Unlevered MOIC Grid #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Unlevered MOIC (Price × Exit Multiple)</span></div>
+        <div style="overflow-x:auto;">
+        <table style="font-size:11px; width:100%;">
+            <thead>
+            <tr>
+                <th style="font-size:10px;">Price \ Exit</th>
+                {% for em in irrs.exit_multiples %}
+                <th class="text-right" style="font-size:10px;">{{ '%.0f' | format(em) }}x</th>
+                {% endfor %}
+            </tr>
+            </thead>
+            <tbody>
+            {% for pi in range(irrs.purchase_prices | length) %}
+            <tr>
+                <td style="font-weight:600; white-space:nowrap;">{{ CSYM }}{{ '{:,.0f}'.format(irrs.purchase_prices[pi]) }}</td>
+                {% for ci in range(irrs.exit_multiples | length) %}
+                {% set v = irrs.moic_matrix[pi][ci] %}
+                <td class="text-right mono" style="{% if pi == 2 and ci == (irrs.exit_multiples | length - 1) %}background:rgba(251,191,36,0.15); font-weight:700;{% endif %}{% if v is not none and v >= 2.0 %}color:var(--green);{% elif v is not none and v < 1.0 %}color:var(--red);{% endif %}">{% if v is not none %}{{ '%.2f' | format(v) }}x{% else %}&mdash;{% endif %}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{# ---- Levered IRR/MOIC Sensitivity ---- #}
+{% if forecast_result.levered_sensitivity and forecast_result.levered_sensitivity.purchase_prices is defined %}
+{% set lsens = forecast_result.levered_sensitivity %}
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+    {# Levered IRR Grid #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Levered IRR (Price × Exit Multiple) — {{ '%.0f' | format(forecast_result.config.ltv * 100) }}% LTV</span></div>
+        <div style="overflow-x:auto;">
+        <table style="font-size:11px; width:100%;">
+            <thead>
+            <tr>
+                <th style="font-size:10px;">Price \ Exit</th>
+                {% for em in lsens.exit_multiples %}
+                <th class="text-right" style="font-size:10px;">{{ '%.0f' | format(em) }}x</th>
+                {% endfor %}
+            </tr>
+            </thead>
+            <tbody>
+            {% for pi in range(lsens.purchase_prices | length) %}
+            <tr>
+                <td style="font-weight:600; white-space:nowrap;">{{ CSYM }}{{ '{:,.0f}'.format(lsens.purchase_prices[pi]) }}</td>
+                {% for ci in range(lsens.exit_multiples | length) %}
+                {% set v = lsens.irr_matrix[pi][ci] %}
+                <td class="text-right mono" style="{% if pi == 2 and ci == (lsens.exit_multiples | length - 1) %}background:rgba(251,191,36,0.15); font-weight:700;{% endif %}{% if v and v > 0 %}color:var(--green);{% elif v and v < 0 %}color:var(--red);{% endif %}">{% if v is not none %}{{ '%.1f' | format(v * 100) }}%{% else %}—{% endif %}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+    {# Levered MOIC Grid #}
+    <div class="card">
+        <div class="card-header"><span class="card-title">Levered MOIC (Price × Exit Multiple) — {{ '%.0f' | format(forecast_result.config.ltv * 100) }}% LTV</span></div>
+        <div style="overflow-x:auto;">
+        <table style="font-size:11px; width:100%;">
+            <thead>
+            <tr>
+                <th style="font-size:10px;">Price \ Exit</th>
+                {% for em in lsens.exit_multiples %}
+                <th class="text-right" style="font-size:10px;">{{ '%.0f' | format(em) }}x</th>
+                {% endfor %}
+            </tr>
+            </thead>
+            <tbody>
+            {% for pi in range(lsens.purchase_prices | length) %}
+            <tr>
+                <td style="font-weight:600; white-space:nowrap;">{{ CSYM }}{{ '{:,.0f}'.format(lsens.purchase_prices[pi]) }}</td>
+                {% for ci in range(lsens.exit_multiples | length) %}
+                {% set v = lsens.moic_matrix[pi][ci] %}
+                <td class="text-right mono" style="{% if pi == 2 and ci == (lsens.exit_multiples | length - 1) %}background:rgba(251,191,36,0.15); font-weight:700;{% endif %}{% if v and v >= 2.0 %}color:var(--green);{% elif v and v < 1.0 %}color:var(--red);{% endif %}">{% if v is not none %}{{ '%.2f' | format(v) }}x{% else %}—{% endif %}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 </div>
 
 {# ==================== Tab 5: Returns ==================== #}
