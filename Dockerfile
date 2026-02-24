@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY app.py consolidator.py mapper.py enrichment.py formula_engine.py validator.py db.py storage.py migrate_data.py ./
+COPY app.py consolidator.py mapper.py enrichment.py formula_engine.py validator.py db.py storage.py migrate_data.py forecast.py delta.py ./
 COPY migrations/ ./migrations/
 
 # Create directories for runtime data

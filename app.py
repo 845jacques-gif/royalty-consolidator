@@ -42,13 +42,11 @@ genai = None
 _gemini_api_key = os.getenv('GEMINI_API_KEY', '')
 
 def _get_genai():
-    """Lazy-load google.generativeai on first use."""
+    """Lazy-load google.genai client on first use."""
     global genai
     if genai is None:
-        import google.generativeai as _genai
+        from google import genai as _genai
         genai = _genai
-        if _gemini_api_key:
-            genai.configure(api_key=_gemini_api_key)
     return genai
 
 from consolidator import (
@@ -8279,7 +8277,7 @@ def api_analyze_contract():
         uploaded_files = []
 
         _genai = _get_genai()
-        _genai.configure(api_key=api_key)
+        _client = _genai.Client(api_key=api_key)
 
         # Save and upload each PDF
         for cf in contract_files:
@@ -8289,12 +8287,10 @@ def api_analyze_contract():
             cf.save(tmp.name)
             tmp.close()
             tmp_paths.append(tmp.name)
-            uploaded_files.append(_genai.upload_file(tmp.name, mime_type='application/pdf'))
+            uploaded_files.append(_client.files.upload(file=tmp.name))
 
         if not uploaded_files:
             return jsonify({'error': 'No valid PDF files found'}), 400
-
-        model = _genai.GenerativeModel('gemini-2.0-flash')
         n_docs = len(uploaded_files)
         prompt = f"""Analyze {'this music industry contract' if n_docs == 1 else 'these ' + str(n_docs) + ' music industry contract documents together as parts of the same deal'} and extract the following deal terms.
 Return a single JSON object with exactly these keys (use null if not found):
@@ -8311,7 +8307,10 @@ Return a single JSON object with exactly these keys (use null if not found):
 
 Only return valid JSON, no markdown fences or extra text."""
 
-        response = model.generate_content([*uploaded_files, prompt])
+        response = _client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=[*uploaded_files, prompt],
+        )
 
         # Clean up temp files
         for p in tmp_paths:
@@ -9247,18 +9246,20 @@ def api_chat():
 
     try:
         _genai = _get_genai()
-        model = _genai.GenerativeModel(
-            'gemini-2.0-flash',
-            system_instruction=system_prompt,
-        )
+        from google.genai import types as _genai_types
+        _client = _genai.Client(api_key=_gemini_api_key or os.getenv('GEMINI_API_KEY', ''))
 
         # Build contents from history + new message
         contents = []
         for msg in history:
-            contents.append({'role': msg['role'], 'parts': [msg['text']]})
-        contents.append({'role': 'user', 'parts': [user_message]})
+            contents.append({'role': msg['role'], 'parts': [{'text': msg['text']}]})
+        contents.append({'role': 'user', 'parts': [{'text': user_message}]})
 
-        response = model.generate_content(contents)
+        response = _client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=contents,
+            config=_genai_types.GenerateContentConfig(system_instruction=system_prompt),
+        )
         reply = response.text
 
         # Store in history

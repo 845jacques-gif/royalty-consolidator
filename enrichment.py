@@ -365,9 +365,8 @@ def _lookup_gemini_batch(items: List[TrackLookupItem], api_key: str,
         return results
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        from google import genai
+        _client = genai.Client(api_key=api_key)
     except Exception as exc:
         print(f"[enrichment] Gemini init error: {exc}", file=sys.stderr, flush=True)
         return results
@@ -405,7 +404,10 @@ def _lookup_gemini_batch(items: List[TrackLookupItem], api_key: str,
 
         try:
             # Run generate_content with a timeout to avoid hanging indefinitely
-            future = executor.submit(model.generate_content, prompt)
+            future = executor.submit(
+                lambda p: _client.models.generate_content(model='gemini-2.0-flash', contents=p),
+                prompt,
+            )
             response = future.result(timeout=timeout_per_batch)
             response_text = response.text.strip()
 

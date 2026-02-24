@@ -2,7 +2,7 @@ pandas
 openpyxl
 flask
 pdfplumber
-google-generativeai
+google-genai
 python-dotenv
 psycopg2-binary
 google-cloud-storage
