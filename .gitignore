@@ -11,3 +11,10 @@ isrc_cache.json
 release_date_cache.json
 deals/
 app.log
+
+# Temp/debug files
+_debug_page.html
+_test_*.py
+dashboard_output*.html
+read_virtu.py
+nul
