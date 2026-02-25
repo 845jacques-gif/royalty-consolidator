@@ -81,6 +81,23 @@ def _no_cache(response):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     return response
 
+
+@app.errorhandler(413)
+def _request_too_large(e):
+    log.error("413 Request Entity Too Large: %s %s (content-length: %s)",
+              request.method, request.path, request.content_length)
+    if request.path.startswith('/api/'):
+        return jsonify(error='File too large', message='Upload exceeds the maximum allowed size.'), 413
+    return '<h1>Upload Too Large</h1><p>The file you uploaded exceeds the maximum allowed size. Try a smaller file or upload fewer files at once.</p>', 413
+
+
+@app.errorhandler(500)
+def _internal_error(e):
+    log.error("500 Internal Server Error: %s %s — %s", request.method, request.path, e)
+    if request.path.startswith('/api/'):
+        return jsonify(error='Internal server error', message=str(e)), 500
+    return '<h1>Internal Server Error</h1><p>Something went wrong. Check the Cloud Run logs for details.</p>', 500
+
 def _log_memory():
     """Log current memory usage (works on Linux/Docker and Windows)."""
     try:
