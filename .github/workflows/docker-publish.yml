@@ -51,6 +51,11 @@ jobs:
           project_id: ma-royalty-consolidator
           region: us-west1
           image: docker.io/845jacques/royalty-consolidator:${{ github.sha }}
+          flags: |
+            --memory=4Gi
+            --cpu=2
+            --timeout=600
+            --concurrency=80
           env_vars: |
             DB_HOST=${{ secrets.DB_HOST }}
             DB_PORT=${{ secrets.DB_PORT }}
