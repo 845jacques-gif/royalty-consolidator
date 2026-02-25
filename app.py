@@ -2132,12 +2132,20 @@ function syncFormulas() {
     <div class="card">
         <div class="card-header"><span class="card-title">Ingest Statement</span></div>
         <p style="font-size:12px; color:var(--text-dim); margin-bottom:12px;">Upload an XLSX or CSV royalty statement file. The wizard will guide you through column mapping and quality checks.</p>
-        <form method="POST" action="/ingest/upload" enctype="multipart/form-data">
+        <form method="POST" action="/ingest/upload" enctype="multipart/form-data" id="ingestForm">
             <div class="form-group">
                 <label class="form-label">Statement File</label>
                 <input class="form-input" type="file" name="statement_file" accept=".xlsx,.xls,.xlsb,.csv" required>
             </div>
-            <button type="submit" class="btn-submit">Upload &amp; Detect</button>
+            <div id="ingestProgress" style="display:none; margin-bottom:8px;">
+                <div style="font-size:11px; color:var(--accent); margin-bottom:4px;" id="ingestProgressText">Uploading to storage...</div>
+                <div style="height:3px; background:var(--border); border-radius:2px;">
+                    <div id="ingestProgressBar" style="height:100%; background:var(--accent); border-radius:2px; width:0%; transition:width 0.2s;"></div>
+                </div>
+            </div>
+            <input type="hidden" name="gcs_file_path" id="ingestGcsPath" value="">
+            <input type="hidden" name="gcs_file_name" id="ingestGcsName" value="">
+            <button type="submit" class="btn-submit" id="ingestBtn">Upload &amp; Detect</button>
         </form>
     </div>
 
@@ -3136,6 +3144,70 @@ function _submitViaFetch() {
         alert('Upload failed: ' + err.message);
     });
 }
+
+/* ---- Ingest Form: GCS upload for large single files ---- */
+(function() {
+    const form = document.getElementById('ingestForm');
+    if (!form) return;
+    form.addEventListener('submit', function(e) {
+        const fileInput = form.querySelector('input[name="statement_file"]');
+        const file = fileInput && fileInput.files[0];
+        if (!file || !_gcsAvailable || file.size < GCS_THRESHOLD) return; // let normal submit proceed
+
+        e.preventDefault();
+        const btn = document.getElementById('ingestBtn');
+        const origText = btn.textContent;
+        btn.textContent = 'Uploading...';
+        btn.disabled = true;
+        document.getElementById('ingestProgress').style.display = 'block';
+
+        // Request a resumable upload URL
+        fetch('/api/upload-urls', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({files: [{name: file.name, size: file.size, payor_idx: 0, content_type: file.type || 'application/octet-stream'}]}),
+        })
+        .then(r => { if (!r.ok) throw new Error('Failed to get upload URL'); return r.json(); })
+        .then(data => {
+            const info = data.urls[0];
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('PUT', info.upload_url, true);
+                xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+                xhr.upload.onprogress = function(ev) {
+                    if (ev.lengthComputable) {
+                        const pct = Math.round((ev.loaded / ev.total) * 100);
+                        document.getElementById('ingestProgressBar').style.width = pct + '%';
+                        document.getElementById('ingestProgressText').textContent = 'Uploading to storage... ' + pct + '%';
+                    }
+                };
+                xhr.onload = function() {
+                    if (xhr.status >= 200 && xhr.status < 300) resolve(info);
+                    else reject(new Error('GCS upload failed: HTTP ' + xhr.status));
+                };
+                xhr.onerror = function() { reject(new Error('Network error during upload')); };
+                xhr.send(file);
+            });
+        })
+        .then(info => {
+            document.getElementById('ingestProgressText').textContent = 'Processing...';
+            document.getElementById('ingestGcsPath').value = info.gcs_path;
+            document.getElementById('ingestGcsName').value = file.name;
+            // Clear the file input so it doesn't send the large file via multipart
+            fileInput.value = '';
+            // Remove required so the empty file input doesn't block submit
+            fileInput.removeAttribute('required');
+            form.submit();
+        })
+        .catch(err => {
+            console.error('Ingest GCS upload failed:', err);
+            btn.textContent = origText;
+            btn.disabled = false;
+            document.getElementById('ingestProgress').style.display = 'none';
+            alert('Upload failed: ' + err.message);
+        });
+    });
+})();
 </script>
 
 {% if demo_autofill|default(false) %}
