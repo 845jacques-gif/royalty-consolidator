@@ -64,7 +64,12 @@ def _db_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_NAME)
 
 
+_sqlite_available = False
+
+
 def _get_conn():
+    if not _sqlite_available:
+        raise RuntimeError("SQLite not available")
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
@@ -72,36 +77,46 @@ def _get_conn():
 
 
 def init_db():
-    """Create tables if they don't exist."""
-    conn = _get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS fingerprints (
-            fingerprint TEXT PRIMARY KEY,
-            column_names TEXT NOT NULL,
-            mapping TEXT NOT NULL,
-            source_label TEXT DEFAULT '',
-            use_count INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS synonyms (
-            raw_name TEXT PRIMARY KEY,
-            canonical TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS import_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT NOT NULL,
-            fingerprint TEXT,
-            mapping_used TEXT,
-            row_count INTEGER DEFAULT 0,
-            qc_warnings INTEGER DEFAULT 0,
-            qc_errors INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL
-        );
-    """)
-    conn.commit()
-    conn.close()
+    """Create tables if they don't exist. Returns True on success."""
+    global _sqlite_available
+    try:
+        conn = sqlite3.connect(_db_path())
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                column_names TEXT NOT NULL,
+                mapping TEXT NOT NULL,
+                source_label TEXT DEFAULT '',
+                use_count INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS synonyms (
+                raw_name TEXT PRIMARY KEY,
+                canonical TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS import_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                fingerprint TEXT,
+                mapping_used TEXT,
+                row_count INTEGER DEFAULT 0,
+                qc_warnings INTEGER DEFAULT 0,
+                qc_errors INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            );
+        """)
+        conn.commit()
+        conn.close()
+        _sqlite_available = True
+    except Exception as e:
+        import logging
+        logging.getLogger('royalty').warning("SQLite unavailable (read-only filesystem?): %s", e)
+        _sqlite_available = False
+    return _sqlite_available
 
 
 init_db()
@@ -281,14 +296,17 @@ def propose_mapping(cols: List[str]) -> Dict[str, dict]:
         except Exception as e:
             log.debug("DB fingerprint lookup failed: %s", e)
 
-    if saved_mapping is None:
-        conn = _get_conn()
-        row = conn.execute(
-            'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
-        ).fetchone()
-        if row:
-            saved_mapping = json.loads(row['mapping'])
-        conn.close()
+    if saved_mapping is None and _sqlite_available:
+        try:
+            conn = _get_conn()
+            row = conn.execute(
+                'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
+            ).fetchone()
+            if row:
+                saved_mapping = json.loads(row['mapping'])
+            conn.close()
+        except Exception:
+            pass
 
     if saved_mapping:
         for col in cols:
@@ -308,14 +326,17 @@ def propose_mapping(cols: List[str]) -> Dict[str, dict]:
                 canonical = dbm.get_synonyms_db(raw_lower)
             except Exception as e:
                 log.debug("DB synonym lookup failed for '%s': %s", raw_lower, e)
-        if canonical is None:
-            conn = _get_conn()
-            syn_row = conn.execute(
-                'SELECT canonical FROM synonyms WHERE raw_name = ?', (raw_lower,)
-            ).fetchone()
-            if syn_row:
-                canonical = syn_row['canonical']
-            conn.close()
+        if canonical is None and _sqlite_available:
+            try:
+                conn = _get_conn()
+                syn_row = conn.execute(
+                    'SELECT canonical FROM synonyms WHERE raw_name = ?', (raw_lower,)
+                ).fetchone()
+                if syn_row:
+                    canonical = syn_row['canonical']
+                conn.close()
+            except Exception:
+                pass
         if canonical and canonical not in assigned:
             result[col] = {'canonical': canonical, 'confidence': 0.9}
             assigned.add(canonical)
@@ -366,13 +387,17 @@ def get_fingerprint_mapping(cols: List[str]) -> Optional[Dict[str, str]]:
         except Exception as e:
             log.debug("DB fingerprint lookup failed: %s", e)
     # Fall back to SQLite
-    conn = _get_conn()
-    row = conn.execute(
-        'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
-    ).fetchone()
-    conn.close()
-    if row:
-        return json.loads(row['mapping'])
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            row = conn.execute(
+                'SELECT mapping FROM fingerprints WHERE fingerprint = ?', (fp,)
+            ).fetchone()
+            conn.close()
+            if row:
+                return json.loads(row['mapping'])
+        except Exception:
+            pass
     return None
 
 
@@ -693,32 +718,36 @@ def save_mapping(fingerprint: str, cols: List[str], mapping: Dict[str, str],
         except Exception as e:
             log.warning("DB save_mapping failed: %s", e)
 
-    # Always save to SQLite as fallback
-    conn = _get_conn()
-    now = datetime.now().isoformat()
-    col_json = json.dumps(cols)
-    map_json = json.dumps(mapping)
+    # Save to SQLite as fallback
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            now = datetime.now().isoformat()
+            col_json = json.dumps(cols)
+            map_json = json.dumps(mapping)
 
-    existing = conn.execute(
-        'SELECT use_count FROM fingerprints WHERE fingerprint = ?', (fingerprint,)
-    ).fetchone()
+            existing = conn.execute(
+                'SELECT use_count FROM fingerprints WHERE fingerprint = ?', (fingerprint,)
+            ).fetchone()
 
-    if existing:
-        conn.execute("""
-            UPDATE fingerprints
-            SET mapping = ?, column_names = ?, source_label = ?, updated_at = ?,
-                use_count = use_count + 1
-            WHERE fingerprint = ?
-        """, (map_json, col_json, source_label, now, fingerprint))
-    else:
-        conn.execute("""
-            INSERT INTO fingerprints (fingerprint, column_names, mapping, source_label,
-                                      use_count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
-        """, (fingerprint, col_json, map_json, source_label, now, now))
+            if existing:
+                conn.execute("""
+                    UPDATE fingerprints
+                    SET mapping = ?, column_names = ?, source_label = ?, updated_at = ?,
+                        use_count = use_count + 1
+                    WHERE fingerprint = ?
+                """, (map_json, col_json, source_label, now, fingerprint))
+            else:
+                conn.execute("""
+                    INSERT INTO fingerprints (fingerprint, column_names, mapping, source_label,
+                                              use_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                """, (fingerprint, col_json, map_json, source_label, now, now))
 
-    conn.commit()
-    conn.close()
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 
 def save_synonyms(mapping: Dict[str, str]):
@@ -731,20 +760,24 @@ def save_synonyms(mapping: Dict[str, str]):
         except Exception as e:
             log.warning("DB save_synonyms failed: %s", e)
 
-    # Always save to SQLite as fallback
-    conn = _get_conn()
-    for raw_col, canonical in mapping.items():
-        if not canonical or canonical not in CANONICAL_FIELDS:
-            continue
-        raw_lower = raw_col.strip().lower()
-        if not raw_lower:
-            continue
-        conn.execute(
-            'INSERT OR REPLACE INTO synonyms (raw_name, canonical) VALUES (?, ?)',
-            (raw_lower, canonical)
-        )
-    conn.commit()
-    conn.close()
+    # Save to SQLite as fallback
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            for raw_col, canonical in mapping.items():
+                if not canonical or canonical not in CANONICAL_FIELDS:
+                    continue
+                raw_lower = raw_col.strip().lower()
+                if not raw_lower:
+                    continue
+                conn.execute(
+                    'INSERT OR REPLACE INTO synonyms (raw_name, canonical) VALUES (?, ?)',
+                    (raw_lower, canonical)
+                )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 
 def increment_fingerprint_use(fingerprint: str):
@@ -756,13 +789,17 @@ def increment_fingerprint_use(fingerprint: str):
         except Exception as e:
             log.debug("DB increment_fingerprint_use failed: %s", e)
 
-    conn = _get_conn()
-    conn.execute(
-        'UPDATE fingerprints SET use_count = use_count + 1, updated_at = ? WHERE fingerprint = ?',
-        (datetime.now().isoformat(), fingerprint)
-    )
-    conn.commit()
-    conn.close()
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            conn.execute(
+                'UPDATE fingerprints SET use_count = use_count + 1, updated_at = ? WHERE fingerprint = ?',
+                (datetime.now().isoformat(), fingerprint)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -796,15 +833,19 @@ def log_import(filename: str, fingerprint: str, mapping: Dict[str, str],
         except Exception as e:
             log.warning("DB log_import failed: %s", e)
 
-    conn = _get_conn()
-    conn.execute("""
-        INSERT INTO import_log (filename, fingerprint, mapping_used, row_count,
-                                qc_warnings, qc_errors, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (filename, fingerprint, json.dumps(mapping), row_count,
-          qc_warnings, qc_errors, status, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            conn.execute("""
+                INSERT INTO import_log (filename, fingerprint, mapping_used, row_count,
+                                        qc_warnings, qc_errors, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (filename, fingerprint, json.dumps(mapping), row_count,
+                  qc_warnings, qc_errors, status, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 
 def get_import_history(limit: int = 20) -> List[dict]:
@@ -816,12 +857,17 @@ def get_import_history(limit: int = 20) -> List[dict]:
         except Exception as e:
             log.debug("DB get_import_history failed: %s", e)
 
-    conn = _get_conn()
-    rows = conn.execute(
-        'SELECT * FROM import_log ORDER BY created_at DESC LIMIT ?', (limit,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            rows = conn.execute(
+                'SELECT * FROM import_log ORDER BY created_at DESC LIMIT ?', (limit,)
+            ).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception:
+            pass
+    return []
 
 
 def get_saved_formats() -> List[dict]:
@@ -833,15 +879,20 @@ def get_saved_formats() -> List[dict]:
         except Exception as e:
             log.debug("DB get_saved_formats failed: %s", e)
 
-    conn = _get_conn()
-    rows = conn.execute(
-        'SELECT fingerprint, source_label, column_names, use_count, updated_at '
-        'FROM fingerprints ORDER BY use_count DESC'
-    ).fetchall()
-    conn.close()
-    results = []
-    for r in rows:
-        entry = dict(r)
-        entry['column_names'] = json.loads(entry['column_names'])
-        results.append(entry)
-    return results
+    if _sqlite_available:
+        try:
+            conn = _get_conn()
+            rows = conn.execute(
+                'SELECT fingerprint, source_label, column_names, use_count, updated_at '
+                'FROM fingerprints ORDER BY use_count DESC'
+            ).fetchall()
+            conn.close()
+            results = []
+            for r in rows:
+                entry = dict(r)
+                entry['column_names'] = json.loads(entry['column_names'])
+                results.append(entry)
+            return results
+        except Exception:
+            pass
+    return []
