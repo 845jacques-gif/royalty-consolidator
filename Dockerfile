@@ -15,8 +15,8 @@ COPY migrations/ ./migrations/
 # Create directories for runtime data
 RUN mkdir -p /app/deals /app/demo_data
 
-# Expose port
-EXPOSE 5000
+# Expose port (Cloud Run sets PORT env var, default 8080)
+EXPOSE 8080
 
-# Run with gunicorn (production WSGI server)
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "300", "app:app"]
+# Run with gunicorn — uses $PORT from Cloud Run, falls back to 8080
+CMD gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 2 --threads 4 --timeout 300 app:app

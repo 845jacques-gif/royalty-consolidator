@@ -9614,5 +9614,6 @@ def ingest_reset():
 
 
 if __name__ == '__main__':
-    log.info("Royalty Consolidator starting on http://localhost:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 8000))
+    log.info(f"Royalty Consolidator starting on http://localhost:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
