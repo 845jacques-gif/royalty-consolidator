@@ -2411,6 +2411,8 @@ function syncFormulas() {
 
 <script>
 const PRESET_PAYORS = {{ default_payors | tojson }};
+const _gcsAvailable = {{ gcs_available|default(false)|tojson }};
+const GCS_THRESHOLD = 10 * 1024 * 1024;  // 10 MB
 
 function applyPreset(selectEl) {
     const block = selectEl.closest('.payor-block');
@@ -2960,37 +2962,161 @@ function confirmDates() {
     _submitViaFetch();
 }
 
+/* ---- GCS Direct Upload Helpers ---- */
+
+function _updateFileProgress(inputName, fileName, pct) {
+    // Find the dropzone for this input and update/create a progress bar
+    const input = document.querySelector('input[name="' + inputName + '"]');
+    if (!input) return;
+    const dz = input.closest('.dropzone');
+    if (!dz) return;
+    const filesDiv = dz.querySelector('.dz-files');
+    if (!filesDiv) return;
+    // Find or create progress element for this file
+    let progEl = filesDiv.querySelector('[data-prog-file="' + CSS.escape(fileName) + '"]');
+    if (!progEl) {
+        progEl = document.createElement('div');
+        progEl.setAttribute('data-prog-file', fileName);
+        progEl.style.cssText = 'margin:2px 0;';
+        progEl.innerHTML = '<div style="display:flex;align-items:center;gap:6px;">' +
+            '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;" title="' + fileName + '">' + fileName + '</span>' +
+            '<span class="prog-pct" style="font-size:11px;color:var(--accent);min-width:36px;text-align:right;">0%</span></div>' +
+            '<div style="height:3px;background:var(--border);border-radius:2px;margin-top:2px;">' +
+            '<div class="prog-bar" style="height:100%;background:var(--accent);border-radius:2px;width:0%;transition:width 0.2s;"></div></div>';
+        filesDiv.appendChild(progEl);
+    }
+    const bar = progEl.querySelector('.prog-bar');
+    const pctEl = progEl.querySelector('.prog-pct');
+    if (bar) bar.style.width = Math.round(pct) + '%';
+    if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+}
+
+function _uploadSingleFileToGCS(file, uploadUrl, gcsPath, inputName) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', uploadUrl, true);
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.upload.onprogress = function(e) {
+            if (e.lengthComputable) {
+                _updateFileProgress(inputName, file.name, (e.loaded / e.total) * 100);
+            }
+        };
+        xhr.onload = function() {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                _updateFileProgress(inputName, file.name, 100);
+                resolve({name: file.name, gcs_path: gcsPath});
+            } else {
+                reject(new Error('GCS upload failed for ' + file.name + ': HTTP ' + xhr.status));
+            }
+        };
+        xhr.onerror = function() {
+            reject(new Error('Network error uploading ' + file.name + ' to GCS'));
+        };
+        xhr.send(file);
+    });
+}
+
+async function _uploadLargeFilesToGCS(largeFiles) {
+    // largeFiles: [{file, inputName, payorIdx}]
+    // Request resumable session URLs from backend
+    const reqFiles = largeFiles.map(lf => ({
+        name: lf.file.name,
+        size: lf.file.size,
+        payor_idx: lf.payorIdx,
+        content_type: lf.file.type || 'application/octet-stream',
+    }));
+    const resp = await fetch('/api/upload-urls', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({files: reqFiles}),
+    });
+    if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || 'Failed to get upload URLs');
+    }
+    const data = await resp.json();
+    const urlMap = {};
+    for (const u of data.urls) {
+        urlMap[u.payor_idx + '/' + u.name] = u;
+    }
+    // Upload each file to GCS with progress tracking
+    const results = [];  // {inputName -> [{name, gcs_path}]}
+    const uploads = largeFiles.map(lf => {
+        const key = lf.payorIdx + '/' + lf.file.name;
+        const info = urlMap[key];
+        if (!info) return Promise.reject(new Error('No upload URL for ' + lf.file.name));
+        return _uploadSingleFileToGCS(lf.file, info.upload_url, info.gcs_path, lf.inputName)
+            .then(result => {
+                results.push({inputName: lf.inputName, ...result});
+            });
+    });
+    await Promise.all(uploads);
+    // Group by inputName
+    const grouped = {};
+    for (const r of results) {
+        const key = r.inputName;
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push({name: r.name, gcs_path: r.gcs_path});
+    }
+    return grouped;
+}
+
 function _submitViaFetch() {
     const form = document.getElementById('uploadForm');
-    const formData = new FormData();
-
-    // Add all non-file form fields
-    const inputs = form.querySelectorAll('input:not([type=file]), select, textarea');
-    inputs.forEach(inp => {
-        if (inp.name) formData.append(inp.name, inp.value);
-    });
-
-    // Add files from _dzFiles or native inputs
-    const fileInputs = form.querySelectorAll('input[type=file][name^="payor_files_"]');
-    fileInputs.forEach(inp => {
-        const dzList = _dzFiles[inp.name];
-        if (dzList && dzList.length) {
-            dzList.forEach(f => formData.append(inp.name, f, f.name));
-        } else {
-            for (const f of inp.files) formData.append(inp.name, f, f.name);
-        }
-    });
-
-    // Show uploading state
     const btn = document.getElementById('submitBtn');
     const origText = btn.textContent;
     btn.textContent = 'Uploading...';
     btn.disabled = true;
 
-    fetch(form.action || '/custom/upload', {
-        method: 'POST',
-        body: formData,
-        redirect: 'follow',
+    // Partition files into small (multipart) and large (GCS)
+    const smallFiles = {};   // inputName -> File[]
+    const largeFiles = [];   // [{file, inputName, payorIdx}]
+    const fileInputs = form.querySelectorAll('input[type=file][name^="payor_files_"]');
+    fileInputs.forEach(inp => {
+        const dzList = _dzFiles[inp.name];
+        const files = (dzList && dzList.length) ? dzList : Array.from(inp.files);
+        const idx = inp.name.replace('payor_files_', '');
+        smallFiles[inp.name] = [];
+        for (const f of files) {
+            if (_gcsAvailable && f.size >= GCS_THRESHOLD) {
+                largeFiles.push({file: f, inputName: inp.name, payorIdx: parseInt(idx)});
+            } else {
+                smallFiles[inp.name].push(f);
+            }
+        }
+    });
+
+    // If there are large files, upload them to GCS first
+    const gcsPromise = largeFiles.length > 0
+        ? _uploadLargeFilesToGCS(largeFiles)
+        : Promise.resolve({});
+
+    gcsPromise.then(gcsResults => {
+        const formData = new FormData();
+
+        // Add all non-file form fields
+        const inputs = form.querySelectorAll('input:not([type=file]), select, textarea');
+        inputs.forEach(inp => {
+            if (inp.name) formData.append(inp.name, inp.value);
+        });
+
+        // Add small files as multipart
+        for (const [inputName, files] of Object.entries(smallFiles)) {
+            files.forEach(f => formData.append(inputName, f, f.name));
+        }
+
+        // Add GCS file references as JSON hidden fields
+        for (const [inputName, gcsFileList] of Object.entries(gcsResults)) {
+            const idx = inputName.replace('payor_files_', '');
+            formData.append('gcs_files_' + idx, JSON.stringify(gcsFileList));
+        }
+
+        btn.textContent = 'Processing...';
+        return fetch(form.action || '/custom/upload', {
+            method: 'POST',
+            body: formData,
+            redirect: 'follow',
+        });
     })
     .then(resp => {
         if (resp.redirected) {
@@ -6572,6 +6698,7 @@ def upload_page():
         saved_formats=formats,
         demo_autofill=demo_autofill,
         demo_data_dir=DEMO_DATA_DIR.replace(chr(92), chr(92)*2) if demo_autofill else '',
+        gcs_available=storage.is_available(),
     )
 
 
@@ -6687,6 +6814,13 @@ def run_custom():
                     else:
                         f.save(os.path.join(payor_dir, f.filename))
 
+                # Download any large files uploaded via GCS
+                gcs_json = request.form.get(f'gcs_files_{idx}', '').strip()
+                if gcs_json:
+                    gcs_saved = _download_gcs_files_to_dir(payor_dir, gcs_json)
+                    if gcs_saved:
+                        has_files = True
+
                 if not has_files and not local_dir:
                     idx += 1
                     continue
@@ -6779,6 +6913,43 @@ def run_custom():
 
 CUSTOM_TEMP = os.path.join(tempfile.gettempdir(), 'royalty_consolidator', 'custom_flow')
 os.makedirs(CUSTOM_TEMP, exist_ok=True)
+
+
+def _download_gcs_files_to_dir(payor_dir: str, gcs_json: str) -> list:
+    """Download GCS-uploaded files to a local payor directory.
+    gcs_json is a JSON string: [{name, gcs_path}, ...]
+    Handles zip extraction. Cleans up GCS blobs after download.
+    Returns list of saved filenames.
+    """
+    try:
+        gcs_files = json.loads(gcs_json)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return []
+    os.makedirs(payor_dir, exist_ok=True)
+    saved = []
+    for entry in gcs_files:
+        gcs_path = entry.get('gcs_path', '')
+        fname = entry.get('name', os.path.basename(gcs_path))
+        if not gcs_path:
+            continue
+        local_path = os.path.join(payor_dir, fname)
+        try:
+            storage.download_to_file(gcs_path, local_path)
+            if fname.lower().endswith('.zip'):
+                try:
+                    with zipfile.ZipFile(local_path, 'r') as zf:
+                        zf.extractall(payor_dir)
+                        saved.extend(n for n in zf.namelist() if not n.endswith('/'))
+                    os.remove(local_path)
+                except zipfile.BadZipFile:
+                    saved.append(fname)
+            else:
+                saved.append(fname)
+            # Clean up GCS temp blob
+            storage.delete_blob(gcs_path)
+        except Exception as e:
+            log.error("GCS download failed for %s: %s", gcs_path, e)
+    return saved
 
 DEMO_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'demo_data')
 
@@ -6943,6 +7114,12 @@ def custom_upload():
                             saved_files.append(safe_name)
                     else:
                         saved_files.append(safe_name)
+
+            # Download any large files uploaded via GCS
+            gcs_json = request.form.get(f'gcs_files_{idx}', '').strip()
+            if gcs_json:
+                gcs_saved = _download_gcs_files_to_dir(payor_dir, gcs_json)
+                saved_files.extend(gcs_saved)
 
             # Also check local dir
             local_dir = request.form.get(f'payor_dir_{idx}', '').strip()
@@ -8230,6 +8407,38 @@ def api_list_dir_files():
     return jsonify({'files': files})
 
 
+@app.route('/api/upload-urls', methods=['POST'])
+def api_upload_urls():
+    """Return resumable GCS upload session URLs for large files.
+    POST JSON: {files: [{name, size, payor_idx, content_type}]}
+    Returns JSON: {urls: [{name, payor_idx, upload_url, gcs_path}]}
+    """
+    if not storage.is_available():
+        return jsonify({'error': 'GCS not configured'}), 503
+    data = request.get_json(silent=True) or {}
+    files = data.get('files', [])
+    origin = request.headers.get('Origin', request.host_url.rstrip('/'))
+    batch_id = str(uuid.uuid4())
+    urls = []
+    for f in files:
+        fname = f.get('name', 'file')
+        payor_idx = f.get('payor_idx', 0)
+        ct = f.get('content_type', 'application/octet-stream')
+        gcs_path = f"tmp_uploads/{batch_id}/{payor_idx}/{fname}"
+        try:
+            session_info = storage.create_upload_session(gcs_path, content_type=ct, origin=origin)
+            urls.append({
+                'name': fname,
+                'payor_idx': payor_idx,
+                'upload_url': session_info['upload_url'],
+                'gcs_path': session_info['gcs_path'],
+            })
+        except Exception as e:
+            log.error("create_upload_session failed for %s: %s", fname, e)
+            return jsonify({'error': f'Failed to create upload session for {fname}: {e}'}), 500
+    return jsonify({'urls': urls})
+
+
 @app.route('/api/extract-dates', methods=['POST'])
 def api_extract_dates():
     """Extract statement dates from filenames and file contents.
@@ -8551,6 +8760,11 @@ def edit_deal_post(slug):
                         zf.extractall(payor_dir)
                 else:
                     f.save(os.path.join(payor_dir, f.filename))
+
+            # Download any large files uploaded via GCS
+            gcs_json = request.form.get(f'gcs_files_{idx}', '').strip()
+            if gcs_json:
+                _download_gcs_files_to_dir(payor_dir, gcs_json)
 
             payor_configs.append(PayorConfig(
                 code=code.strip(),
@@ -9319,19 +9533,38 @@ def ingest_upload():
     _ingest_session, sid = _get_ingest_session()
     _ingest_session.clear()
 
+    # Check for GCS-uploaded file first
+    gcs_file_path = request.form.get('gcs_file_path', '').strip()
+    gcs_file_name = request.form.get('gcs_file_name', '').strip()
+
     f = request.files.get('statement_file')
-    if not f or not f.filename:
+
+    if gcs_file_path and gcs_file_name:
+        # File was uploaded directly to GCS — download it locally
+        filename = gcs_file_name
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in ('.xlsx', '.xls', '.xlsb', '.csv'):
+            flash('Unsupported file type. Please upload XLSX, XLS, XLSB, or CSV.', 'error')
+            return redirect(url_for('upload_page'))
+        filepath = os.path.join(INGEST_TEMP, filename)
+        try:
+            storage.download_to_file(gcs_file_path, filepath)
+            storage.delete_blob(gcs_file_path)
+        except Exception as e:
+            log.error("GCS download failed for ingest: %s", e)
+            flash(f'Failed to download file from storage: {e}', 'error')
+            return redirect(url_for('upload_page'))
+    elif f and f.filename:
+        filename = f.filename
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in ('.xlsx', '.xls', '.xlsb', '.csv'):
+            flash('Unsupported file type. Please upload XLSX, XLS, XLSB, or CSV.', 'error')
+            return redirect(url_for('upload_page'))
+        filepath = os.path.join(INGEST_TEMP, filename)
+        f.save(filepath)
+    else:
         flash('Please select a file to upload.', 'error')
         return redirect(url_for('upload_page'))
-
-    filename = f.filename
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in ('.xlsx', '.xls', '.xlsb', '.csv'):
-        flash('Unsupported file type. Please upload XLSX, XLS, XLSB, or CSV.', 'error')
-        return redirect(url_for('upload_page'))
-
-    filepath = os.path.join(INGEST_TEMP, filename)
-    f.save(filepath)
 
     # Detect headers
     detection = mapper.detect_headers(filepath)

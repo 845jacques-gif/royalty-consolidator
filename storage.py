@@ -184,6 +184,34 @@ def delete_blob(gcs_path: str) -> bool:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def create_upload_session(gcs_path: str, content_type: str = 'application/octet-stream',
+                          origin: str = '') -> dict:
+    """Create a resumable upload session URL for direct browser-to-GCS upload.
+    Returns {upload_url, gcs_path}."""
+    if _bucket is None:
+        raise RuntimeError("GCS not initialised")
+    blob = _bucket.blob(gcs_path)
+    url = blob.create_resumable_upload_session(content_type=content_type, origin=origin)
+    return {'upload_url': url, 'gcs_path': gcs_path}
+
+
+def blob_exists(gcs_path: str) -> bool:
+    """Quick existence check for a GCS blob."""
+    if _bucket is None:
+        return False
+    return _bucket.blob(gcs_path).exists()
+
+
+def download_to_file(gcs_path: str, local_path: str) -> str:
+    """Download a GCS object to a specific local file path. Returns local path."""
+    if _bucket is None:
+        raise RuntimeError("GCS not initialised")
+    blob = _bucket.blob(gcs_path)
+    blob.download_to_filename(local_path)
+    log.info("GCS download: %s -> %s", gcs_path, local_path)
+    return local_path
+
+
 def _guess_content_type(filename: str) -> str:
     """Guess content type from file extension."""
     ext = os.path.splitext(filename)[1].lower()

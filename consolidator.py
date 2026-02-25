@@ -474,7 +474,7 @@ def _validate_column_detection(df: pd.DataFrame, mapping: dict, n_sample: int = 
         # Check numeric fields actually contain numbers
         if field_name in numeric_fields:
             try:
-                numeric_vals = pd.to_numeric(col_data.str.replace(',', ''), errors='coerce')
+                numeric_vals = pd.to_numeric(col_data.str.replace(r'[$€£¥,]', '', regex=True), errors='coerce')
                 non_null = numeric_vals.notna().sum()
                 if non_null / len(col_data) < 0.5 and len(col_data) >= 3:
                     warnings.append(
@@ -822,7 +822,7 @@ def parse_file_universal(filepath, filename, fmt='auto', fallback_period=None):
             col = df[col_map[field]]
             # Strip currency symbols and thousands separators before converting
             if not pd.api.types.is_numeric_dtype(col):
-                col = col.astype(str).str.replace(r'[$€£,]', '', regex=True).str.strip()
+                col = col.astype(str).str.replace(r'[$€£¥,]', '', regex=True).str.strip()
             return pd.to_numeric(col, errors='coerce').fillna(0)
         return pd.Series([0.0] * n)
 
@@ -937,7 +937,7 @@ def parse_file_with_mapping(filepath, filename, column_mapping, remove_top=0,
         if field in canonical_to_src:
             col = df[canonical_to_src[field]]
             if not pd.api.types.is_numeric_dtype(col):
-                col = col.astype(str).str.replace(r'[$€£,]', '', regex=True).str.strip()
+                col = col.astype(str).str.replace(r'[$€£¥,]', '', regex=True).str.strip()
             return pd.to_numeric(col, errors='coerce').fillna(0)
         return pd.Series([0.0] * n)
 

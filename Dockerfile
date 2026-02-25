@@ -19,4 +19,4 @@ RUN mkdir -p /app/deals /app/demo_data
 EXPOSE 8080
 
 # Run with gunicorn — uses $PORT from Cloud Run, falls back to 8080
-CMD gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 2 --threads 4 --timeout 900 app:app
+CMD gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 1 --threads 8 --timeout 900 app:app

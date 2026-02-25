@@ -544,7 +544,7 @@ def apply_mapping(filepath: str, mapping: Dict[str, str], header_row: int,
     # Coerce numeric fields (including percent fields)
     for c in NUMERIC_FIELDS | PERCENT_NUMERIC_FIELDS:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0)
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(r'[$€£¥,]', '', regex=True), errors='coerce').fillna(0)
 
     # Coerce period
     if 'period' in df.columns:
