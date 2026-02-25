@@ -19,14 +19,18 @@ from datetime import datetime
 # Logging setup
 # ---------------------------------------------------------------------------
 _log_dir = os.path.dirname(os.path.abspath(__file__))
+_log_handlers = [logging.StreamHandler()]
+# Only add file handler when filesystem is writable (local dev, not Cloud Run)
+if not os.getenv('DB_HOST'):
+    try:
+        _log_handlers.append(logging.FileHandler(os.path.join(_log_dir, 'app.log'), encoding='utf-8'))
+    except OSError:
+        pass
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(os.path.join(_log_dir, 'app.log'), encoding='utf-8'),
-    ],
+    handlers=_log_handlers,
 )
 log = logging.getLogger('royalty')
 

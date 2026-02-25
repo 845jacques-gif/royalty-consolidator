@@ -65,24 +65,39 @@ def _db_path():
 
 
 _sqlite_available = False
+_sqlite_init_attempted = False
 
 
 def _get_conn():
     if not _sqlite_available:
+        # Lazy init on first access (only in local dev, never in production)
+        _ensure_sqlite()
+    if not _sqlite_available:
         raise RuntimeError("SQLite not available")
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL')
     return conn
+
+
+def _ensure_sqlite():
+    """Lazy-init SQLite on first access. Skips entirely when DB_HOST is set (production)."""
+    global _sqlite_init_attempted
+    if _sqlite_init_attempted:
+        return
+    _sqlite_init_attempted = True
+    init_db()
 
 
 def init_db():
     """Create tables if they don't exist. Returns True on success."""
     global _sqlite_available
+    # In production (DB_HOST set), PostgreSQL is the backend — skip SQLite entirely
+    if os.getenv('DB_HOST'):
+        _sqlite_available = False
+        return False
     try:
         conn = sqlite3.connect(_db_path())
         conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA journal_mode=WAL')
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS fingerprints (
                 fingerprint TEXT PRIMARY KEY,
@@ -113,13 +128,9 @@ def init_db():
         conn.close()
         _sqlite_available = True
     except Exception as e:
-        import logging
         logging.getLogger('royalty').warning("SQLite unavailable (read-only filesystem?): %s", e)
         _sqlite_available = False
     return _sqlite_available
-
-
-init_db()
 
 
 # ---------------------------------------------------------------------------
