@@ -1136,6 +1136,26 @@ def _file_hash(filepath: str) -> str:
     return h.hexdigest()
 
 
+def _parse_single_file(filepath, filename, config_fmt, column_mappings, fallback_period):
+    """Parse a single file — designed to run in a thread pool."""
+    if column_mappings and filename in column_mappings:
+        cm = column_mappings[filename]
+        df, file_currency = parse_file_with_mapping(
+            filepath, filename,
+            column_mapping=cm.get('mapping', {}),
+            remove_top=cm.get('remove_top', 0),
+            remove_bottom=cm.get('remove_bottom', 0),
+            header_row=cm.get('header_row'),
+            sheet=cm.get('sheet'),
+            keep_columns=cm.get('keep_columns'),
+            fallback_period=fallback_period,
+        )
+    else:
+        df, file_currency = parse_file_universal(filepath, filename, fmt=config_fmt,
+                                                  fallback_period=fallback_period)
+    return df, file_currency
+
+
 def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, str]] = None,
                           column_mappings: Optional[Dict[str, dict]] = None) -> Optional[PayorResult]:
     """Load and aggregate all statement files for one payor.
@@ -1145,12 +1165,11 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     column_mappings: optional {filename: {mapping_dict, remove_top, remove_bottom, header_row, sheet, keep_columns}}
                      When provided for a file, uses parse_file_with_mapping() instead of parse_file_universal().
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     log.info("[%s] Loading %s from: %s", config.code, config.name, config.statements_dir)
 
-    chunks = []
-    detail_chunks = []
+    raw_dfs = []       # collect raw DataFrames — aggregate once at the end
     meta_chunks = []
-    dist_chunks = []
     file_count = 0
     currencies_seen = set()
     file_inventory = []
@@ -1159,6 +1178,8 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
 
     SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.xlsb', '.pdf')
 
+    # ---- Phase 1: Discover files and deduplicate ----
+    file_tasks = []  # (filepath, filename, rel_folder, path_period, path_source, fallback_period)
     for root, dirs, files in os.walk(config.statements_dir):
         for f in sorted(files):
             if f.startswith('~$'):
@@ -1201,7 +1222,6 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             # Check file_dates for a fallback period
             fallback_period = None
             if file_dates and f in file_dates:
-                # Parse MM/DD/YY into YYYYMM
                 try:
                     date_str = file_dates[f]
                     parts = date_str.split('/')
@@ -1212,198 +1232,170 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 except (ValueError, IndexError):
                     pass
 
-            # Use explicit mapping if provided, else auto-detect
-            if column_mappings and f in column_mappings:
-                cm = column_mappings[f]
-                df, file_currency = parse_file_with_mapping(
-                    filepath, f,
-                    column_mapping=cm.get('mapping', {}),
-                    remove_top=cm.get('remove_top', 0),
-                    remove_bottom=cm.get('remove_bottom', 0),
-                    header_row=cm.get('header_row'),
-                    sheet=cm.get('sheet'),
-                    keep_columns=cm.get('keep_columns'),
-                    fallback_period=fallback_period,
-                )
-            else:
-                df, file_currency = parse_file_universal(filepath, f, fmt=config.fmt,
-                                                         fallback_period=fallback_period)
+            file_tasks.append((filepath, f, rel_folder, path_period, path_source, fallback_period))
 
-            if df is None:
-                file_inventory.append({
-                    'filename': f,
-                    'folder': rel_folder,
-                    'period': path_period,
-                    'period_source': path_source or 'none',
-                    'rows': 0,
-                    'status': 'skipped',
-                    'gross': 0,
-                })
-                log.warning("Could not parse %s, skipping", f)
-                continue
+    # ---- Phase 2: Parse files in parallel threads ----
+    n_workers = min(len(file_tasks), 8) if file_tasks else 1
+    parsed_results = [None] * len(file_tasks)
 
-            if file_currency and file_currency != 'Unknown':
-                currencies_seen.add(file_currency)
+    def _do_parse(idx):
+        fp, fn, _rf, _pp, _ps, fbp = file_tasks[idx]
+        df, fc = _parse_single_file(fp, fn, config.fmt, column_mappings, fbp)
+        return idx, df, fc
 
-            # Store original gross for FX Original column (identical — no ingestion-time conversion)
-            df['gross_original'] = df['gross'].copy()
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_do_parse, i): i for i in range(len(file_tasks))}
+        for future in as_completed(futures):
+            try:
+                idx, df, fc = future.result()
+                parsed_results[idx] = (df, fc)
+            except Exception as e:
+                idx = futures[future]
+                log.error("  Failed to parse %s: %s", file_tasks[idx][1], e)
+                parsed_results[idx] = (None, None)
 
-            # Auto-detect source currency if user chose "auto"
-            if config.source_currency == 'auto' and file_currency and file_currency != 'Unknown':
-                config.source_currency = file_currency
+    # ---- Phase 3: Process parsed results sequentially (order-dependent logic) ----
+    for i, (filepath, f, rel_folder, path_period, path_source, fallback_period) in enumerate(file_tasks):
+        df, file_currency = parsed_results[i]
 
-            # Auto-detect fee from data when fee is 0 and both gross & net exist
-            if not fee_detected and config.fee == 0 and df['gross'].abs().sum() > 0 and df['net'].abs().sum() > 0:
-                total_g = df['gross'].abs().sum()
-                total_n = df['net'].abs().sum()
-                config.fee = round((total_g - total_n) / total_g, 4)
-                fee_detected = True
-
-            # Fallback: if net is all zeros but gross has data, derive net from fee
-            if df['net'].abs().sum() == 0 and df['gross'].abs().sum() > 0 and config.fee > 0:
-                df['net'] = df['gross'] * (1 - config.fee)
-                df['fees'] = df['gross'] * config.fee
-
-            # Reverse: if gross is all zeros but net has data, derive gross from fee
-            if df['gross'].abs().sum() == 0 and df['net'].abs().sum() > 0:
-                if config.fee > 0:
-                    df['gross'] = df['net'] / (1 - config.fee)
-                    df['fees'] = df['gross'] - df['net']
-                else:
-                    df['gross'] = df['net']
-
-            # Drop rows with missing ISRC
-            df['identifier'] = df['identifier'].astype(str).str.strip()
-            df = df[df['identifier'].ne('') & df['identifier'].ne('nan') & df['identifier'].notna()]
-
-            # Determine actual periods found in the parsed data
-            data_periods = sorted(df['period'].unique().tolist()) if len(df) > 0 else []
-            file_gross = float(df['gross'].sum()) if len(df) > 0 else 0
-
+        if df is None:
             file_inventory.append({
                 'filename': f,
                 'folder': rel_folder,
-                'period': data_periods[0] if len(data_periods) == 1 else path_period,
-                'periods': [int(p) for p in data_periods],
-                'period_source': 'data' if data_periods else (path_source or 'none'),
-                'rows': len(df),
-                'status': 'ok',
-                'gross': round(file_gross, 2),
+                'period': path_period,
+                'period_source': path_source or 'none',
+                'rows': 0,
+                'status': 'skipped',
+                'gross': 0,
             })
+            log.warning("Could not parse %s, skipping", f)
+            continue
 
-            log.info("  %s (%s rows)", f, f"{len(df):,}")
+        if file_currency and file_currency != 'Unknown':
+            currencies_seen.add(file_currency)
 
-            # Ensure new columns exist with defaults
-            for col in ['iswc', 'upc', 'other_identifier', 'country', 'release_date']:
-                if col not in df.columns:
-                    df[col] = ''
-            for col in ['fees', 'gross_original']:
-                if col not in df.columns:
-                    df[col] = 0.0
+        # Store original gross for FX Original column (identical — no ingestion-time conversion)
+        df['gross_original'] = df['gross'].copy()
 
-            # Metadata per ISRC (first occurrence)
-            meta = (
-                df.groupby('identifier')
-                .agg({'title': 'first', 'artist': 'first', 'product_title': 'first',
-                      'iswc': 'first', 'upc': 'first', 'release_date': 'first'})
-                .reset_index()
-            )
-            meta_chunks.append(meta)
+        # Auto-detect source currency if user chose "auto"
+        if config.source_currency == 'auto' and file_currency and file_currency != 'Unknown':
+            config.source_currency = file_currency
 
-            # ISRC + period aggregate
-            agg = (
-                df.groupby(['identifier', 'period'])
-                .agg({'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
-                      'gross_original': 'sum'})
-                .reset_index()
-            )
-            chunks.append(agg)
+        # Auto-detect fee from data when fee is 0 and both gross & net exist
+        if not fee_detected and config.fee == 0 and df['gross'].abs().sum() > 0 and df['net'].abs().sum() > 0:
+            total_g = df['gross'].abs().sum()
+            total_n = df['net'].abs().sum()
+            config.fee = round((total_g - total_n) / total_g, 4)
+            fee_detected = True
 
-            # Identify KEEP columns for passthrough
-            keep_cols = [c for c in df.columns if c.startswith('KEEP_')]
+        # Fallback: if net is all zeros but gross has data, derive net from fee
+        if df['net'].abs().sum() == 0 and df['gross'].abs().sum() > 0 and config.fee > 0:
+            df['net'] = df['gross'] * (1 - config.fee)
+            df['fees'] = df['gross'] * config.fee
 
-            # Detail: ISRC + period + store + media_type + country
-            detail_agg_dict = {
-                'title': 'first', 'artist': 'first', 'product_title': 'first',
-                'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
-                'release_date': 'first',
-                'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
-                'gross_original': 'sum',
-            }
-            for kc in keep_cols:
-                detail_agg_dict[kc] = 'first'
+        # Reverse: if gross is all zeros but net has data, derive gross from fee
+        if df['gross'].abs().sum() == 0 and df['net'].abs().sum() > 0:
+            if config.fee > 0:
+                df['gross'] = df['net'] / (1 - config.fee)
+                df['fees'] = df['gross'] - df['net']
+            else:
+                df['gross'] = df['net']
 
-            detail_agg = (
-                df.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
-                .agg(detail_agg_dict)
-                .reset_index()
-            )
-            detail_chunks.append(detail_agg)
+        # Drop rows with missing ISRC
+        df['identifier'] = df['identifier'].astype(str).str.strip()
+        df = df[df['identifier'].ne('') & df['identifier'].ne('nan') & df['identifier'].notna()]
 
-            # Store aggregate
-            dist_agg = (
-                df.groupby(['store', 'period'])
-                .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
-                .reset_index()
-            )
-            dist_chunks.append(dist_agg)
+        # Determine actual periods found in the parsed data
+        data_periods = sorted(df['period'].unique().tolist()) if len(df) > 0 else []
+        file_gross = float(df['gross'].sum()) if len(df) > 0 else 0
 
-            file_count += 1
-            del df
+        file_inventory.append({
+            'filename': f,
+            'folder': rel_folder,
+            'period': data_periods[0] if len(data_periods) == 1 else path_period,
+            'periods': [int(p) for p in data_periods],
+            'period_source': 'data' if data_periods else (path_source or 'none'),
+            'rows': len(df),
+            'status': 'ok',
+            'gross': round(file_gross, 2),
+        })
 
-    if not chunks:
+        log.info("  %s (%s rows)", f, f"{len(df):,}")
+
+        # Ensure new columns exist with defaults
+        for col in ['iswc', 'upc', 'other_identifier', 'country', 'release_date']:
+            if col not in df.columns:
+                df[col] = ''
+        for col in ['fees', 'gross_original']:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        # Metadata per ISRC (first occurrence)
+        meta = (
+            df.groupby('identifier')
+            .agg({'title': 'first', 'artist': 'first', 'product_title': 'first',
+                  'iswc': 'first', 'upc': 'first', 'release_date': 'first'})
+            .reset_index()
+        )
+        meta_chunks.append(meta)
+
+        # Collect raw df for bulk aggregation (skip per-file groupby)
+        raw_dfs.append(df)
+        file_count += 1
+
+    if not raw_dfs:
         log.warning("No files found for %s", config.name)
         return None
 
-    log.info("Aggregating %d files...", file_count)
+    log.info("Aggregating %d files (%s total rows)...", file_count,
+             f"{sum(len(d) for d in raw_dfs):,}")
 
-    # Combine and re-aggregate across files
-    monthly = pd.concat(chunks, ignore_index=True)
-    del chunks
+    # Combine all raw DataFrames and aggregate once (instead of per-file + re-agg)
+    combined = pd.concat(raw_dfs, ignore_index=True)
+    del raw_dfs
+
+    # Monthly: ISRC + period
     monthly = (
-        monthly.groupby(['identifier', 'period'])
+        combined.groupby(['identifier', 'period'])
         .agg({'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
               'gross_original': 'sum'})
         .reset_index()
     )
     monthly['statement_date'] = monthly['period'].apply(period_to_end_of_month)
 
-    detail = pd.concat(detail_chunks, ignore_index=True)
-    del detail_chunks
-
-    # Build detail re-aggregation dict
-    detail_reagg = {
+    # Detail: ISRC + period + store + media_type + country
+    keep_cols = [c for c in combined.columns if c.startswith('KEEP_')]
+    detail_agg_dict = {
         'title': 'first', 'artist': 'first', 'product_title': 'first',
         'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
         'release_date': 'first',
         'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
         'gross_original': 'sum',
     }
-    for kc in [c for c in detail.columns if c.startswith('KEEP_')]:
-        detail_reagg[kc] = 'first'
+    for kc in keep_cols:
+        detail_agg_dict[kc] = 'first'
 
     detail = (
-        detail.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
-        .agg(detail_reagg)
+        combined.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
+        .agg(detail_agg_dict)
         .reset_index()
     )
     detail['statement_date'] = detail['period'].apply(period_to_end_of_month)
 
-    all_meta = pd.concat(meta_chunks, ignore_index=True)
-    del meta_chunks
-    isrc_meta = all_meta.drop_duplicates('identifier', keep='first').reset_index(drop=True)
-    del all_meta
-
-    dist_all = pd.concat(dist_chunks, ignore_index=True)
-    del dist_chunks
+    # Store aggregate
     by_store = (
-        dist_all.groupby('store')
+        combined.groupby('store')
         .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
         .reset_index()
         .sort_values('gross', ascending=False)
     )
     by_store.columns = ['Store', 'Total Gross', 'Total Net', 'Total Sales']
-    del dist_all
+    del combined
+
+    all_meta = pd.concat(meta_chunks, ignore_index=True)
+    del meta_chunks
+    isrc_meta = all_meta.drop_duplicates('identifier', keep='first').reset_index(drop=True)
+    del all_meta
 
     # Pivot: rows=ISRC, cols=period, vals=gross
     pivot_gross = monthly.pivot_table(

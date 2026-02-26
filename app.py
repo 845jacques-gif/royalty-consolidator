@@ -3077,9 +3077,11 @@ function _submitViaFetch() {
     btn.disabled = true;
 
     // Partition files into small (multipart) and large (GCS)
+    const MAX_MULTIPART = 25 * 1024 * 1024;  // 25 MB total multipart limit
     const smallFiles = {};   // inputName -> File[]
     const largeFiles = [];   // [{file, inputName, payorIdx}]
     const fileInputs = form.querySelectorAll('input[type=file][name^="payor_files_"]');
+    let totalSmallSize = 0;
     fileInputs.forEach(inp => {
         const dzList = _dzFiles[inp.name];
         const files = (dzList && dzList.length) ? dzList : Array.from(inp.files);
@@ -3090,9 +3092,20 @@ function _submitViaFetch() {
                 largeFiles.push({file: f, inputName: inp.name, payorIdx: parseInt(idx)});
             } else {
                 smallFiles[inp.name].push(f);
+                totalSmallSize += f.size;
             }
         }
     });
+    // If total small files exceed multipart limit, route ALL through GCS
+    if (_gcsAvailable && totalSmallSize > MAX_MULTIPART) {
+        for (const [inputName, files] of Object.entries(smallFiles)) {
+            const idx = inputName.replace('payor_files_', '');
+            for (const f of files) {
+                largeFiles.push({file: f, inputName, payorIdx: parseInt(idx)});
+            }
+            smallFiles[inputName] = [];
+        }
+    }
 
     // If there are large files, upload them to GCS first
     const gcsPromise = largeFiles.length > 0
