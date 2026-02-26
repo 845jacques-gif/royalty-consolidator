@@ -1174,7 +1174,8 @@ def _parse_single_file(filepath, filename, config_fmt, column_mappings, fallback
 
 
 def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, str]] = None,
-                          column_mappings: Optional[Dict[str, dict]] = None) -> Optional[PayorResult]:
+                          column_mappings: Optional[Dict[str, dict]] = None,
+                          progress_cb=None) -> Optional[PayorResult]:
     """Load and aggregate all statement files for one payor.
 
     file_dates: optional {filename: "MM/DD/YY"} from the date extraction modal,
@@ -1397,6 +1398,12 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             detail_chunks.append(detail_chunk)
             file_count += 1
 
+            if progress_cb:
+                try:
+                    progress_cb(file_count, f)
+                except Exception:
+                    pass
+
         # Force gc after each batch to reclaim freed raw DataFrames
         del parsed_batch
         gc.collect()
@@ -1498,20 +1505,23 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
 
 
 def load_all_payors(configs: List[PayorConfig], file_dates: Optional[Dict[str, str]] = None,
-                    column_mappings_by_payor: Optional[Dict[str, Dict[str, dict]]] = None) -> Dict[str, PayorResult]:
+                    column_mappings_by_payor: Optional[Dict[str, Dict[str, dict]]] = None,
+                    progress_cb=None) -> Dict[str, PayorResult]:
     """Load statements for all payors (parallel when multiple payors).
 
     file_dates: optional {filename: "MM/DD/YY"} from the date extraction modal,
                 used as fallback when auto-detection fails.
     column_mappings_by_payor: optional {payor_code: {filename: mapping_info}}
                               Phase 2 explicit column mappings per payor.
+    progress_cb: optional callback(files_done, current_filename) for UI progress.
     """
     if len(configs) <= 1:
         # Single payor — no need for threading overhead
         results = {}
         for cfg in configs:
             cm = column_mappings_by_payor.get(cfg.code) if column_mappings_by_payor else None
-            result = load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm)
+            result = load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm,
+                                           progress_cb=progress_cb)
             if result is not None:
                 results[cfg.code] = result
     else:
@@ -1520,7 +1530,8 @@ def load_all_payors(configs: List[PayorConfig], file_dates: Optional[Dict[str, s
 
         def _load_one(cfg):
             cm = column_mappings_by_payor.get(cfg.code) if column_mappings_by_payor else None
-            return cfg.code, load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm)
+            return cfg.code, load_payor_statements(cfg, file_dates=file_dates, column_mappings=cm,
+                                                   progress_cb=progress_cb)
 
         results = {}
         with ThreadPoolExecutor(max_workers=min(len(configs), 4)) as pool:

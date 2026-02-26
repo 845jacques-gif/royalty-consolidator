@@ -7719,7 +7719,20 @@ def custom_process():
             return _render_processing_page(sid)
 
         # Start background processing
-        sess['_cp_status'] = {'running': True, 'done': False, 'error': None, 'progress': 'Starting...'}
+        # Count total files across all payors for ETA
+        import time as _time
+        total_files = 0
+        for p in sess.get('payors', []):
+            pdir = p.get('payor_dir', p.get('local_dir', ''))
+            if os.path.isdir(pdir):
+                for _r, _d, _f in os.walk(pdir):
+                    total_files += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in ('.csv', '.xlsx', '.xls', '.xlsb', '.pdf'))
+
+        sess['_cp_status'] = {
+            'running': True, 'done': False, 'error': None,
+            'progress': 'Starting...', 'started_at': _time.time(),
+            'total_files': total_files, 'files_done': 0,
+        }
 
         def _bg_process():
             try:
@@ -7748,47 +7761,93 @@ def custom_process():
 def custom_process_status():
     """Poll endpoint for custom_process background status."""
     try:
+        import time as _time
         sess, sid = _get_custom_session()
         cp = sess.get('_cp_status', {})
+        files_done = cp.get('files_done', 0)
+        total_files = cp.get('total_files', 0)
+        started_at = cp.get('started_at', 0)
+        elapsed = _time.time() - started_at if started_at else 0
+
+        # ETA calculation
+        eta_seconds = None
+        if files_done > 0 and total_files > files_done and elapsed > 0:
+            per_file = elapsed / files_done
+            eta_seconds = int(per_file * (total_files - files_done))
+
         return jsonify({
             'running': cp.get('running', False),
             'done': cp.get('done', False),
             'error': cp.get('error'),
             'progress': cp.get('progress', ''),
+            'files_done': files_done,
+            'total_files': total_files,
+            'elapsed': int(elapsed),
+            'eta_seconds': eta_seconds,
         })
     except Exception:
         return jsonify({'running': False, 'done': False, 'error': 'No session'})
 
 
 def _render_processing_page(sid):
-    """Return a simple loading page that polls process-status."""
+    """Return a simple loading page that polls process-status with progress bar and ETA."""
     html = """<!DOCTYPE html>
 <html><head><title>Processing...</title>
 <style>
   body { background:#0f1117; color:#e4e4e7; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; display:flex; justify-content:center; align-items:center; min-height:100vh; margin:0; }
-  .box { text-align:center; }
+  .box { text-align:center; width:400px; }
   .spinner { width:40px; height:40px; border:3px solid #27272a; border-top-color:#6366f1; border-radius:50%; animation:spin 0.8s linear infinite; margin:0 auto 20px; }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .msg { font-size:16px; color:#a1a1aa; }
+  .msg { font-size:16px; color:#e4e4e7; font-weight:500; }
   .progress { font-size:13px; color:#6366f1; margin-top:8px; }
+  .bar-wrap { background:#27272a; border-radius:6px; height:8px; margin-top:16px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:6px; background:linear-gradient(90deg,#6366f1,#8b5cf6); transition:width 0.5s ease; width:0%; }
+  .stats { display:flex; justify-content:space-between; margin-top:8px; font-size:12px; color:#71717a; }
+  .eta { font-size:14px; color:#a1a1aa; margin-top:12px; }
 </style></head><body>
 <div class="box">
   <div class="spinner"></div>
   <div class="msg">Processing statements...</div>
   <div class="progress" id="prog">Starting...</div>
+  <div class="bar-wrap"><div class="bar-fill" id="bar"></div></div>
+  <div class="stats"><span id="counter"></span><span id="elapsed"></span></div>
+  <div class="eta" id="eta"></div>
 </div>
 <script>
+function fmtTime(s) {
+  if (!s || s < 0) return '';
+  if (s < 60) return s + 's';
+  var m = Math.floor(s/60), sec = s%60;
+  return m + 'm ' + (sec < 10 ? '0' : '') + sec + 's';
+}
 (function poll() {
   fetch('/api/custom/process-status')
     .then(r => r.json())
     .then(d => {
       document.getElementById('prog').textContent = d.progress || '';
+      var pct = 0;
+      if (d.total_files > 0) {
+        pct = Math.min(100, Math.round(d.files_done / d.total_files * 100));
+        document.getElementById('counter').textContent = d.files_done + ' / ' + d.total_files + ' files';
+      }
+      document.getElementById('bar').style.width = pct + '%';
+      if (d.elapsed > 0) document.getElementById('elapsed').textContent = fmtTime(d.elapsed) + ' elapsed';
+      if (d.eta_seconds != null) {
+        document.getElementById('eta').textContent = '~' + fmtTime(d.eta_seconds) + ' remaining';
+      } else if (d.files_done === 0 && d.running) {
+        document.getElementById('eta').textContent = 'Estimating...';
+      }
       if (d.done) {
+        document.getElementById('bar').style.width = '100%';
         if (d.error) {
-          document.querySelector('.msg').textContent = 'Error: ' + d.error;
+          document.querySelector('.msg').textContent = 'Error';
+          document.getElementById('prog').textContent = d.error;
           document.querySelector('.spinner').style.display = 'none';
+          document.getElementById('eta').textContent = '';
         } else {
-          window.location.href = '/custom/validate';
+          document.querySelector('.msg').textContent = 'Done!';
+          document.getElementById('eta').textContent = 'Redirecting...';
+          setTimeout(function(){ window.location.href = '/custom/validate'; }, 500);
         }
       } else {
         setTimeout(poll, 2000);
@@ -7860,14 +7919,19 @@ def _do_custom_process_bg(sess, sid):
 
     sess['_cp_status']['progress'] = f'Processing {len(configs)} payor(s)...'
 
+    def _file_progress(files_done, current_file):
+        sess['_cp_status']['files_done'] = files_done
+        sess['_cp_status']['progress'] = f'Parsing {current_file}...'
+
     payor_results = load_all_payors(
         configs,
         file_dates=file_dates,
         column_mappings_by_payor=column_mappings_by_payor if column_mappings_by_payor else None,
+        progress_cb=_file_progress,
     )
     sess['payor_results_keys'] = list(payor_results.keys())
 
-    sess['_cp_status']['progress'] = 'Storing results...'
+    sess['_cp_status']['progress'] = 'Computing analytics & storing results...'
 
     # Store results temporarily (in-memory for this session)
     sess_data = _ingest_sessions.get(sid, {})
