@@ -2159,7 +2159,7 @@ function syncFormulas() {
                     <span style="color:var(--text-secondary);">{{ fmt.source_label or fmt.fingerprint[:12] + '...' }}</span>
                     <span style="color:var(--text-dim);">Used {{ fmt.use_count }}x</span>
                 </div>
-                <div style="color:var(--text-dim); font-size:11px; margin-top:2px;">{{ fmt.column_names | length }} columns &middot; {{ fmt.updated_at[:10] }}</div>
+                <div style="color:var(--text-dim); font-size:11px; margin-top:2px;">{{ fmt.column_names | length }} columns &middot; {{ fmt.updated_at.strftime('%Y-%m-%d') if fmt.updated_at is not string and fmt.updated_at else (fmt.updated_at[:10] if fmt.updated_at else '') }}</div>
             </div>
             {% endfor %}
         </div>
@@ -2187,7 +2187,7 @@ function syncFormulas() {
             <td class="mono">{{ log.row_count }}</td>
             <td class="mono {% if log.qc_warnings > 0 %}text-yellow{% endif %}">{{ log.qc_warnings }}</td>
             <td class="mono {% if log.qc_errors > 0 %}text-red{% endif %}">{{ log.qc_errors }}</td>
-            <td style="color:var(--text-dim); font-size:11px;">{{ log.created_at[:16].replace('T', ' ') }}</td>
+            <td style="color:var(--text-dim); font-size:11px;">{{ log.created_at.strftime('%Y-%m-%d %H:%M') if log.created_at is not string and log.created_at else (log.created_at[:16].replace('T', ' ') if log.created_at else '') }}</td>
         </tr>
         {% endfor %}
         </tbody>
@@ -3268,7 +3268,7 @@ function _submitViaFetch() {
         <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
             <div>
                 <div style="font-size:16px; font-weight:700; color:var(--text-primary); letter-spacing:-0.01em;">{{ deal.name }}</div>
-                <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">{{ deal.timestamp[:16].replace('T', ' ') }}</div>
+                <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">{{ deal.timestamp.strftime('%Y-%m-%d %H:%M') if deal.timestamp is not string and deal.timestamp else (deal.timestamp[:16].replace('T', ' ') if deal.timestamp else '') }}</div>
             </div>
             <span style="font-size:10px; color:var(--text-muted); background:var(--bg-inset); border:1px solid var(--border); padding:2px 8px; border-radius:4px;">{{ deal.slug }}</span>
         </div>
@@ -5296,26 +5296,86 @@ document.querySelector('form[action*="/forecast"]').addEventListener('submit', f
     </div>
 </div>
 
-{# ---- ROW 3: LTM Top Songs + Per Payor Breakdown ---- #}
+{# ---- ROW 3: Top Songs + Per Payor Breakdown ---- #}
 <div id="sec-songs" class="grid grid-wide" style="margin-bottom:16px;">
     <div class="card">
-        <div class="card-header"><span class="card-title">LTM Top 20 Songs</span></div>
-        <table>
-            <thead>
-                <tr><th>#</th><th>Artist</th><th>Title</th><th>ISRC</th><th class="text-right">LTM Gross</th></tr>
-            </thead>
-            <tbody>
-            {% for song in results.ltm_songs %}
-            <tr>
-                <td><span class="rank">{{ loop.index }}</span></td>
-                <td>{{ song.artist }}</td>
-                <td style="color:var(--text-primary); font-weight:500;">{{ song.title }}</td>
-                <td class="mono" style="font-size:11px; color:var(--text-dim);">{{ song.isrc }}</td>
-                <td class="text-right mono"><span class="data-money" data-raw="{{ song.gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ song.gross }}</span></td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+            <span class="card-title">Top Songs</span>
+            <div class="pill-tabs" style="margin:0;">
+                <button class="pill-tab active" onclick="showSongTab('alltime')">All-Time</button>
+                <button class="pill-tab" onclick="showSongTab('ltm')">LTM</button>
+            </div>
+        </div>
+
+        {# -- All-Time Top 20 -- #}
+        {% set top20 = results.top_songs[:20] %}
+        <div class="song-tab-content active" id="stab-alltime">
+            <table>
+                <thead>
+                    <tr><th style="width:36px;">#</th><th>Title</th><th>Artist</th><th class="text-right">Gross</th><th class="text-right" style="width:60px;">%</th><th style="width:180px;"></th></tr>
+                </thead>
+                <tbody>
+                {% set max_pct = top20[0].get('pct_of_total', 0) if top20 else 1 %}
+                {% for song in top20 %}
+                {% set pct = song.get('pct_of_total', 0) %}
+                <tr>
+                    <td><span class="rank">{{ loop.index }}</span></td>
+                    <td style="color:var(--text-primary); font-weight:500;">{{ song.title }}</td>
+                    <td style="color:var(--text-secondary); font-size:12px;">{{ song.artist }}</td>
+                    <td class="text-right mono"><span class="data-money" data-raw="{{ song.gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ song.gross }}</span></td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--text-muted);">{{ pct }}%</td>
+                    <td>
+                        <div style="background:var(--bg-inset); border-radius:4px; height:8px; overflow:hidden;">
+                            <div style="height:100%; border-radius:4px; width:{{ (pct / max_pct * 100) | round(1) if max_pct else 0 }}%; background:linear-gradient(90deg, {% if loop.index <= 2 %}var(--yellow), #f97316{% else %}var(--accent), #818cf8{% endif %});"></div>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% if top20 %}
+            {% set total_pct = namespace(v=0) %}
+            {% for s in top20 %}{% set total_pct.v = total_pct.v + s.get('pct_of_total', 0) %}{% endfor %}
+            <div style="padding:8px 16px; font-size:11px; color:var(--text-dim); text-align:right; border-top:1px solid var(--border);">
+                Top {{ top20 | length }} = {{ '%.1f' | format(total_pct.v) }}% of catalog gross
+            </div>
+            {% endif %}
+        </div>
+
+        {# -- LTM Top 20 -- #}
+        <div class="song-tab-content" id="stab-ltm" style="display:none;">
+            <table>
+                <thead>
+                    <tr><th style="width:36px;">#</th><th>Title</th><th>Artist</th><th>ISRC</th><th class="text-right">LTM Gross</th><th class="text-right" style="width:60px;">%</th><th style="width:180px;"></th></tr>
+                </thead>
+                <tbody>
+                {% set ltm_max_pct = results.ltm_songs[0].get('pct_of_total', 0) if results.ltm_songs else 1 %}
+                {% for song in results.ltm_songs %}
+                {% set lpct = song.get('pct_of_total', 0) %}
+                <tr>
+                    <td><span class="rank">{{ loop.index }}</span></td>
+                    <td style="color:var(--text-primary); font-weight:500;">{{ song.title }}</td>
+                    <td style="color:var(--text-secondary); font-size:12px;">{{ song.artist }}</td>
+                    <td class="mono" style="font-size:11px; color:var(--text-dim);">{{ song.isrc }}</td>
+                    <td class="text-right mono"><span class="data-money" data-raw="{{ song.gross_raw }}" data-ccy="{{ results.currency_code | default('USD') }}">{{ results.currency_symbol | default('$') }}{{ song.gross }}</span></td>
+                    <td class="text-right mono" style="font-size:12px; color:var(--text-muted);">{{ lpct }}%</td>
+                    <td>
+                        <div style="background:var(--bg-inset); border-radius:4px; height:8px; overflow:hidden;">
+                            <div style="height:100%; border-radius:4px; width:{{ (lpct / ltm_max_pct * 100) | round(1) if ltm_max_pct else 0 }}%; background:linear-gradient(90deg, {% if loop.index <= 2 %}var(--yellow), #f97316{% else %}var(--accent), #818cf8{% endif %});"></div>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% if results.ltm_songs %}
+            {% set ltm_total_pct = namespace(v=0) %}
+            {% for s in results.ltm_songs %}{% set ltm_total_pct.v = ltm_total_pct.v + s.get('pct_of_total', 0) %}{% endfor %}
+            <div style="padding:8px 16px; font-size:11px; color:var(--text-dim); text-align:right; border-top:1px solid var(--border);">
+                Top {{ results.ltm_songs | length }} = {{ '%.1f' | format(ltm_total_pct.v) }}% of LTM gross
+            </div>
+            {% endif %}
+        </div>
     </div>
 
     <div id="sec-payors" class="card">
@@ -6551,6 +6611,14 @@ function pollStatus() {
 function showDashTab(name) {
     document.querySelectorAll('[id^="dtab-"]').forEach(el => el.classList.remove('active'));
     document.getElementById('dtab-' + name).classList.add('active');
+    const btn = event.target;
+    btn.parentElement.querySelectorAll('.pill-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+}
+function showSongTab(name) {
+    document.querySelectorAll('.song-tab-content').forEach(el => { el.classList.remove('active'); el.style.display = 'none'; });
+    const tab = document.getElementById('stab-' + name);
+    if (tab) { tab.classList.add('active'); tab.style.display = ''; }
     const btn = event.target;
     btn.parentElement.querySelectorAll('.pill-tab').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');

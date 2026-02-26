@@ -2130,11 +2130,11 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
         .reset_index()
         .sort_values('total_gross', ascending=False)
     )
-    # Pre-compute per-song yearly data for top 10 YoY
+    # Pre-compute per-song yearly data for top 20 YoY
     monthly['year'] = monthly['period'].astype(str).str[:4].astype(int)
-    top_10_isrcs = cross.head(10)['identifier'].tolist()
+    top_20_isrcs = cross.head(20)['identifier'].tolist()
     song_yearly = (
-        monthly[monthly['identifier'].isin(top_10_isrcs)]
+        monthly[monthly['identifier'].isin(top_20_isrcs)]
         .groupby(['identifier', 'year'])
         .agg({'gross': 'sum', 'net': 'sum'})
         .reset_index()
@@ -2142,7 +2142,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
     )
 
     top_songs = []
-    for _, row in cross.head(10).iterrows():
+    for _, row in cross.head(20).iterrows():
         isrc = str(row['identifier'])
         sy = song_yearly[song_yearly['identifier'] == isrc].sort_values('year')
         yearly = []
@@ -2162,12 +2162,15 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
                 'pct': round(pct, 1),
                 'direction': 'up' if pct >= 0 else 'down',
             })
+        pct = (float(row['total_gross']) / total_gross * 100) if total_gross > 0 else 0.0
         top_songs.append({
             'isrc': isrc,
             'artist': str(row['artist'])[:30],
             'title': str(row['title'])[:40],
             'gross': f"{row['total_gross']:,.2f}",
             'gross_raw': round(float(row['total_gross']), 2),
+            'net_raw': round(float(row.get('total_net', 0)), 2) if 'total_net' in row.index else 0.0,
+            'pct_of_total': round(pct, 1),
             'yearly': yearly,
             'yoy': song_yoy,
         })
@@ -2318,12 +2321,14 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
 
     ltm_songs = []
     for _, row in ltm_by_song.head(20).iterrows():
+        ltm_pct = (float(row['gross']) / ltm_gross_total * 100) if ltm_gross_total > 0 else 0.0
         ltm_songs.append({
             'isrc': str(row['identifier']),
             'artist': str(row['artist'])[:30],
             'title': str(row['title'])[:40],
             'gross': f"{row['gross']:,.2f}",
             'gross_raw': round(float(row['gross']), 2),
+            'pct_of_total': round(ltm_pct, 1),
         })
 
     # Add LTM gross to top_songs (hero card) and re-sort by LTM gross descending
