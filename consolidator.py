@@ -339,10 +339,12 @@ COLUMN_PATTERNS = {
     'media_type': ['download type', 'usage type', 'transaction type',
                    'content type', 'sale type', 'revenue type', 'type',
                    'media type', 'delivery type'],
-    'gross': ['gross', 'ppu total', 'revenue', 'earning gross', 'total revenue',
+    'gross': ['gross revenue account', 'gross_revenue_account', 'gross account',
+              'gross', 'ppu total', 'revenue', 'earning gross', 'total revenue',
               'gross revenue', 'amount', 'total amount',
               'earning_gross', 'price', 'retail'],
-    'net': ['net', 'royalty', 'earning net', 'earnings', 'payout', 'net revenue',
+    'net': ['net share account', 'net_share_account', 'net account',
+            'net', 'royalty', 'earning net', 'earnings', 'payout', 'net revenue',
             'your share', 'payable', 'earning_net', 'net amount', 'royalties'],
     'fees': ['fee', 'commission', 'distribution fee', 'service fee', 'deduction'],
     'period': ['period', 'reporting period', 'statement period', 'statement date',
@@ -393,9 +395,12 @@ def _fuzzy_match_columns(df_columns):
 
     # Disqualifiers: prevent cross-matching ambiguous terms like "earnings"
     # e.g. "Net Earnings" should not match gross, "Gross Revenue" should not match net
+    # Also: prefer "account currency" columns over "sale currency" columns (FUGA/Harbour)
+    has_account_gross = any('account' in low and 'gross' in low for low in lower_cols.values())
+    has_account_net = any('account' in low and 'net' in low for low in lower_cols.values())
     field_disqualifiers = {
-        'gross': ('net',),
-        'net': ('gross',),
+        'gross': ('net',) + (('sale',) if has_account_gross else ()),
+        'net': ('gross',) + (('sale',) if has_account_net else ()),
     }
 
     for field, patterns in COLUMN_PATTERNS.items():
