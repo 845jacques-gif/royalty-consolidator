@@ -1282,6 +1282,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     # ---- Phase 3: Process parsed results sequentially (order-dependent logic) ----
     for i, (filepath, f, rel_folder, path_period, path_source, fallback_period) in enumerate(file_tasks):
         df, file_currency = parsed_results[i]
+        parsed_results[i] = None  # free memory as we go
 
         if df is None:
             file_inventory.append({
@@ -1388,6 +1389,10 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         del df  # free raw rows immediately
         detail_chunks.append(detail_chunk)
         file_count += 1
+
+        # Force garbage collection every 20 files to keep memory in check
+        if file_count % 20 == 0:
+            import gc; gc.collect()
 
     _t_agg = _time.time()
     log.info("[%s] Phase 3 (process + pre-agg): %d files in %.1fs", config.code, file_count, _t_agg - _t_process)
