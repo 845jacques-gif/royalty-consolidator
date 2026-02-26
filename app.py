@@ -6619,13 +6619,20 @@ function pollStatus() {
                 if (data.progress) {
                     document.getElementById('loadingText').textContent = data.progress;
                 }
-                if (data.done) {
-                    clearInterval(interval);
-                    window.location.href = '/?loaded=1';
-                }
                 if (data.error) {
                     clearInterval(interval);
-                    window.location.href = '/';
+                    // Show error to user with retry option
+                    const overlay = document.getElementById('loadingOverlay');
+                    overlay.innerHTML = '<div style="text-align:center;max-width:600px;padding:2rem;">' +
+                        '<div style="font-size:2rem;margin-bottom:1rem;">&#9888;</div>' +
+                        '<div style="font-size:1.1rem;font-weight:600;margin-bottom:0.5rem;color:#dc3545;">Processing Failed</div>' +
+                        '<div style="color:#666;margin-bottom:1.5rem;white-space:pre-wrap;">' + data.error + '</div>' +
+                        '<a href="/" class="btn" style="margin-right:0.5rem;">Dashboard</a>' +
+                        '<a href="/upload" class="btn btn-primary">Try Again</a>' +
+                        '</div>';
+                } else if (data.done) {
+                    clearInterval(interval);
+                    window.location.href = '/?loaded=1';
                 }
             })
             .catch(() => {});
@@ -8468,53 +8475,22 @@ def custom_finalize():
                     pr.detail = apply_enrichment_to_raw_detail(pr.detail, lookups)
 
             with _state_lock:
-                _set_processing_status(progress='Writing output files...')
+                _set_processing_status(progress='Computing analytics...')
                 _cached_results = payor_results
 
-            # Determine output dir
-            if deal_name:
-                deal_slug = re.sub(r'[^A-Za-z0-9_-]', '_', deal_name).upper()
-                deal_dir = os.path.join(DEALS_DIR, deal_slug)
-                os.makedirs(deal_dir, exist_ok=True)
-                exports_dir = os.path.join(deal_dir, 'exports')
-                os.makedirs(exports_dir, exist_ok=True)
-                xlsx_path = os.path.join(exports_dir, f'{deal_slug}_consolidated.xlsx')
-                csv_path = os.path.join(exports_dir, f'{deal_slug}_consolidated.csv')
-            else:
-                work_dir = sess.get('work_dir', CUSTOM_TEMP)
-                xlsx_path = os.path.join(work_dir, 'consolidated.xlsx')
-                csv_path = os.path.join(work_dir, 'consolidated.csv')
-                exports_dir = work_dir
-
-            per_payor_paths = {}
-            agg_by = export_options.get('aggregate_by') if export_options.get('aggregate') else None
-
-            # Write outputs based on export options
-            if export_options.get('combined_excel', True):
-                write_consolidated_excel(payor_results, xlsx_path, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
-            if export_options.get('combined_csv', True):
-                write_consolidated_csv(payor_results, csv_path, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
-            if export_options.get('per_payor_excel', False):
-                per_payor_paths = write_per_payor_exports(payor_results, exports_dir, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
-            if export_options.get('per_payor_csv', True):
-                pp_csv_dir = os.path.join(exports_dir, 'per_payor_csv')
-                pp_csv_paths = write_per_payor_csv_exports(payor_results, pp_csv_dir, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
-                per_payor_paths.update(pp_csv_paths)
-
+            # Compute analytics EARLY so dashboard has data even if file writes fail
             analytics = compute_analytics(payor_results, formulas=formulas or None,
                                           enrichment_stats=enrichment_stats)
 
             # --- Inject audit trail into analytics for dashboard rendering ---
             audit_trail = sess.get('audit_trail', {})
             if audit_trail:
-                # Compute cross-payor audit summary
                 total_files = 0
                 auto_ingested = 0
                 manually_mapped = 0
                 total_cols_mapped = 0
                 auto_accepted_cols = 0
                 user_corrected_cols = 0
-                # Build payor-name lookup from payor_results
                 payor_name_map = {pr.config.code: pr.config.name for pr in payor_results.values()}
                 per_payor_rows = []
                 for payor_code, fp_entries in audit_trail.items():
@@ -8559,42 +8535,93 @@ def custom_finalize():
                     'per_payor': per_payor_rows,
                 }
 
+            # Cache analytics immediately so dashboard is usable even if writes fail
             with _state_lock:
                 _cached_analytics = analytics
-                if export_options.get('combined_excel', True):
+
+            # Determine output dir
+            if deal_name:
+                deal_slug = re.sub(r'[^A-Za-z0-9_-]', '_', deal_name).upper()
+                deal_dir = os.path.join(DEALS_DIR, deal_slug)
+                os.makedirs(deal_dir, exist_ok=True)
+                exports_dir = os.path.join(deal_dir, 'exports')
+                os.makedirs(exports_dir, exist_ok=True)
+                xlsx_path = os.path.join(exports_dir, f'{deal_slug}_consolidated.xlsx')
+                csv_path = os.path.join(exports_dir, f'{deal_slug}_consolidated.csv')
+            else:
+                work_dir = sess.get('work_dir', CUSTOM_TEMP)
+                xlsx_path = os.path.join(work_dir, 'consolidated.xlsx')
+                csv_path = os.path.join(work_dir, 'consolidated.csv')
+                exports_dir = work_dir
+
+            per_payor_paths = {}
+            agg_by = export_options.get('aggregate_by') if export_options.get('aggregate') else None
+            write_warnings = []
+
+            # Write outputs — each in its own try/except so one failure doesn't kill everything
+            with _state_lock:
+                _set_processing_status(progress='Writing CSV exports...')
+            if export_options.get('combined_csv', True):
+                try:
+                    write_consolidated_csv(payor_results, csv_path, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
+                except Exception as csv_err:
+                    log.error("Failed to write combined CSV: %s", csv_err, exc_info=True)
+                    write_warnings.append(f"Combined CSV failed: {csv_err}")
+
+            if export_options.get('per_payor_csv', True):
+                try:
+                    pp_csv_dir = os.path.join(exports_dir, 'per_payor_csv')
+                    pp_csv_paths = write_per_payor_csv_exports(payor_results, pp_csv_dir, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
+                    per_payor_paths.update(pp_csv_paths)
+                except Exception as pcsv_err:
+                    log.error("Failed to write per-payor CSVs: %s", pcsv_err, exc_info=True)
+                    write_warnings.append(f"Per-payor CSVs failed: {pcsv_err}")
+
+            with _state_lock:
+                _set_processing_status(progress='Writing Excel export...')
+            if export_options.get('combined_excel', True):
+                try:
+                    write_consolidated_excel(payor_results, xlsx_path, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by)
+                except Exception as xlsx_err:
+                    log.error("Failed to write combined Excel: %s", xlsx_err, exc_info=True)
+                    write_warnings.append(f"Combined Excel failed: {xlsx_err}")
+
+            if export_options.get('per_payor_excel', False):
+                try:
+                    per_payor_paths.update(
+                        write_per_payor_exports(payor_results, exports_dir, deal_name=deal_name, formulas=formulas or None, aggregate_by=agg_by))
+                except Exception as pxlsx_err:
+                    log.error("Failed to write per-payor Excel: %s", pxlsx_err, exc_info=True)
+                    write_warnings.append(f"Per-payor Excel failed: {pxlsx_err}")
+
+            with _state_lock:
+                if export_options.get('combined_excel', True) and 'Combined Excel' not in str(write_warnings):
                     app.config['CONSOLIDATED_PATH'] = xlsx_path
-                if export_options.get('combined_csv', True):
+                if export_options.get('combined_csv', True) and 'Combined CSV' not in str(write_warnings):
                     app.config['CONSOLIDATED_CSV_PATH'] = csv_path
                 app.config['PER_PAYOR_PATHS'] = per_payor_paths
 
-            # Save deal if named
+            # Save deal if named (DB + GCS + local disk)
             if deal_name:
-                deal_meta = {
-                    'name': deal_name,
-                    'slug': deal_slug,
-                    'timestamp': datetime.now().isoformat(),
-                    'payor_codes': [pr.config.code for pr in payor_results.values()],
-                    'payor_names': [pr.config.name for pr in payor_results.values()],
-                    'total_gross': analytics.get('total_gross', '0'),
-                    'isrc_count': analytics.get('isrc_count', '0'),
-                    'total_files': analytics.get('total_files', 0),
-                    'currency_symbol': analytics.get('currency_symbol', '$'),
-                    'ltm_gross': analytics.get('ltm_gross_total_fmt', '0'),
-                    'ltm_net': analytics.get('ltm_net_total_fmt', '0'),
-                }
-                # Include audit trail in deal metadata
-                if audit_trail:
-                    deal_meta['audit_trail'] = audit_trail
-                    deal_meta['audit_summary'] = analytics.get('audit_summary', {})
-                with open(os.path.join(deal_dir, 'deal_meta.json'), 'w') as f:
-                    json.dump(deal_meta, f, indent=2)
-                with open(os.path.join(deal_dir, 'analytics.json'), 'w') as f:
-                    json.dump(analytics, f, indent=2, default=str)
-                with open(os.path.join(deal_dir, 'payor_results.pkl'), 'wb') as f:
-                    pickle.dump(payor_results, f)
+                with _state_lock:
+                    _set_processing_status(progress='Saving deal...')
+                try:
+                    save_deal(deal_slug, deal_name, payor_results, analytics,
+                              xlsx_path if 'Combined Excel' not in str(write_warnings) else None,
+                              csv_path if 'Combined CSV' not in str(write_warnings) else None,
+                              per_payor_paths)
+                except Exception as save_err:
+                    log.error("Failed to save deal: %s", save_err, exc_info=True)
+                    write_warnings.append(f"Deal save failed: {save_err}")
 
             with _state_lock:
-                _set_processing_status(running=False, progress='Done!', done=True, error=None)
+                if write_warnings:
+                    # Dashboard is loaded (analytics cached), but some exports failed
+                    warn_msg = 'Dashboard ready, but some exports failed: ' + '; '.join(write_warnings)
+                    _set_processing_status(running=False, progress='Done with warnings', done=True, error=None)
+                    log.warning("Finalize completed with warnings: %s", warn_msg)
+                else:
+                    _set_processing_status(running=False, progress='Done!', done=True, error=None)
 
         except Exception as e:
             log.error("Finalize thread failed: %s", e, exc_info=True)
@@ -8807,8 +8834,8 @@ def api_status():
         if status.get('running') and status.get('_updated_at'):
             age = _time.monotonic() - status['_updated_at']
             if age > _STALE_TIMEOUT:
-                _processing_status.update({'running': False, 'done': True,
-                    'error': 'Processing timed out. The background task may have crashed. Please try again.'})
+                _processing_status.update({'running': False, 'done': False,
+                    'error': 'Processing timed out (no activity for 10 min). The background task may have crashed on Cloud Run. Please try again.'})
                 status = dict(_processing_status)
         status.pop('_updated_at', None)
         return jsonify(status)
