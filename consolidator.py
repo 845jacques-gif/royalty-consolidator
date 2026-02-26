@@ -1256,11 +1256,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                                     pass
                             # Local path (already extracted), no GCS path
                             file_tasks.append((inner_path, base_name, '', pp, ps, fbp, None))
-                    # Clean up GCS blob for the zip
-                    try:
-                        _st_discover.delete_blob(gcs_path)
-                    except Exception:
-                        pass
+                    # Keep GCS blob for potential reprocessing (lifecycle rule handles cleanup)
                 except Exception as e:
                     log.error("GCS zip extraction failed for %s: %s", f, e)
                 finally:
@@ -1544,14 +1540,7 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 except Exception:
                     pass
 
-        # Clean up GCS blobs for this batch (files already downloaded + processed)
-        if gcs_mode and _storage:
-            for j, (_, _, _, _, _, _, gcs_path) in enumerate(batch):
-                if gcs_path:
-                    try:
-                        _storage.delete_blob(gcs_path)
-                    except Exception:
-                        pass
+        # Keep GCS blobs for potential reprocessing (lifecycle rule handles cleanup)
 
         # Force gc after each batch to reclaim freed raw DataFrames + temp files
         del parsed_batch

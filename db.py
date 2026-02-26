@@ -177,25 +177,28 @@ def save_deal_to_db(slug, deal_name, payor_results, analytics,
             detected_currencies = list(pr.detected_currencies) if pr.detected_currencies else []
             file_inventory = pr.file_inventory if pr.file_inventory else []
 
+            gcs_files_json = json.dumps(c.gcs_files) if c.gcs_files else None
             cur.execute("""
                 INSERT INTO payor_configs
                     (deal_id, code, name, fmt, fee, fx_currency, fx_rate,
-                     statement_type, deal_type, artist_split, territory,
+                     source_currency, statement_type, deal_type, artist_split, territory,
                      contract_pdf_gcs, contract_summary,
                      expected_start, expected_end, file_count,
                      detected_currencies, file_inventory,
-                     calc_payable, payable_pct, calc_third_party, third_party_pct)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     calc_payable, payable_pct, calc_third_party, third_party_pct,
+                     gcs_files)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
             """, (deal_id, code, c.name, c.fmt, c.fee,
-                  c.source_currency, 1.0,  # map source_currency -> fx_currency col, fx_rate always 1.0
-                  c.statement_type, c.deal_type, c.artist_split, c.territory,
+                  c.source_currency, 1.0,
+                  c.source_currency, c.statement_type, c.deal_type, c.artist_split, c.territory,
                   getattr(c, 'contract_pdf_gcs', None),
                   json.dumps(c.contract_summary) if c.contract_summary else None,
                   c.expected_start, c.expected_end, pr.file_count,
                   detected_currencies,
                   json.dumps(file_inventory, default=str),
-                  c.calc_payable, c.payable_pct, c.calc_third_party, c.third_party_pct))
+                  c.calc_payable, c.payable_pct, c.calc_third_party, c.third_party_pct,
+                  gcs_files_json))
 
             pc_id = cur.fetchone()[0]
 
@@ -232,6 +235,62 @@ def load_deal_from_db(slug):
         analytics = json.loads(analytics_json) if analytics_json else {}
 
         return deal_name, analytics
+
+
+def load_payor_configs_from_db(slug) -> List[dict]:
+    """Load payor configs for a deal, including GCS file manifests for reprocessing.
+    Returns list of dicts with all config fields needed to reconstruct PayorConfig objects.
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM deals WHERE slug = %s", (slug,))
+        row = cur.fetchone()
+        if not row:
+            raise FileNotFoundError(f"Deal '{slug}' not found in database")
+        deal_id = row[0]
+
+        cur.execute("""
+            SELECT code, name, fmt, fee, source_currency, fx_currency,
+                   statement_type, deal_type, artist_split, territory,
+                   contract_pdf_gcs, contract_summary,
+                   expected_start, expected_end,
+                   calc_payable, payable_pct, calc_third_party, third_party_pct,
+                   gcs_files, file_inventory
+            FROM payor_configs WHERE deal_id = %s
+        """, (deal_id,))
+        rows = cur.fetchall()
+
+        configs = []
+        for r in rows:
+            gcs_files_raw = r[18]
+            if isinstance(gcs_files_raw, str):
+                gcs_files_raw = json.loads(gcs_files_raw)
+            file_inv_raw = r[19]
+            if isinstance(file_inv_raw, str):
+                file_inv_raw = json.loads(file_inv_raw)
+
+            configs.append({
+                'code': r[0],
+                'name': r[1],
+                'fmt': r[2] or 'auto',
+                'fee': float(r[3]) if r[3] is not None else 0.0,
+                'source_currency': r[4] or r[5] or 'auto',
+                'statement_type': r[6] or 'masters',
+                'deal_type': r[7] or 'artist',
+                'artist_split': float(r[8]) if r[8] is not None else None,
+                'territory': r[9],
+                'contract_pdf_gcs': r[10],
+                'contract_summary': json.loads(r[11]) if isinstance(r[11], str) else r[11],
+                'expected_start': r[12],
+                'expected_end': r[13],
+                'calc_payable': r[14] or False,
+                'payable_pct': float(r[15]) if r[15] is not None else 0.0,
+                'calc_third_party': r[16] or False,
+                'third_party_pct': float(r[17]) if r[17] is not None else 0.0,
+                'gcs_files': gcs_files_raw,
+                'file_inventory': file_inv_raw,
+            })
+        return configs
 
 
 def list_deals_from_db() -> List[dict]:

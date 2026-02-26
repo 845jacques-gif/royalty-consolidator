@@ -9267,6 +9267,49 @@ def rerun_quick_route(slug):
         deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
         payor_configs = [pr.config for pr in payor_results.values()]
 
+        # On Cloud Run, payor_results is empty (no pickle). Reconstruct from DB.
+        if not payor_configs and db.is_available():
+            try:
+                pc_dicts = db.load_payor_configs_from_db(slug)
+                for p in pc_dicts:
+                    cfg = PayorConfig(
+                        code=p['code'],
+                        name=p['name'],
+                        statements_dir='',
+                        fmt=p['fmt'],
+                        fee=p['fee'],
+                        source_currency=p.get('source_currency', 'auto'),
+                        statement_type=p['statement_type'],
+                        artist_split=p.get('artist_split'),
+                        calc_payable=p.get('calc_payable', False),
+                        payable_pct=p.get('payable_pct', 0.0),
+                        calc_third_party=p.get('calc_third_party', False),
+                        third_party_pct=p.get('third_party_pct', 0.0),
+                        territory=p.get('territory'),
+                        gcs_files=p.get('gcs_files'),
+                    )
+                    payor_configs.append(cfg)
+                log.info("Reconstructed %d PayorConfigs from DB for rerun of %s", len(payor_configs), slug)
+            except Exception as e:
+                log.error("Failed to load payor configs from DB for %s: %s", slug, e)
+
+        if not payor_configs:
+            flash('No payor configs found for rerun. Upload files first.', 'error')
+            return redirect(url_for('deals_page'))
+
+        # Verify GCS files exist (at least spot-check first payor)
+        gcs_mode = any(c.gcs_files for c in payor_configs)
+        if gcs_mode:
+            try:
+                first_gcs = next((c for c in payor_configs if c.gcs_files), None)
+                if first_gcs and first_gcs.gcs_files:
+                    sample = first_gcs.gcs_files[0]
+                    if not storage.blob_exists(sample.get('gcs_path', '')):
+                        flash('GCS files expired. Please re-upload.', 'error')
+                        return redirect(url_for('deals_page'))
+            except Exception:
+                pass  # If check fails, still attempt rerun
+
         with _state_lock:
             if _processing_status.get('running'):
                 flash('A consolidation is already running.', 'error')
