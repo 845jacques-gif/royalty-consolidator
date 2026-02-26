@@ -1354,13 +1354,14 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     _t_parse = _time.time()
     log.info("[%s] Phase 1 (discover): %d files in %.1fs", config.code, len(file_tasks), _t_parse - _t_start)
 
-    PARSE_BATCH = 4  # parse 4 files at a time — keeps memory bounded
+    PARSE_BATCH = 8  # files per batch — balances memory vs throughput
 
     # Lazy-import storage for GCS download-on-demand
     _storage = None
     if gcs_mode:
         try:
             import storage as _storage
+            import tempfile as _tmpmod
         except ImportError:
             log.error("storage module not available for GCS mode")
             return None
@@ -1369,27 +1370,34 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         batch_end = min(batch_start + PARSE_BATCH, len(file_tasks))
         batch = file_tasks[batch_start:batch_end]
 
-        # For GCS files, download this batch to temp files before parsing
+        # For GCS files, download this batch in parallel threads
         temp_paths = {}  # j -> temp_path (to clean up after processing)
         if gcs_mode:
-            import tempfile as _tmpmod
-            for j, (_, fn, _, _, _, _, gcs_path) in enumerate(batch):
-                if gcs_path:
-                    ext = os.path.splitext(fn)[1]
-                    fd, tmp = _tmpmod.mkstemp(suffix=ext)
-                    os.close(fd)
+            def _download_one(j, fn, gcs_path):
+                ext = os.path.splitext(fn)[1]
+                fd, tmp = _tmpmod.mkstemp(suffix=ext)
+                os.close(fd)
+                try:
+                    _storage.download_to_file(gcs_path, tmp)
+                    return j, tmp
+                except Exception as e:
+                    log.error("  GCS download failed for %s: %s", fn, e)
                     try:
-                        _storage.download_to_file(gcs_path, tmp)
-                        temp_paths[j] = tmp
-                    except Exception as e:
-                        log.error("  GCS download failed for %s: %s", fn, e)
-                        temp_paths[j] = None
-                        try:
-                            os.remove(tmp)
-                        except OSError:
-                            pass
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    return j, None
 
-        # Parse this batch in parallel
+            with ThreadPoolExecutor(max_workers=PARSE_BATCH) as dl_pool:
+                dl_futures = {}
+                for j, (_, fn, _, _, _, _, gcs_path) in enumerate(batch):
+                    if gcs_path:
+                        dl_futures[dl_pool.submit(_download_one, j, fn, gcs_path)] = j
+                for fut in as_completed(dl_futures):
+                    j, tmp = fut.result()
+                    temp_paths[j] = tmp
+
+        # Parse this batch in parallel (download + parse overlap for local files)
         n_workers = min(len(batch), PARSE_BATCH)
         parsed_batch = [None] * len(batch)
 
