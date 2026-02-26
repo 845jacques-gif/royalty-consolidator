@@ -436,7 +436,20 @@ def save_deal(slug, deal_name, payor_results, analytics, xlsx_path, csv_path, pe
 
 
 def load_deal(slug):
-    """Load a saved deal from disk. Returns (deal_name, payor_results, analytics) or raises."""
+    """Load a saved deal from DB (preferred) or disk fallback.
+    Returns (deal_name, payor_results, analytics, xlsx_path, csv_path, per_payor_paths) or raises.
+    """
+    # Try database first (Cloud Run — no local filesystem)
+    if db.is_available():
+        try:
+            deal_name, analytics = db.load_deal_from_db(slug)
+            log.info("Loaded deal '%s' from database", slug)
+            return deal_name, {}, analytics, None, None, {}
+        except FileNotFoundError:
+            pass  # Not in DB, fall through to local
+        except Exception as e:
+            log.warning("DB load failed for %s, trying local: %s", slug, e)
+
     deal_dir = os.path.join(DEALS_DIR, slug)
 
     with open(os.path.join(deal_dir, 'deal_meta.json'), 'r') as f:
