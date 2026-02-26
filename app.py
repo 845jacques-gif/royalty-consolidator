@@ -3047,6 +3047,8 @@ function _uploadSingleFileToGCS(file, uploadUrl, gcsPath, inputName) {
 async function _uploadFilesToGCS(largeFiles) {
     // largeFiles: [{file, inputName, payorIdx}]
     // Request resumable session URLs from backend
+    const btn0 = document.getElementById('submitBtn');
+    if (btn0) btn0.textContent = 'Preparing ' + largeFiles.length + ' files...';
     const reqFiles = largeFiles.map(lf => ({
         name: lf.file.name,
         size: lf.file.size,
@@ -3069,6 +3071,10 @@ async function _uploadFilesToGCS(largeFiles) {
     }
     // Upload each file to GCS with progress tracking
     const results = [];  // {inputName -> [{name, gcs_path}]}
+    let completed = 0;
+    const total = largeFiles.length;
+    const btn = document.getElementById('submitBtn');
+    if (btn) btn.textContent = 'Uploading 0/' + total + ' files...';
     const uploads = largeFiles.map(lf => {
         const key = lf.payorIdx + '/' + lf.file.name;
         const info = urlMap[key];
@@ -3076,6 +3082,8 @@ async function _uploadFilesToGCS(largeFiles) {
         return _uploadSingleFileToGCS(lf.file, info.upload_url, info.gcs_path, lf.inputName)
             .then(result => {
                 results.push({inputName: lf.inputName, ...result});
+                completed++;
+                if (btn) btn.textContent = 'Uploading ' + completed + '/' + total + ' files...';
             });
     });
     await Promise.all(uploads);
