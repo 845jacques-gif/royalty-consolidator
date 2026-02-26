@@ -131,6 +131,8 @@ def run_migrations(migrations_dir: str):
 def save_deal_to_db(slug, deal_name, payor_results, analytics,
                     currency_symbol='$') -> Optional[int]:
     """Insert or update a deal and all child rows. Returns deal_id."""
+    import time as _time
+    _t0 = _time.time()
     with get_conn() as conn:
         cur = conn.cursor()
 
@@ -213,6 +215,7 @@ def save_deal_to_db(slug, deal_name, payor_results, analytics,
             if pr.by_store is not None and not pr.by_store.empty:
                 _bulk_insert_distributor(conn, deal_id, pc_id, pr.by_store)
 
+        log.info("DB save complete for %s in %.1fs", slug, _time.time() - _t0)
         return deal_id
 
 
@@ -270,8 +273,13 @@ def delete_deal_from_db(slug) -> bool:
 # ---------------------------------------------------------------------------
 
 def _bulk_insert_statement_rows(conn, deal_id, pc_id, df, batch_size=5000):
-    """Insert statement_rows from a detail DataFrame using execute_values for speed."""
-    from psycopg2.extras import execute_values
+    """Insert statement_rows using COPY protocol for maximum speed.
+
+    COPY is 5-10x faster than execute_values for large DataFrames because it
+    streams tab-separated data directly to Postgres, bypassing SQL parsing.
+    """
+    import time
+    t0 = time.time()
 
     # Map DataFrame columns to DB columns
     col_map = {
@@ -301,75 +309,72 @@ def _bulk_insert_statement_rows(conn, deal_id, pc_id, df, batch_size=5000):
         'Net Earnings': 'net_earnings',
     }
 
-    # Also extract period/store/country if present
     extra_map = {
         'Period': 'period',
         '_period': 'period',
-        'Store': 'distributor',       # map Store -> DB column 'distributor' for backward compat
-        'Distributor': 'distributor',  # legacy fallback
+        'Store': 'distributor',
+        'Distributor': 'distributor',
         'Country': 'country',
     }
 
+    NUMERIC_DB_COLS = {'units', 'gross_earnings', 'fees', 'net_receipts',
+                       'payable_share', 'third_party_share', 'net_earnings',
+                       'fx_original'}
+
+    # Build column list and source mappings
     db_cols = ['deal_id', 'payor_config_id']
-    val_extractors = []
+    val_extractors = []  # (db_col, df_col)
+    seen_db = set()
 
     for df_col, db_col in {**col_map, **extra_map}.items():
-        if df_col in df.columns and db_col not in [e[0] for e in val_extractors]:
+        if df_col in df.columns and db_col not in seen_db:
             db_cols.append(db_col)
             val_extractors.append((db_col, df_col))
+            seen_db.add(db_col)
 
-    # Detect KEEP_ columns
     keep_cols = [c for c in df.columns if c.startswith('KEEP_')]
     has_keep = len(keep_cols) > 0
     if has_keep:
         db_cols.append('keep_columns')
 
+    # ---- Build a clean DataFrame for COPY ----
+    out = pd.DataFrame(index=df.index)
+    out['deal_id'] = deal_id
+    out['payor_config_id'] = pc_id
+
+    for db_col, df_col in val_extractors:
+        col_data = df[df_col]
+        if db_col in NUMERIC_DB_COLS:
+            out[db_col] = pd.to_numeric(col_data, errors='coerce').fillna(0)
+        elif db_col == 'period':
+            out[db_col] = pd.to_numeric(col_data, errors='coerce').fillna(0).astype(int)
+        else:
+            out[db_col] = col_data.astype(str).where(col_data.notna(), None)
+
+    if has_keep:
+        # Vectorised JSON: build per-row dicts from KEEP_ columns
+        keep_df = df[keep_cols]
+        def _keep_to_json(row):
+            d = {k: str(v) for k, v in row.items() if pd.notna(v)}
+            return json.dumps(d) if d else None
+        out['keep_columns'] = keep_df.apply(_keep_to_json, axis=1)
+
+    # ---- Stream via COPY protocol ----
     cols_str = ', '.join(db_cols)
-    placeholders = ', '.join(['%s'] * len(db_cols))
+    buf = io.StringIO()
+    # Write tab-separated, \N for nulls — matches COPY TEXT format
+    out.to_csv(buf, sep='\t', header=False, index=False, na_rep='\\N')
+    buf.seek(0)
 
     cur = conn.cursor()
-    rows = []
-    for _, row in df.iterrows():
-        vals = [deal_id, pc_id]
-        for db_col, df_col in val_extractors:
-            v = row.get(df_col, None)
-            if pd.isna(v):
-                v = None
-            elif db_col in ('units', 'gross_earnings', 'fees', 'net_receipts',
-                            'payable_share', 'third_party_share', 'net_earnings'):
-                try:
-                    v = float(v)
-                except (ValueError, TypeError):
-                    v = 0
-            elif db_col == 'period':
-                try:
-                    v = int(v)
-                except (ValueError, TypeError):
-                    v = None
-            else:
-                v = str(v) if v is not None else None
-            vals.append(v)
+    cur.copy_expert(
+        f"COPY statement_rows ({cols_str}) FROM STDIN WITH (FORMAT text, NULL '\\N')",
+        buf
+    )
 
-        if has_keep:
-            keep_data = {}
-            for kc in keep_cols:
-                kv = row.get(kc, None)
-                if not pd.isna(kv):
-                    keep_data[kc] = str(kv)
-            vals.append(json.dumps(keep_data) if keep_data else None)
-
-        rows.append(tuple(vals))
-
-        if len(rows) >= batch_size:
-            execute_values(cur,
-                           f"INSERT INTO statement_rows ({cols_str}) VALUES %s",
-                           rows, template=f"({placeholders})")
-            rows = []
-
-    if rows:
-        execute_values(cur,
-                       f"INSERT INTO statement_rows ({cols_str}) VALUES %s",
-                       rows, template=f"({placeholders})")
+    elapsed = time.time() - t0
+    log.info("COPY %s statement_rows in %.1fs (%.0f rows/sec)",
+             f"{len(df):,}", elapsed, len(df) / elapsed if elapsed > 0 else 0)
 
 
 def _bulk_insert_isrc_meta(conn, deal_id, pc_id, df):

@@ -1183,6 +1183,8 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                      When provided for a file, uses parse_file_with_mapping() instead of parse_file_universal().
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time as _time
+    _t_start = _time.time()
     log.info("[%s] Loading %s from: %s", config.code, config.name, config.statements_dir)
 
     detail_chunks = []  # pre-aggregated detail per file (much smaller than raw)
@@ -1253,6 +1255,8 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
             file_tasks.append((filepath, f, rel_folder, path_period, path_source, fallback_period))
 
     # ---- Phase 2: Parse files in parallel threads ----
+    _t_parse = _time.time()
+    log.info("[%s] Phase 1 (discover): %d files in %.1fs", config.code, len(file_tasks), _t_parse - _t_start)
     n_workers = min(len(file_tasks), 8) if file_tasks else 1
     parsed_results = [None] * len(file_tasks)
 
@@ -1271,6 +1275,9 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 idx = futures[future]
                 log.error("  Failed to parse %s: %s", file_tasks[idx][1], e)
                 parsed_results[idx] = (None, None)
+
+    _t_process = _time.time()
+    log.info("[%s] Phase 2 (parse): %d files in %.1fs", config.code, len(file_tasks), _t_process - _t_parse)
 
     # ---- Phase 3: Process parsed results sequentially (order-dependent logic) ----
     for i, (filepath, f, rel_folder, path_period, path_source, fallback_period) in enumerate(file_tasks):
@@ -1382,6 +1389,9 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         detail_chunks.append(detail_chunk)
         file_count += 1
 
+    _t_agg = _time.time()
+    log.info("[%s] Phase 3 (process + pre-agg): %d files in %.1fs", config.code, file_count, _t_agg - _t_process)
+
     if not detail_chunks:
         log.warning("No files found for %s", config.name)
         return None
@@ -1447,10 +1457,14 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     isrc_meta['total_gross'] = isrc_meta['identifier'].map(pivot_gross.sum(axis=1))
     isrc_meta = isrc_meta.sort_values('total_gross', ascending=False).reset_index(drop=True)
 
+    _t_done = _time.time()
+    log.info("[%s] Phase 4 (final agg): %.1fs", config.code, _t_done - _t_agg)
+
     currency_str = ', '.join(sorted(currencies_seen)) if currencies_seen else config.source_currency
-    log.info("%s: %d files, %s ISRCs, $%s total gross, currency: %s",
+    log.info("%s: %d files, %s ISRCs, $%s total gross, currency: %s — total %.1fs",
              config.name, file_count, f"{len(isrc_meta):,}",
-             f"{isrc_meta['total_gross'].sum():,.2f}", currency_str)
+             f"{isrc_meta['total_gross'].sum():,.2f}", currency_str,
+             _t_done - _t_start)
 
     # Duplicate row detection across files
     quality_warnings = detect_duplicate_rows(detail)
