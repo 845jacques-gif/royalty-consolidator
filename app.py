@@ -7692,117 +7692,183 @@ def custom_map(payor_idx, struct_idx):
 
 @app.route('/custom/process', methods=['GET', 'POST'])
 def custom_process():
-    """Phase 2: Parse all files with user mappings, then redirect to validation."""
+    """Phase 2: Parse all files with user mappings asynchronously."""
     try:
         sess, sid = _get_custom_session()
 
-        # ── Prevent duplicate concurrent processing runs ──
-        with _processing_locks_guard:
-            if sid not in _processing_locks:
-                _processing_locks[sid] = threading.Lock()
-            lock = _processing_locks[sid]
-
-        if not lock.acquire(blocking=False):
-            # Another run is already in progress – wait for it to finish
-            log.warning("custom_process: duplicate run blocked for sid=%s", sid)
-            lock.acquire()          # block until the first run is done
-            lock.release()
-            # First run already stored results – just redirect to validation
+        # If already done, redirect to validation
+        cp_status = sess.get('_cp_status', {})
+        if cp_status.get('done') and not cp_status.get('error'):
             return redirect(url_for('custom_validate'))
 
-        try:
-            return _do_custom_process(sess, sid)
-        finally:
-            lock.release()
+        # If already running, show the loading page
+        if cp_status.get('running'):
+            return _render_processing_page(sid)
+
+        # Start background processing
+        sess['_cp_status'] = {'running': True, 'done': False, 'error': None, 'progress': 'Starting...'}
+
+        def _bg_process():
+            try:
+                _do_custom_process_bg(sess, sid)
+                sess['_cp_status']['done'] = True
+                sess['_cp_status']['running'] = False
+                sess['_cp_status']['progress'] = 'Complete'
+            except Exception as e:
+                log.error("custom_process bg failed: %s", e, exc_info=True)
+                sess['_cp_status']['done'] = True
+                sess['_cp_status']['running'] = False
+                sess['_cp_status']['error'] = str(e)
+
+        t = threading.Thread(target=_bg_process, daemon=True)
+        t.start()
+
+        return _render_processing_page(sid)
+
     except Exception as e:
         log.error("custom_process failed: %s", e, exc_info=True)
         flash(f'Error processing files: {str(e)}', 'error')
         return redirect(url_for('upload_page'))
 
 
-def _do_custom_process(sess, sid):
-    """Actual processing logic (called under lock)."""
+@app.route('/api/custom/process-status')
+def custom_process_status():
+    """Poll endpoint for custom_process background status."""
     try:
-        payors = sess.get('payors', [])
-        log.info("custom_process: %d payor(s)", len(payors))
-        _log_memory()
-        file_dates = sess.get('file_dates', {})
-        column_mappings_by_payor = sess.get('column_mappings', {})
+        sess, sid = _get_custom_session()
+        cp = sess.get('_cp_status', {})
+        return jsonify({
+            'running': cp.get('running', False),
+            'done': cp.get('done', False),
+            'error': cp.get('error'),
+            'progress': cp.get('progress', ''),
+        })
+    except Exception:
+        return jsonify({'running': False, 'done': False, 'error': 'No session'})
 
-        # Build PayorConfig objects
-        configs = []
-        for p in payors:
-            payor_dir = p['payor_dir']
-            local_dir = p.get('local_dir', '')
-            statements_dir = payor_dir if os.path.isdir(payor_dir) and os.listdir(payor_dir) else local_dir
 
-            # Merge: copy any files from local_dir missing in payor_dir
-            if local_dir and os.path.isdir(local_dir) and os.path.isdir(payor_dir):
-                existing = {f.lower() for f in os.listdir(payor_dir)}
-                for root, dirs, files in os.walk(local_dir):
-                    for f in files:
-                        if f.startswith('~$'):
-                            continue
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in _SUPPORTED_EXT and f.lower() not in existing:
-                            try:
-                                shutil.copy2(os.path.join(root, f), os.path.join(payor_dir, f))
-                                existing.add(f.lower())
-                                log.info("  Copied missing file from local_dir: %s", f)
-                            except Exception as e:
-                                log.warning("Failed to copy %s: %s", f, e)
+def _render_processing_page(sid):
+    """Return a simple loading page that polls process-status."""
+    html = """<!DOCTYPE html>
+<html><head><title>Processing...</title>
+<style>
+  body { background:#0f1117; color:#e4e4e7; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; display:flex; justify-content:center; align-items:center; min-height:100vh; margin:0; }
+  .box { text-align:center; }
+  .spinner { width:40px; height:40px; border:3px solid #27272a; border-top-color:#6366f1; border-radius:50%; animation:spin 0.8s linear infinite; margin:0 auto 20px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .msg { font-size:16px; color:#a1a1aa; }
+  .progress { font-size:13px; color:#6366f1; margin-top:8px; }
+</style></head><body>
+<div class="box">
+  <div class="spinner"></div>
+  <div class="msg">Processing statements...</div>
+  <div class="progress" id="prog">Starting...</div>
+</div>
+<script>
+(function poll() {
+  fetch('/api/custom/process-status')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('prog').textContent = d.progress || '';
+      if (d.done) {
+        if (d.error) {
+          document.querySelector('.msg').textContent = 'Error: ' + d.error;
+          document.querySelector('.spinner').style.display = 'none';
+        } else {
+          window.location.href = '/custom/validate';
+        }
+      } else {
+        setTimeout(poll, 2000);
+      }
+    })
+    .catch(() => setTimeout(poll, 3000));
+})();
+</script></body></html>"""
+    r = make_response(html)
+    r.set_cookie('session_id', sid)
+    return r
 
-            if not statements_dir or not os.path.isdir(statements_dir):
-                continue
 
-            cfg = PayorConfig(
-                code=p['code'],
-                name=p['name'],
-                statements_dir=statements_dir,
-                fmt=p['fmt'],
-                fee=p['fee'],
-                source_currency=p.get('source_currency', p.get('fx_currency', 'auto')),
-                statement_type=p['statement_type'],
-                artist_split=p.get('artist_split'),
-                calc_payable=p.get('calc_payable', False),
-                payable_pct=p.get('payable_pct', 0.0),
-                calc_third_party=p.get('calc_third_party', False),
-                third_party_pct=p.get('third_party_pct', 0.0),
-                territory=p.get('territory'),
-            )
-            configs.append(cfg)
+def _do_custom_process_bg(sess, sid):
+    """Actual processing logic (runs in background thread)."""
+    payors = sess.get('payors', [])
+    log.info("custom_process: %d payor(s)", len(payors))
+    _log_memory()
+    file_dates = sess.get('file_dates', {})
+    column_mappings_by_payor = sess.get('column_mappings', {})
 
-        if not configs:
-            flash('No valid payor configurations.', 'error')
-            return redirect(url_for('upload_page'))
+    sess['_cp_status']['progress'] = f'Building configs for {len(payors)} payor(s)...'
 
-        payor_results = load_all_payors(
-            configs,
-            file_dates=file_dates,
-            column_mappings_by_payor=column_mappings_by_payor if column_mappings_by_payor else None,
+    # Build PayorConfig objects
+    configs = []
+    for p in payors:
+        payor_dir = p['payor_dir']
+        local_dir = p.get('local_dir', '')
+        statements_dir = payor_dir if os.path.isdir(payor_dir) and os.listdir(payor_dir) else local_dir
+
+        # Merge: copy any files from local_dir missing in payor_dir
+        if local_dir and os.path.isdir(local_dir) and os.path.isdir(payor_dir):
+            existing = {f.lower() for f in os.listdir(payor_dir)}
+            for root, dirs, files in os.walk(local_dir):
+                for f in files:
+                    if f.startswith('~$'):
+                        continue
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in _SUPPORTED_EXT and f.lower() not in existing:
+                        try:
+                            shutil.copy2(os.path.join(root, f), os.path.join(payor_dir, f))
+                            existing.add(f.lower())
+                            log.info("  Copied missing file from local_dir: %s", f)
+                        except Exception as e:
+                            log.warning("Failed to copy %s: %s", f, e)
+
+        if not statements_dir or not os.path.isdir(statements_dir):
+            continue
+
+        cfg = PayorConfig(
+            code=p['code'],
+            name=p['name'],
+            statements_dir=statements_dir,
+            fmt=p['fmt'],
+            fee=p['fee'],
+            source_currency=p.get('source_currency', p.get('fx_currency', 'auto')),
+            statement_type=p['statement_type'],
+            artist_split=p.get('artist_split'),
+            calc_payable=p.get('calc_payable', False),
+            payable_pct=p.get('payable_pct', 0.0),
+            calc_third_party=p.get('calc_third_party', False),
+            third_party_pct=p.get('third_party_pct', 0.0),
+            territory=p.get('territory'),
         )
-        sess['payor_results_keys'] = list(payor_results.keys())
+        configs.append(cfg)
 
-        # Store results temporarily (in-memory for this session)
-        sess_data, _ = _get_ingest_session()
-        sess_data['_phase2_results'] = payor_results
-        sess_data['_phase2_configs'] = configs
+    if not configs:
+        raise RuntimeError('No valid payor configurations.')
 
-        # Collect all file paths for validation
-        all_file_paths = []
-        for cfg in configs:
-            if os.path.isdir(cfg.statements_dir):
-                for root, dirs, files in os.walk(cfg.statements_dir):
-                    for f in files:
-                        all_file_paths.append(os.path.join(root, f))
-        sess['all_file_paths'] = all_file_paths
+    sess['_cp_status']['progress'] = f'Processing {len(configs)} payor(s)...'
 
-    except Exception as e:
-        log.error("_do_custom_process failed: %s", e, exc_info=True)
-        flash(f'Error processing files: {str(e)}', 'error')
-        return redirect(url_for('upload_page'))
+    payor_results = load_all_payors(
+        configs,
+        file_dates=file_dates,
+        column_mappings_by_payor=column_mappings_by_payor if column_mappings_by_payor else None,
+    )
+    sess['payor_results_keys'] = list(payor_results.keys())
 
-    return redirect(url_for('custom_validate'))
+    sess['_cp_status']['progress'] = 'Storing results...'
+
+    # Store results temporarily (in-memory for this session)
+    sess_data = _ingest_sessions.get(sid, {})
+    sess_data['_phase2_results'] = payor_results
+    sess_data['_phase2_configs'] = configs
+
+    # Collect all file paths for validation
+    all_file_paths = []
+    for cfg in configs:
+        if os.path.isdir(cfg.statements_dir):
+            for root, dirs, files in os.walk(cfg.statements_dir):
+                for f in files:
+                    all_file_paths.append(os.path.join(root, f))
+    sess['all_file_paths'] = all_file_paths
 
 
 @app.route('/custom/validate', methods=['GET', 'POST'])
