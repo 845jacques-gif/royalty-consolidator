@@ -210,6 +210,7 @@ class PayorConfig:
     contract_summary: Optional[Dict] = None    # Gemini-extracted contract summary
     expected_start: Optional[int] = None       # Expected first period YYYYMM (for missing month detection)
     expected_end: Optional[int] = None         # Expected last period YYYYMM (for missing month detection)
+    gcs_files: Optional[List[dict]] = None     # [{name, gcs_path}] — stream from GCS instead of local dir
 
 
 @dataclass
@@ -1186,7 +1187,10 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import time as _time
     _t_start = _time.time()
-    log.info("[%s] Loading %s from: %s", config.code, config.name, config.statements_dir)
+    gcs_mode = bool(config.gcs_files)
+    log.info("[%s] Loading %s (%s, %d files)", config.code, config.name,
+             'GCS' if gcs_mode else config.statements_dir,
+             len(config.gcs_files) if gcs_mode else 0)
 
     detail_chunks = []  # pre-aggregated detail per file (much smaller than raw)
     meta_chunks = []
@@ -1200,47 +1204,79 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     SUPPORTED_EXT = ('.csv', '.xlsx', '.xls', '.xlsb', '.pdf')
 
     # ---- Phase 1: Discover files and deduplicate ----
-    file_tasks = []  # (filepath, filename, rel_folder, path_period, path_source, fallback_period)
-    for root, dirs, files in os.walk(config.statements_dir):
-        for f in sorted(files):
+    # file_tasks: (filepath_or_none, filename, rel_folder, path_period, path_source, fallback_period, gcs_path_or_none)
+    file_tasks = []
+
+    if gcs_mode:
+        # GCS mode: files are in cloud storage, will be downloaded one-at-a-time during processing.
+        # Zip files are downloaded, extracted to temp, and inner files added as tasks.
+        import tempfile as _tmpmod
+        try:
+            import storage as _st_discover
+        except ImportError:
+            _st_discover = None
+
+        for entry in config.gcs_files:
+            f = entry.get('name', '')
+            gcs_path = entry.get('gcs_path', '')
+            if not f or not gcs_path:
+                continue
             if f.startswith('~$'):
                 continue
             ext = os.path.splitext(f)[1].lower()
+
+            # Handle zip files: download, extract, add inner files as individual tasks
+            if ext == '.zip' and _st_discover:
+                fd, tmp_zip = _tmpmod.mkstemp(suffix='.zip')
+                os.close(fd)
+                try:
+                    _st_discover.download_to_file(gcs_path, tmp_zip)
+                    import zipfile
+                    with zipfile.ZipFile(tmp_zip, 'r') as zf:
+                        tmp_dir = _tmpmod.mkdtemp()
+                        zf.extractall(tmp_dir)
+                        for inner_name in sorted(zf.namelist()):
+                            if inner_name.endswith('/') or inner_name.startswith('__MACOSX'):
+                                continue
+                            inner_ext = os.path.splitext(inner_name)[1].lower()
+                            if inner_ext not in SUPPORTED_EXT:
+                                continue
+                            inner_path = os.path.join(tmp_dir, inner_name)
+                            base_name = os.path.basename(inner_name)
+                            pp = parse_period_from_filename(base_name)
+                            ps = 'filename' if pp else None
+                            fbp = None
+                            if file_dates and base_name in file_dates:
+                                try:
+                                    ds = file_dates[base_name].split('/')
+                                    if len(ds) == 3:
+                                        yyyy = 2000 + int(ds[2]) if int(ds[2]) < 100 else int(ds[2])
+                                        fbp = yyyy * 100 + int(ds[0])
+                                except (ValueError, IndexError):
+                                    pass
+                            # Local path (already extracted), no GCS path
+                            file_tasks.append((inner_path, base_name, '', pp, ps, fbp, None))
+                    # Clean up GCS blob for the zip
+                    try:
+                        _st_discover.delete_blob(gcs_path)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.error("GCS zip extraction failed for %s: %s", f, e)
+                finally:
+                    try:
+                        os.remove(tmp_zip)
+                    except OSError:
+                        pass
+                continue
+
             if ext not in SUPPORTED_EXT:
                 continue
-            filepath = os.path.join(root, f)
 
-            # ---- Duplicate file detection ----
-            try:
-                fhash = _file_hash(filepath)
-            except OSError:
-                fhash = None
-            if fhash and fhash in seen_hashes:
-                rel_folder = os.path.relpath(root, config.statements_dir)
-                if rel_folder == '.':
-                    rel_folder = ''
-                file_inventory.append({
-                    'filename': f,
-                    'folder': rel_folder,
-                    'period': None,
-                    'period_source': 'none',
-                    'rows': 0,
-                    'status': 'duplicate',
-                    'gross': 0,
-                    'duplicate_of': seen_hashes[fhash],
-                })
-                log.warning("  Duplicate file skipped: %s (same as %s)", f, seen_hashes[fhash])
-                continue
-            if fhash:
-                seen_hashes[fhash] = f
+            # Period detection from filename only (no full path in GCS)
+            path_period = parse_period_from_filename(f)
+            path_source = 'filename' if path_period else None
 
-            # Detect period from filepath (filename + folder names)
-            path_period, path_source = parse_period_from_path(filepath, config.statements_dir)
-            rel_folder = os.path.relpath(root, config.statements_dir)
-            if rel_folder == '.':
-                rel_folder = ''
-
-            # Check file_dates for a fallback period
             fallback_period = None
             if file_dates and f in file_dates:
                 try:
@@ -1253,7 +1289,62 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 except (ValueError, IndexError):
                     pass
 
-            file_tasks.append((filepath, f, rel_folder, path_period, path_source, fallback_period))
+            file_tasks.append((None, f, '', path_period, path_source, fallback_period, gcs_path))
+    else:
+        # Local mode: walk filesystem
+        for root, dirs, files in os.walk(config.statements_dir):
+            for f in sorted(files):
+                if f.startswith('~$'):
+                    continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in SUPPORTED_EXT:
+                    continue
+                filepath = os.path.join(root, f)
+
+                # ---- Duplicate file detection ----
+                try:
+                    fhash = _file_hash(filepath)
+                except OSError:
+                    fhash = None
+                if fhash and fhash in seen_hashes:
+                    rel_folder = os.path.relpath(root, config.statements_dir)
+                    if rel_folder == '.':
+                        rel_folder = ''
+                    file_inventory.append({
+                        'filename': f,
+                        'folder': rel_folder,
+                        'period': None,
+                        'period_source': 'none',
+                        'rows': 0,
+                        'status': 'duplicate',
+                        'gross': 0,
+                        'duplicate_of': seen_hashes[fhash],
+                    })
+                    log.warning("  Duplicate file skipped: %s (same as %s)", f, seen_hashes[fhash])
+                    continue
+                if fhash:
+                    seen_hashes[fhash] = f
+
+                # Detect period from filepath (filename + folder names)
+                path_period, path_source = parse_period_from_path(filepath, config.statements_dir)
+                rel_folder = os.path.relpath(root, config.statements_dir)
+                if rel_folder == '.':
+                    rel_folder = ''
+
+                # Check file_dates for a fallback period
+                fallback_period = None
+                if file_dates and f in file_dates:
+                    try:
+                        date_str = file_dates[f]
+                        parts = date_str.split('/')
+                        if len(parts) == 3:
+                            mm, dd, yy = int(parts[0]), int(parts[1]), int(parts[2])
+                            yyyy = 2000 + yy if yy < 100 else yy
+                            fallback_period = yyyy * 100 + mm
+                    except (ValueError, IndexError):
+                        pass
+
+                file_tasks.append((filepath, f, rel_folder, path_period, path_source, fallback_period, None))
 
     # ---- Phase 2+3: Parse and process files with bounded memory ----
     # Parse files in small batches (BATCH_SIZE at a time in parallel),
@@ -1265,9 +1356,38 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
 
     PARSE_BATCH = 4  # parse 4 files at a time — keeps memory bounded
 
+    # Lazy-import storage for GCS download-on-demand
+    _storage = None
+    if gcs_mode:
+        try:
+            import storage as _storage
+        except ImportError:
+            log.error("storage module not available for GCS mode")
+            return None
+
     for batch_start in range(0, len(file_tasks), PARSE_BATCH):
         batch_end = min(batch_start + PARSE_BATCH, len(file_tasks))
         batch = file_tasks[batch_start:batch_end]
+
+        # For GCS files, download this batch to temp files before parsing
+        temp_paths = {}  # j -> temp_path (to clean up after processing)
+        if gcs_mode:
+            import tempfile as _tmpmod
+            for j, (_, fn, _, _, _, _, gcs_path) in enumerate(batch):
+                if gcs_path:
+                    ext = os.path.splitext(fn)[1]
+                    fd, tmp = _tmpmod.mkstemp(suffix=ext)
+                    os.close(fd)
+                    try:
+                        _storage.download_to_file(gcs_path, tmp)
+                        temp_paths[j] = tmp
+                    except Exception as e:
+                        log.error("  GCS download failed for %s: %s", fn, e)
+                        temp_paths[j] = None
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
 
         # Parse this batch in parallel
         n_workers = min(len(batch), PARSE_BATCH)
@@ -1279,8 +1399,13 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
 
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {}
-            for j, (fp, fn, _rf, _pp, _ps, fbp) in enumerate(batch):
-                futures[pool.submit(_do_parse, j, fp, fn, fbp)] = j
+            for j, (fp, fn, _rf, _pp, _ps, fbp, _gp) in enumerate(batch):
+                # Use temp path for GCS files, original path for local
+                actual_path = temp_paths.get(j, fp) if gcs_mode else fp
+                if actual_path is None:
+                    parsed_batch[j] = (None, None)
+                    continue
+                futures[pool.submit(_do_parse, j, actual_path, fn, fbp)] = j
             for future in as_completed(futures):
                 try:
                     idx, df, fc = future.result()
@@ -1291,9 +1416,16 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                     parsed_batch[idx] = (None, None)
 
         # Process each file in this batch sequentially, then free it
-        for j, (filepath, f, rel_folder, path_period, path_source, fallback_period) in enumerate(batch):
+        for j, (filepath, f, rel_folder, path_period, path_source, fallback_period, gcs_path) in enumerate(batch):
             df, file_currency = parsed_batch[j]
             parsed_batch[j] = None  # free immediately
+
+            # Clean up temp file immediately after parsing (before pre-agg)
+            if j in temp_paths and temp_paths[j]:
+                try:
+                    os.remove(temp_paths[j])
+                except OSError:
+                    pass
 
             if df is None:
                 file_inventory.append({
@@ -1404,8 +1536,18 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
                 except Exception:
                     pass
 
-        # Force gc after each batch to reclaim freed raw DataFrames
+        # Clean up GCS blobs for this batch (files already downloaded + processed)
+        if gcs_mode and _storage:
+            for j, (_, _, _, _, _, _, gcs_path) in enumerate(batch):
+                if gcs_path:
+                    try:
+                        _storage.delete_blob(gcs_path)
+                    except Exception:
+                        pass
+
+        # Force gc after each batch to reclaim freed raw DataFrames + temp files
         del parsed_batch
+        temp_paths.clear()
         gc.collect()
 
     _t_agg = _time.time()

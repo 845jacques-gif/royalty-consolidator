@@ -6962,12 +6962,16 @@ def run_custom():
                     else:
                         f.save(os.path.join(payor_dir, f.filename))
 
-                # Download any large files uploaded via GCS
+                # GCS files: store paths for streaming (no download to /tmp)
+                gcs_files_list = []
                 gcs_json = request.form.get(f'gcs_files_{idx}', '').strip()
                 if gcs_json:
-                    gcs_saved = _download_gcs_files_to_dir(payor_dir, gcs_json)
-                    if gcs_saved:
-                        has_files = True
+                    try:
+                        gcs_files_list = json.loads(gcs_json)
+                        if gcs_files_list:
+                            has_files = True
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        pass
 
                 if not has_files and not local_dir:
                     idx += 1
@@ -6992,6 +6996,7 @@ def run_custom():
                 contract_summary=contract_summary,
                 expected_start=expected_start,
                 expected_end=expected_end,
+                gcs_files=gcs_files_list if gcs_files_list else None,
             ))
             idx += 1
 
@@ -7263,11 +7268,15 @@ def custom_upload():
                     else:
                         saved_files.append(safe_name)
 
-            # Download any large files uploaded via GCS
+            # GCS files: store paths for streaming during processing (no download to /tmp)
+            gcs_files_list = []
             gcs_json = request.form.get(f'gcs_files_{idx}', '').strip()
             if gcs_json:
-                gcs_saved = _download_gcs_files_to_dir(payor_dir, gcs_json)
-                saved_files.extend(gcs_saved)
+                try:
+                    gcs_files_list = json.loads(gcs_json)
+                    saved_files.extend(e.get('name', '') for e in gcs_files_list)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
 
             # Also check local dir
             local_dir = request.form.get(f'payor_dir_{idx}', '').strip()
@@ -7288,6 +7297,7 @@ def custom_upload():
                 'payor_dir': payor_dir,
                 'local_dir': local_dir,
                 'saved_files': saved_files,
+                'gcs_files': gcs_files_list,
             })
 
             idx += 1
@@ -7300,6 +7310,19 @@ def custom_upload():
         # filename and file contents now that files are saved to disk
         from consolidator import parse_period_from_filename, period_to_end_of_month, peek_statement_date
         for p in payors:
+            # GCS-mode payors: detect periods from filenames only (no local files to peek)
+            if p.get('gcs_files'):
+                for entry in p['gcs_files']:
+                    fn = entry.get('name', '')
+                    if not fn or (fn in file_dates and file_dates[fn]):
+                        continue
+                    period = parse_period_from_filename(fn)
+                    if period:
+                        eom = period_to_end_of_month(period)
+                        parts = eom.split('/')
+                        file_dates[fn] = f"{parts[0]}/{parts[1]}/{parts[2][2:]}"
+                continue
+
             src_dir = p['payor_dir'] if os.path.isdir(p['payor_dir']) else p.get('local_dir', '')
             if not src_dir or not os.path.isdir(src_dir):
                 continue
@@ -7894,13 +7917,16 @@ def _do_custom_process_bg(sess, sid):
                         except Exception as e:
                             log.warning("Failed to copy %s: %s", f, e)
 
-        if not statements_dir or not os.path.isdir(statements_dir):
+        gcs_files = p.get('gcs_files') or None
+        has_local = statements_dir and os.path.isdir(statements_dir)
+
+        if not has_local and not gcs_files:
             continue
 
         cfg = PayorConfig(
             code=p['code'],
             name=p['name'],
-            statements_dir=statements_dir,
+            statements_dir=statements_dir or '',
             fmt=p['fmt'],
             fee=p['fee'],
             source_currency=p.get('source_currency', p.get('fx_currency', 'auto')),
@@ -7911,6 +7937,7 @@ def _do_custom_process_bg(sess, sid):
             calc_third_party=p.get('calc_third_party', False),
             third_party_pct=p.get('third_party_pct', 0.0),
             territory=p.get('territory'),
+            gcs_files=gcs_files,
         )
         configs.append(cfg)
 
@@ -9039,10 +9066,14 @@ def edit_deal_post(slug):
                 else:
                     f.save(os.path.join(payor_dir, f.filename))
 
-            # Download any large files uploaded via GCS
+            # GCS files: store paths for streaming (no download to /tmp)
+            gcs_files_list = None
             gcs_json = request.form.get(f'gcs_files_{idx}', '').strip()
             if gcs_json:
-                _download_gcs_files_to_dir(payor_dir, gcs_json)
+                try:
+                    gcs_files_list = json.loads(gcs_json) or None
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
 
             payor_configs.append(PayorConfig(
                 code=code.strip(),
@@ -9063,6 +9094,7 @@ def edit_deal_post(slug):
                 contract_summary=contract_summary,
                 expected_start=expected_start,
                 expected_end=expected_end,
+                gcs_files=gcs_files_list,
             ))
             idx += 1
 
