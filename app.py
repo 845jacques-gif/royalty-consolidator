@@ -7183,6 +7183,88 @@ def _scan_file_structures(directory):
     return structures
 
 
+def _scan_file_structures_gcs(gcs_files):
+    """Scan GCS files for column structures by downloading a few samples.
+
+    Downloads up to MAX_SAMPLES files to detect unique column structures,
+    then assigns remaining files to matching structures by extension.
+    Returns same format as _scan_file_structures().
+    """
+    import tempfile
+    if not gcs_files:
+        return []
+
+    MAX_SAMPLES = 5  # only download this many for header detection
+    valid_files = []
+    for entry in gcs_files:
+        fname = entry.get('name', '')
+        gcs_path = entry.get('gcs_path', '')
+        if not fname or not gcs_path or fname.startswith('~$'):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in _SUPPORTED_EXT:
+            valid_files.append((fname, gcs_path, ext))
+
+    if not valid_files:
+        return []
+
+    groups = {}  # fingerprint -> {files, sample_path, headers, header_row}
+    sampled_exts = set()  # extensions we've already sampled
+    tmp_files = []  # track temp files for cleanup
+
+    for fname, gcs_path, ext in valid_files:
+        # Only download samples for new extensions (most payors have one format)
+        if ext in sampled_exts and len(groups) > 0:
+            # Assign to the first group with matching extension
+            for g in groups.values():
+                g['files'].append(fname)
+                break
+            continue
+
+        if len(tmp_files) >= MAX_SAMPLES:
+            # Hit sample limit — assign remaining to largest group
+            largest = max(groups.values(), key=lambda g: len(g['files']))
+            largest['files'].append(fname)
+            continue
+
+        fd, tmp = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        try:
+            storage.download_to_file(gcs_path, tmp)
+            detection = mapper.detect_headers(tmp)
+            headers = detection['headers']
+            header_row = detection['header_row']
+            fp = mapper.compute_fingerprint(headers)
+
+            if fp not in groups:
+                groups[fp] = {
+                    'fingerprint': fp,
+                    'files': [],
+                    'sample_path': tmp,
+                    'headers': headers,
+                    'header_row': header_row,
+                }
+                tmp_files.append(tmp)
+            else:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            groups[fp]['files'].append(fname)
+            sampled_exts.add(ext)
+        except Exception as e:
+            log.warning("GCS header scan failed for %s: %s", fname, e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    structures = sorted(groups.values(), key=lambda g: len(g['files']), reverse=True)
+    log.info("GCS structure scan: %d files → %d unique structure(s), sampled %d files",
+             len(valid_files), len(structures), len(tmp_files))
+    return structures
+
+
 def _get_source_dir(payor):
     """Determine the source directory for a payor (uploaded files or local dir)."""
     payor_dir = payor.get('payor_dir', '')
@@ -7388,6 +7470,8 @@ def custom_preview(payor_idx, struct_idx):
         structures = []
         if source_dir:
             structures = _scan_file_structures(source_dir)
+        elif payor.get('gcs_files') and storage.is_available():
+            structures = _scan_file_structures_gcs(payor['gcs_files'])
         sess.setdefault('structures', {})[payor['code']] = structures
 
     struct_count = len(structures)
