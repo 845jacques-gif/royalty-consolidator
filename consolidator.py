@@ -1254,148 +1254,155 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
 
             file_tasks.append((filepath, f, rel_folder, path_period, path_source, fallback_period))
 
-    # ---- Phase 2: Parse files in parallel threads ----
+    # ---- Phase 2+3: Parse and process files with bounded memory ----
+    # Parse files in small batches (BATCH_SIZE at a time in parallel),
+    # then immediately process + pre-aggregate each batch before starting
+    # the next. This caps peak memory at ~BATCH_SIZE raw DataFrames.
+    import gc
     _t_parse = _time.time()
     log.info("[%s] Phase 1 (discover): %d files in %.1fs", config.code, len(file_tasks), _t_parse - _t_start)
-    n_workers = min(len(file_tasks), 8) if file_tasks else 1
-    parsed_results = [None] * len(file_tasks)
 
-    def _do_parse(idx):
-        fp, fn, _rf, _pp, _ps, fbp = file_tasks[idx]
-        df, fc = _parse_single_file(fp, fn, config.fmt, column_mappings, fbp)
-        return idx, df, fc
+    PARSE_BATCH = 4  # parse 4 files at a time — keeps memory bounded
 
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_do_parse, i): i for i in range(len(file_tasks))}
-        for future in as_completed(futures):
-            try:
-                idx, df, fc = future.result()
-                parsed_results[idx] = (df, fc)
-            except Exception as e:
-                idx = futures[future]
-                log.error("  Failed to parse %s: %s", file_tasks[idx][1], e)
-                parsed_results[idx] = (None, None)
+    for batch_start in range(0, len(file_tasks), PARSE_BATCH):
+        batch_end = min(batch_start + PARSE_BATCH, len(file_tasks))
+        batch = file_tasks[batch_start:batch_end]
 
-    _t_process = _time.time()
-    log.info("[%s] Phase 2 (parse): %d files in %.1fs", config.code, len(file_tasks), _t_process - _t_parse)
+        # Parse this batch in parallel
+        n_workers = min(len(batch), PARSE_BATCH)
+        parsed_batch = [None] * len(batch)
 
-    # ---- Phase 3: Process parsed results sequentially (order-dependent logic) ----
-    for i, (filepath, f, rel_folder, path_period, path_source, fallback_period) in enumerate(file_tasks):
-        df, file_currency = parsed_results[i]
-        parsed_results[i] = None  # free memory as we go
+        def _do_parse(idx, fp, fn, fbp):
+            df, fc = _parse_single_file(fp, fn, config.fmt, column_mappings, fbp)
+            return idx, df, fc
 
-        if df is None:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {}
+            for j, (fp, fn, _rf, _pp, _ps, fbp) in enumerate(batch):
+                futures[pool.submit(_do_parse, j, fp, fn, fbp)] = j
+            for future in as_completed(futures):
+                try:
+                    idx, df, fc = future.result()
+                    parsed_batch[idx] = (df, fc)
+                except Exception as e:
+                    idx = futures[future]
+                    log.error("  Failed to parse %s: %s", batch[idx][1], e)
+                    parsed_batch[idx] = (None, None)
+
+        # Process each file in this batch sequentially, then free it
+        for j, (filepath, f, rel_folder, path_period, path_source, fallback_period) in enumerate(batch):
+            df, file_currency = parsed_batch[j]
+            parsed_batch[j] = None  # free immediately
+
+            if df is None:
+                file_inventory.append({
+                    'filename': f,
+                    'folder': rel_folder,
+                    'period': path_period,
+                    'period_source': path_source or 'none',
+                    'rows': 0,
+                    'status': 'skipped',
+                    'gross': 0,
+                })
+                log.warning("Could not parse %s, skipping", f)
+                continue
+
+            if file_currency and file_currency != 'Unknown':
+                currencies_seen.add(file_currency)
+
+            # Store original gross for FX Original column
+            df['gross_original'] = df['gross'].copy()
+
+            # Auto-detect source currency if user chose "auto"
+            if config.source_currency == 'auto' and file_currency and file_currency != 'Unknown':
+                config.source_currency = file_currency
+
+            # Auto-detect fee from data when fee is 0 and both gross & net exist
+            if not fee_detected and config.fee == 0 and df['gross'].abs().sum() > 0 and df['net'].abs().sum() > 0:
+                total_g = df['gross'].abs().sum()
+                total_n = df['net'].abs().sum()
+                config.fee = round((total_g - total_n) / total_g, 4)
+                fee_detected = True
+
+            # Fallback: if net is all zeros but gross has data, derive net from fee
+            if df['net'].abs().sum() == 0 and df['gross'].abs().sum() > 0 and config.fee > 0:
+                df['net'] = df['gross'] * (1 - config.fee)
+                df['fees'] = df['gross'] * config.fee
+
+            # Reverse: if gross is all zeros but net has data, derive gross from fee
+            if df['gross'].abs().sum() == 0 and df['net'].abs().sum() > 0:
+                if config.fee > 0:
+                    df['gross'] = df['net'] / (1 - config.fee)
+                    df['fees'] = df['gross'] - df['net']
+                else:
+                    df['gross'] = df['net']
+
+            # Drop rows with missing ISRC
+            df['identifier'] = df['identifier'].astype(str).str.strip()
+            df = df[df['identifier'].ne('') & df['identifier'].ne('nan') & df['identifier'].notna()]
+
+            # Determine actual periods found in the parsed data
+            data_periods = sorted(df['period'].unique().tolist()) if len(df) > 0 else []
+            file_gross = float(df['gross'].sum()) if len(df) > 0 else 0
+
             file_inventory.append({
                 'filename': f,
                 'folder': rel_folder,
-                'period': path_period,
-                'period_source': path_source or 'none',
-                'rows': 0,
-                'status': 'skipped',
-                'gross': 0,
+                'period': data_periods[0] if len(data_periods) == 1 else path_period,
+                'periods': [int(p) for p in data_periods],
+                'period_source': 'data' if data_periods else (path_source or 'none'),
+                'rows': len(df),
+                'status': 'ok',
+                'gross': round(file_gross, 2),
             })
-            log.warning("Could not parse %s, skipping", f)
-            continue
 
-        if file_currency and file_currency != 'Unknown':
-            currencies_seen.add(file_currency)
+            log.info("  [%d/%d] %s (%s rows)", batch_start + j + 1, len(file_tasks), f, f"{len(df):,}")
 
-        # Store original gross for FX Original column (identical — no ingestion-time conversion)
-        df['gross_original'] = df['gross'].copy()
+            # Ensure new columns exist with defaults
+            for col in ['iswc', 'upc', 'other_identifier', 'country', 'release_date']:
+                if col not in df.columns:
+                    df[col] = ''
+            for col in ['fees', 'gross_original']:
+                if col not in df.columns:
+                    df[col] = 0.0
 
-        # Auto-detect source currency if user chose "auto"
-        if config.source_currency == 'auto' and file_currency and file_currency != 'Unknown':
-            config.source_currency = file_currency
+            # Metadata per ISRC (first occurrence)
+            meta = (
+                df.groupby('identifier')
+                .agg({'title': 'first', 'artist': 'first', 'product_title': 'first',
+                      'iswc': 'first', 'upc': 'first', 'release_date': 'first'})
+                .reset_index()
+            )
+            meta_chunks.append(meta)
 
-        # Auto-detect fee from data when fee is 0 and both gross & net exist
-        if not fee_detected and config.fee == 0 and df['gross'].abs().sum() > 0 and df['net'].abs().sum() > 0:
-            total_g = df['gross'].abs().sum()
-            total_n = df['net'].abs().sum()
-            config.fee = round((total_g - total_n) / total_g, 4)
-            fee_detected = True
+            # ---- Pre-aggregate to detail level immediately ----
+            # 200K raw rows → ~10-50K detail rows per file
+            keep_cols = [c for c in df.columns if c.startswith('KEEP_')]
+            file_agg = {
+                'title': 'first', 'artist': 'first', 'product_title': 'first',
+                'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
+                'release_date': 'first',
+                'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
+                'gross_original': 'sum',
+            }
+            for kc in keep_cols:
+                file_agg[kc] = 'first'
+            detail_chunk = (
+                df.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
+                .agg(file_agg)
+                .reset_index()
+            )
+            total_raw_rows += len(df)
+            del df  # free raw rows immediately
+            detail_chunks.append(detail_chunk)
+            file_count += 1
 
-        # Fallback: if net is all zeros but gross has data, derive net from fee
-        if df['net'].abs().sum() == 0 and df['gross'].abs().sum() > 0 and config.fee > 0:
-            df['net'] = df['gross'] * (1 - config.fee)
-            df['fees'] = df['gross'] * config.fee
-
-        # Reverse: if gross is all zeros but net has data, derive gross from fee
-        if df['gross'].abs().sum() == 0 and df['net'].abs().sum() > 0:
-            if config.fee > 0:
-                df['gross'] = df['net'] / (1 - config.fee)
-                df['fees'] = df['gross'] - df['net']
-            else:
-                df['gross'] = df['net']
-
-        # Drop rows with missing ISRC
-        df['identifier'] = df['identifier'].astype(str).str.strip()
-        df = df[df['identifier'].ne('') & df['identifier'].ne('nan') & df['identifier'].notna()]
-
-        # Determine actual periods found in the parsed data
-        data_periods = sorted(df['period'].unique().tolist()) if len(df) > 0 else []
-        file_gross = float(df['gross'].sum()) if len(df) > 0 else 0
-
-        file_inventory.append({
-            'filename': f,
-            'folder': rel_folder,
-            'period': data_periods[0] if len(data_periods) == 1 else path_period,
-            'periods': [int(p) for p in data_periods],
-            'period_source': 'data' if data_periods else (path_source or 'none'),
-            'rows': len(df),
-            'status': 'ok',
-            'gross': round(file_gross, 2),
-        })
-
-        log.info("  %s (%s rows)", f, f"{len(df):,}")
-
-        # Ensure new columns exist with defaults
-        for col in ['iswc', 'upc', 'other_identifier', 'country', 'release_date']:
-            if col not in df.columns:
-                df[col] = ''
-        for col in ['fees', 'gross_original']:
-            if col not in df.columns:
-                df[col] = 0.0
-
-        # Metadata per ISRC (first occurrence)
-        meta = (
-            df.groupby('identifier')
-            .agg({'title': 'first', 'artist': 'first', 'product_title': 'first',
-                  'iswc': 'first', 'upc': 'first', 'release_date': 'first'})
-            .reset_index()
-        )
-        meta_chunks.append(meta)
-
-        # ---- Pre-aggregate this file to detail level immediately ----
-        # This is the key memory optimisation: instead of holding all raw rows
-        # across all files, we compress each file down to its detail-level
-        # groupby (ISRC × period × store × media_type × country) right away.
-        # A 200K-row file typically reduces to ~10-50K detail rows.
-        keep_cols = [c for c in df.columns if c.startswith('KEEP_')]
-        file_agg = {
-            'title': 'first', 'artist': 'first', 'product_title': 'first',
-            'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
-            'release_date': 'first',
-            'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
-            'gross_original': 'sum',
-        }
-        for kc in keep_cols:
-            file_agg[kc] = 'first'
-        detail_chunk = (
-            df.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
-            .agg(file_agg)
-            .reset_index()
-        )
-        total_raw_rows += len(df)
-        del df  # free raw rows immediately
-        detail_chunks.append(detail_chunk)
-        file_count += 1
-
-        # Force garbage collection every 20 files to keep memory in check
-        if file_count % 20 == 0:
-            import gc; gc.collect()
+        # Force gc after each batch to reclaim freed raw DataFrames
+        del parsed_batch
+        gc.collect()
 
     _t_agg = _time.time()
-    log.info("[%s] Phase 3 (process + pre-agg): %d files in %.1fs", config.code, file_count, _t_agg - _t_process)
+    log.info("[%s] Phase 2+3 (parse + process): %d files in %.1fs", config.code, file_count, _t_agg - _t_parse)
 
     if not detail_chunks:
         log.warning("No files found for %s", config.name)
