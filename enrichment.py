@@ -123,61 +123,66 @@ def deduplicate_tracks(detail_df: pd.DataFrame) -> List[TrackLookupItem]:
 
     Groups by ISRC first; rows without ISRC group by (Title, Artist).
     Tracks that already have a release_date from source data are tagged SRC.
+    Vectorized — avoids row-by-row iteration on large DataFrames.
     """
-    items = []
-    seen_isrcs = set()
-    seen_title_artist = set()
-
-    # Ensure columns exist
+    # Ensure columns exist (normalize names)
+    df = detail_df
     for col in ['ISRC', 'Title', 'Artist', 'Release Date']:
-        if col not in detail_df.columns:
-            # Try lowercase variants
+        if col not in df.columns:
             for alt in [col.lower(), col.replace(' ', '_').lower()]:
-                if alt in detail_df.columns:
-                    detail_df = detail_df.rename(columns={alt: col})
+                if alt in df.columns:
+                    df = df.rename(columns={alt: col})
                     break
             else:
-                detail_df[col] = ''
+                df[col] = ''
 
-    for idx, row in detail_df.iterrows():
-        isrc = str(row.get('ISRC', '')).strip()
-        title = str(row.get('Title', '')).strip()
-        artist = str(row.get('Artist', '')).strip()
-        rd = str(row.get('Release Date', '')).strip()
+    # Vectorized column prep
+    isrc_col = df['ISRC'].fillna('').astype(str).str.strip().str.upper()
+    title_col = df['Title'].fillna('').astype(str).str.strip()
+    artist_col = df['Artist'].fillna('').astype(str).str.strip()
+    rd_col = df['Release Date'].fillna('').astype(str).str.strip()
 
-        if isrc and isrc not in ('', 'nan', 'None'):
-            if isrc.upper() not in seen_isrcs:
-                seen_isrcs.add(isrc.upper())
-                item = TrackLookupItem(
-                    isrc=isrc.upper(),
-                    title=title,
-                    artist=artist,
-                    existing_release_date=rd if rd and rd not in ('', 'nan', 'None', 'NaT') else '',
-                    row_indices=[idx],
-                )
-                items.append(item)
-            else:
-                # Add row index to existing item
-                for it in items:
-                    if it.isrc == isrc.upper():
-                        it.row_indices.append(idx)
-                        break
-        elif title and artist:
-            key = _cache_key_title_artist(title, artist)
-            if key not in seen_title_artist:
-                seen_title_artist.add(key)
-                item = TrackLookupItem(
-                    title=title,
-                    artist=artist,
-                    existing_release_date=rd if rd and rd not in ('', 'nan', 'None', 'NaT') else '',
-                    row_indices=[idx],
-                )
-                items.append(item)
-            else:
-                for it in items:
-                    if not it.isrc and _cache_key_title_artist(it.title, it.artist) == key:
-                        it.row_indices.append(idx)
-                        break
+    # Mark valid ISRCs
+    valid_isrc = isrc_col.ne('') & ~isrc_col.isin(['NAN', 'NONE'])
+    _invalid_rd = {'', 'nan', 'None', 'NaT'}
+
+    items = []
+    item_by_isrc = {}   # isrc -> item (O(1) lookup instead of linear scan)
+    item_by_ta = {}     # ta_key -> item
+
+    # Process rows with valid ISRC — use groupby for speed
+    if valid_isrc.any():
+        isrc_groups = df.loc[valid_isrc].groupby(isrc_col[valid_isrc])
+        for isrc_val, group in isrc_groups:
+            first_idx = group.index[0]
+            rd_val = rd_col.at[first_idx]
+            item = TrackLookupItem(
+                isrc=isrc_val,
+                title=title_col.at[first_idx],
+                artist=artist_col.at[first_idx],
+                existing_release_date=rd_val if rd_val not in _invalid_rd else '',
+                row_indices=list(group.index),
+            )
+            items.append(item)
+            item_by_isrc[isrc_val] = item
+
+    # Process rows without ISRC — group by title+artist
+    no_isrc = ~valid_isrc & title_col.ne('') & artist_col.ne('')
+    if no_isrc.any():
+        ta_key_col = title_col[no_isrc].str.upper().str.replace(r'\s+', ' ', regex=True) + '::' + \
+                     artist_col[no_isrc].str.upper().str.replace(r'\s+', ' ', regex=True)
+        ta_groups = df.loc[no_isrc].groupby(ta_key_col)
+        for ta_key, group in ta_groups:
+            first_idx = group.index[0]
+            rd_val = rd_col.at[first_idx]
+            item = TrackLookupItem(
+                title=title_col.at[first_idx],
+                artist=artist_col.at[first_idx],
+                existing_release_date=rd_val if rd_val not in _invalid_rd else '',
+                row_indices=list(group.index),
+            )
+            items.append(item)
+            item_by_ta[ta_key] = item
 
     return items
 
