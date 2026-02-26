@@ -647,8 +647,13 @@ def _find_header_row(filepath, ext, max_scan=50):
     return best_row if best_hits >= 3 else 0
 
 
+CSV_CHUNKSIZE = 100_000  # rows per chunk for large CSV reads
+
+
 def _read_raw_dataframe(filepath, filename):
-    """Read any file (PDF, CSV, Excel) into a raw DataFrame."""
+    """Read any file (PDF, CSV, Excel) into a raw DataFrame.
+    Large CSVs are read in chunks to limit peak memory usage.
+    """
     ext = os.path.splitext(filename)[1].lower()
 
     if ext == '.csv':
@@ -656,7 +661,13 @@ def _read_raw_dataframe(filepath, filename):
         # Try common encodings
         for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
             try:
-                df = pd.read_csv(filepath, encoding=enc)
+                chunks = []
+                for chunk in pd.read_csv(filepath, encoding=enc, chunksize=CSV_CHUNKSIZE,
+                                         low_memory=False):
+                    chunks.append(chunk)
+                if chunks:
+                    df = pd.concat(chunks, ignore_index=True)
+                    del chunks
                 break
             except (UnicodeDecodeError, UnicodeError):
                 continue
@@ -669,7 +680,13 @@ def _read_raw_dataframe(filepath, filename):
             if header_row > 0:
                 for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
                     try:
-                        df = pd.read_csv(filepath, skiprows=header_row, encoding=enc)
+                        chunks = []
+                        for chunk in pd.read_csv(filepath, skiprows=header_row, encoding=enc,
+                                                  chunksize=CSV_CHUNKSIZE, low_memory=False):
+                            chunks.append(chunk)
+                        if chunks:
+                            df = pd.concat(chunks, ignore_index=True)
+                            del chunks
                         break
                     except (UnicodeDecodeError, UnicodeError):
                         continue
@@ -1168,8 +1185,9 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
     from concurrent.futures import ThreadPoolExecutor, as_completed
     log.info("[%s] Loading %s from: %s", config.code, config.name, config.statements_dir)
 
-    raw_dfs = []       # collect raw DataFrames — aggregate once at the end
+    detail_chunks = []  # pre-aggregated detail per file (much smaller than raw)
     meta_chunks = []
+    total_raw_rows = 0
     file_count = 0
     currencies_seen = set()
     file_inventory = []
@@ -1339,32 +1357,46 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         )
         meta_chunks.append(meta)
 
-        # Collect raw df for bulk aggregation (skip per-file groupby)
-        raw_dfs.append(df)
+        # ---- Pre-aggregate this file to detail level immediately ----
+        # This is the key memory optimisation: instead of holding all raw rows
+        # across all files, we compress each file down to its detail-level
+        # groupby (ISRC × period × store × media_type × country) right away.
+        # A 200K-row file typically reduces to ~10-50K detail rows.
+        keep_cols = [c for c in df.columns if c.startswith('KEEP_')]
+        file_agg = {
+            'title': 'first', 'artist': 'first', 'product_title': 'first',
+            'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
+            'release_date': 'first',
+            'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
+            'gross_original': 'sum',
+        }
+        for kc in keep_cols:
+            file_agg[kc] = 'first'
+        detail_chunk = (
+            df.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
+            .agg(file_agg)
+            .reset_index()
+        )
+        total_raw_rows += len(df)
+        del df  # free raw rows immediately
+        detail_chunks.append(detail_chunk)
         file_count += 1
 
-    if not raw_dfs:
+    if not detail_chunks:
         log.warning("No files found for %s", config.name)
         return None
 
-    log.info("Aggregating %d files (%s total rows)...", file_count,
-             f"{sum(len(d) for d in raw_dfs):,}")
+    log.info("Aggregating %d files (%s raw rows → %s pre-aggregated rows)...",
+             file_count, f"{total_raw_rows:,}",
+             f"{sum(len(d) for d in detail_chunks):,}")
 
-    # Combine all raw DataFrames and aggregate once (instead of per-file + re-agg)
-    combined = pd.concat(raw_dfs, ignore_index=True)
-    del raw_dfs
+    # Merge pre-aggregated chunks — re-aggregate to handle overlapping keys
+    # (same ISRC+period+store+media_type+country across files)
+    combined_detail = pd.concat(detail_chunks, ignore_index=True)
+    del detail_chunks
 
-    # Monthly: ISRC + period
-    monthly = (
-        combined.groupby(['identifier', 'period'])
-        .agg({'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
-              'gross_original': 'sum'})
-        .reset_index()
-    )
-    monthly['statement_date'] = monthly['period'].apply(period_to_end_of_month)
-
-    # Detail: ISRC + period + store + media_type + country
-    keep_cols = [c for c in combined.columns if c.startswith('KEEP_')]
+    # Detect all KEEP_ columns across files (different files may have different ones)
+    keep_cols = [c for c in combined_detail.columns if c.startswith('KEEP_')]
     detail_agg_dict = {
         'title': 'first', 'artist': 'first', 'product_title': 'first',
         'iswc': 'first', 'upc': 'first', 'other_identifier': 'first',
@@ -1376,21 +1408,30 @@ def load_payor_statements(config: PayorConfig, file_dates: Optional[Dict[str, st
         detail_agg_dict[kc] = 'first'
 
     detail = (
-        combined.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
+        combined_detail.groupby(['identifier', 'period', 'store', 'media_type', 'country'])
         .agg(detail_agg_dict)
         .reset_index()
     )
     detail['statement_date'] = detail['period'].apply(period_to_end_of_month)
 
-    # Store aggregate
+    # Monthly: derive from detail (already aggregated, so just roll up)
+    monthly = (
+        detail.groupby(['identifier', 'period'])
+        .agg({'gross': 'sum', 'net': 'sum', 'fees': 'sum', 'sales': 'sum',
+              'gross_original': 'sum'})
+        .reset_index()
+    )
+    monthly['statement_date'] = monthly['period'].apply(period_to_end_of_month)
+
+    # Store aggregate: derive from detail
     by_store = (
-        combined.groupby('store')
+        detail.groupby('store')
         .agg({'gross': 'sum', 'net': 'sum', 'sales': 'sum'})
         .reset_index()
         .sort_values('gross', ascending=False)
     )
     by_store.columns = ['Store', 'Total Gross', 'Total Net', 'Total Sales']
-    del combined
+    del combined_detail
 
     all_meta = pd.concat(meta_chunks, ignore_index=True)
     del meta_chunks
