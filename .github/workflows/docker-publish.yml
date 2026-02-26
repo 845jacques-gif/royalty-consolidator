@@ -45,29 +45,19 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: royalty-consolidator
-          project_id: ma-royalty-consolidator
-          region: us-west1
-          image: docker.io/845jacques/royalty-consolidator:${{ github.sha }}
-          flags: |
-            --memory=4Gi
-            --cpu=2
-            --timeout=900
-            --concurrency=80
-            --execution-environment=gen2
-          env_vars: |
-            DB_HOST=${{ secrets.DB_HOST }}
-            DB_PORT=${{ secrets.DB_PORT }}
-            DB_NAME=${{ secrets.DB_NAME }}
-            DB_USER=${{ secrets.DB_USER }}
-          secrets: |
-            DB_PASSWORD=postgres-db-password:latest
-
-      - name: Set max request body size
         run: |
-          gcloud run services update royalty-consolidator \
+          gcloud run deploy royalty-consolidator \
             --region=us-west1 \
             --project=ma-royalty-consolidator \
-            --update-annotations=run.googleapis.com/maxRequestBodySize=2Gi
+            --platform=managed \
+            --image=docker.io/845jacques/royalty-consolidator:${{ github.sha }} \
+            --memory=4Gi \
+            --cpu=2 \
+            --timeout=900 \
+            --concurrency=80 \
+            --execution-environment=gen2 \
+            --set-env-vars=DB_HOST=/cloudsql/ma-royalty-consolidator:us-central1:royaltyconsolidator,DB_PORT=5432,DB_NAME=royalty_consolidator,DB_USER=postgres,GCS_BUCKET=royalty_consolidator_uploaded_files \
+            --set-secrets=DB_PASSWORD=postgres-db-password:latest \
+            --add-cloudsql-instances=ma-royalty-consolidator:us-central1:royaltyconsolidator \
+            --update-annotations=run.googleapis.com/maxRequestBodySize=2Gi \
+            --labels=managed-by=github-actions,commit-sha=${{ github.sha }}
