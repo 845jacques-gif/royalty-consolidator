@@ -177,7 +177,15 @@ _processing_status = {
     'progress': '',
     'done': False,
     'error': None,
+    '_updated_at': 0.0,  # monotonic timestamp for staleness detection
 }
+_STALE_TIMEOUT = 600  # 10 minutes — if no status update, consider dead
+
+def _set_processing_status(**kwargs):
+    """Update _processing_status with staleness timestamp."""
+    import time as _t
+    _processing_status.update(kwargs)
+    _processing_status['_updated_at'] = _t.monotonic()
 
 # Chat session histories (session_id -> list of message dicts)
 _chat_histories = {}
@@ -8227,9 +8235,11 @@ def custom_enrich():
             estimated_seconds = int(len(unique_isrcs) * 1.5)
 
             # Initialize enrichment status
+            import time as _etime
             sess['enrichment_status'] = {
                 'running': True, 'done': False, 'error': None,
                 'phase': 'starting', 'current': 0, 'total': 0, 'message': 'Starting...',
+                '_started_at': _etime.monotonic(),
                 'eta_seconds': estimated_seconds, 'need_lookup': len(unique_isrcs),
             }
 
@@ -8381,8 +8391,17 @@ def custom_export():
 @app.route('/api/enrichment-status')
 def api_enrichment_status():
     """AJAX: Return enrichment progress for polling."""
+    import time as _etime
     sess, sid = _get_custom_session()
     status = sess.get('enrichment_status', {})
+    # Detect stale enrichment (thread died or instance replaced)
+    if status.get('running') and status.get('_started_at'):
+        age = _etime.monotonic() - status['_started_at']
+        if age > _STALE_TIMEOUT:
+            status = {'running': False, 'done': False,
+                      'error': 'Enrichment timed out. The background task may have crashed. You can skip this step.',
+                      'phase': 'error', 'current': 0, 'total': 0, 'message': 'Timed out'}
+            sess['enrichment_status'] = status
     return jsonify({
         'running': status.get('running', False),
         'done': status.get('done', False),
@@ -8416,7 +8435,7 @@ def custom_finalize():
         if _processing_status.get('running'):
             flash('A consolidation is already running.', 'error')
             return redirect(url_for('index'))
-        _processing_status = {'running': True, 'progress': 'Finalizing...', 'done': False, 'error': None}
+        _set_processing_status(running=True, progress='Finalizing...', done=False, error=None)
 
     _cached_deal_name = deal_name
 
@@ -8432,7 +8451,7 @@ def custom_finalize():
         global _cached_results, _cached_analytics, _processing_status
         try:
             with _state_lock:
-                _processing_status['progress'] = 'Applying enrichment...'
+                _set_processing_status(progress='Applying enrichment...')
 
             # Apply enrichment to raw PayorResult.detail DataFrames
             if enrich_result and enrich_result.get('lookups'):
@@ -8441,7 +8460,7 @@ def custom_finalize():
                     pr.detail = apply_enrichment_to_raw_detail(pr.detail, lookups)
 
             with _state_lock:
-                _processing_status['progress'] = 'Writing output files...'
+                _set_processing_status(progress='Writing output files...')
                 _cached_results = payor_results
 
             # Determine output dir
@@ -8567,12 +8586,12 @@ def custom_finalize():
                     pickle.dump(payor_results, f)
 
             with _state_lock:
-                _processing_status = {'running': False, 'progress': 'Done!', 'done': True, 'error': None}
+                _set_processing_status(running=False, progress='Done!', done=True, error=None)
 
         except Exception as e:
             log.error("Finalize thread failed: %s", e, exc_info=True)
             with _state_lock:
-                _processing_status = {'running': False, 'progress': '', 'done': False, 'error': str(e)}
+                _set_processing_status(running=False, progress='', done=False, error=str(e))
 
     t = threading.Thread(target=_finalize_thread, daemon=True)
     t.start()
@@ -8773,8 +8792,18 @@ def api_analytics():
 @app.route('/api/status')
 def api_status():
     """Return background processing status as JSON."""
+    import time as _time
     with _state_lock:
-        return jsonify(dict(_processing_status))
+        status = dict(_processing_status)
+        # Detect stale/dead background threads (e.g. Cloud Run instance replaced)
+        if status.get('running') and status.get('_updated_at'):
+            age = _time.monotonic() - status['_updated_at']
+            if age > _STALE_TIMEOUT:
+                _processing_status.update({'running': False, 'done': True,
+                    'error': 'Processing timed out. The background task may have crashed. Please try again.'})
+                status = dict(_processing_status)
+        status.pop('_updated_at', None)
+        return jsonify(status)
 
 
 @app.route('/api/list-dir-files', methods=['POST'])

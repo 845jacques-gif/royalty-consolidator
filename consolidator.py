@@ -2025,37 +2025,73 @@ def apply_enrichment_to_raw_detail(detail_df: pd.DataFrame, lookups: dict) -> pd
 
     Match by ISRC (identifier column) first, then TITLE::ARTIST fallback.
     Sets both 'release_date' and 'release_date_source' columns on the raw detail.
+    Vectorized implementation — avoids row-by-row iteration.
     """
-    import re
+    import re as _re
+
+    if not lookups:
+        return detail_df
+
     df = detail_df.copy()
 
     if 'release_date_source' not in df.columns:
         df['release_date_source'] = ''
 
-    def _cache_key_isrc(isrc):
-        return isrc.strip().upper()
+    # Build lookup Series keyed by ISRC
+    isrc_dates = {}
+    isrc_sources = {}
+    ta_dates = {}
+    ta_sources = {}
+    for key, entry in lookups.items():
+        rd = entry.get('release_date')
+        if not rd:
+            continue
+        src = entry.get('source', '')
+        if '::' in key:
+            ta_dates[key] = rd
+            ta_sources[key] = src
+        else:
+            isrc_dates[key] = rd
+            isrc_sources[key] = src
 
-    def _cache_key_ta(title, artist):
-        t = re.sub(r'\s+', ' ', title.strip().upper())
-        a = re.sub(r'\s+', ' ', artist.strip().upper())
-        return f"{t}::{a}"
+    # Vectorized ISRC key column
+    has_id = 'identifier' in df.columns
+    has_title = 'title' in df.columns
+    has_artist = 'artist' in df.columns
 
-    for idx in df.index:
-        isrc = str(df.at[idx, 'identifier']).strip().upper() if 'identifier' in df.columns else ''
-        title = str(df.at[idx, 'title']).strip() if 'title' in df.columns else ''
-        artist = str(df.at[idx, 'artist']).strip() if 'artist' in df.columns else ''
+    if has_id and isrc_dates:
+        isrc_col = df['identifier'].fillna('').astype(str).str.strip().str.upper()
+        matched_rd = isrc_col.map(isrc_dates)
+        matched_src = isrc_col.map(isrc_sources)
+    else:
+        matched_rd = pd.Series([None] * len(df), index=df.index)
+        matched_src = pd.Series([None] * len(df), index=df.index)
 
-        entry = None
-        if isrc and isrc not in ('', 'NAN', 'NONE'):
-            entry = lookups.get(_cache_key_isrc(isrc))
-        if not entry and title and artist:
-            entry = lookups.get(_cache_key_ta(title, artist))
+    # Fallback: TITLE::ARTIST for rows without ISRC match
+    if has_title and has_artist and ta_dates:
+        needs_fallback = matched_rd.isna()
+        if needs_fallback.any():
+            title_col = df.loc[needs_fallback, 'title'].fillna('').astype(str).str.strip().str.upper().str.replace(r'\s+', ' ', regex=True)
+            artist_col = df.loc[needs_fallback, 'artist'].fillna('').astype(str).str.strip().str.upper().str.replace(r'\s+', ' ', regex=True)
+            ta_key = title_col + '::' + artist_col
+            fb_rd = ta_key.map(ta_dates)
+            fb_src = ta_key.map(ta_sources)
+            matched_rd.loc[needs_fallback] = matched_rd.loc[needs_fallback].fillna(fb_rd)
+            matched_src.loc[needs_fallback] = matched_src.loc[needs_fallback].fillna(fb_src)
 
-        if entry and entry.get('release_date'):
-            current_rd = str(df.at[idx, 'release_date']).strip() if 'release_date' in df.columns else ''
-            if not current_rd or current_rd in ('', 'nan', 'None', 'NaT'):
-                df.at[idx, 'release_date'] = entry['release_date']
-            df.at[idx, 'release_date_source'] = entry.get('source', '')
+    # Apply: only fill release_date where currently empty
+    has_match = matched_rd.notna()
+    if has_match.any():
+        if 'release_date' in df.columns:
+            current_rd = df['release_date'].fillna('').astype(str).str.strip()
+            empty_rd = current_rd.isin(['', 'nan', 'None', 'NaT'])
+            fill_mask = has_match & empty_rd
+        else:
+            fill_mask = has_match
+            df['release_date'] = ''
+
+        df.loc[fill_mask, 'release_date'] = matched_rd.loc[fill_mask]
+        df.loc[has_match, 'release_date_source'] = matched_src.loc[has_match]
 
     return df
 
