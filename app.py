@@ -2420,7 +2420,6 @@ function syncFormulas() {
 <script>
 const PRESET_PAYORS = {{ default_payors | tojson }};
 const _gcsAvailable = {{ gcs_available|default(false)|tojson }};
-const GCS_THRESHOLD = 10 * 1024 * 1024;  // 10 MB
 
 function applyPreset(selectEl) {
     const block = selectEl.closest('.payor-block');
@@ -3024,7 +3023,7 @@ function _uploadSingleFileToGCS(file, uploadUrl, gcsPath, inputName) {
     });
 }
 
-async function _uploadLargeFilesToGCS(largeFiles) {
+async function _uploadFilesToGCS(largeFiles) {
     // largeFiles: [{file, inputName, payorIdx}]
     // Request resumable session URLs from backend
     const reqFiles = largeFiles.map(lf => ({
@@ -3076,60 +3075,43 @@ function _submitViaFetch() {
     btn.textContent = 'Uploading...';
     btn.disabled = true;
 
-    // Partition files into small (multipart) and large (GCS)
-    const MAX_MULTIPART = 25 * 1024 * 1024;  // 25 MB total multipart limit
-    const smallFiles = {};   // inputName -> File[]
-    const largeFiles = [];   // [{file, inputName, payorIdx}]
+    // Collect all files per payor
+    const allFiles = [];   // [{file, inputName, payorIdx}]
     const fileInputs = form.querySelectorAll('input[type=file][name^="payor_files_"]');
-    let totalSmallSize = 0;
     fileInputs.forEach(inp => {
         const dzList = _dzFiles[inp.name];
         const files = (dzList && dzList.length) ? dzList : Array.from(inp.files);
         const idx = inp.name.replace('payor_files_', '');
-        smallFiles[inp.name] = [];
         for (const f of files) {
-            if (_gcsAvailable && f.size >= GCS_THRESHOLD) {
-                largeFiles.push({file: f, inputName: inp.name, payorIdx: parseInt(idx)});
-            } else {
-                smallFiles[inp.name].push(f);
-                totalSmallSize += f.size;
-            }
+            allFiles.push({file: f, inputName: inp.name, payorIdx: parseInt(idx)});
         }
     });
-    // If total small files exceed multipart limit, route ALL through GCS
-    if (_gcsAvailable && totalSmallSize > MAX_MULTIPART) {
-        for (const [inputName, files] of Object.entries(smallFiles)) {
-            const idx = inputName.replace('payor_files_', '');
-            for (const f of files) {
-                largeFiles.push({file: f, inputName, payorIdx: parseInt(idx)});
-            }
-            smallFiles[inputName] = [];
-        }
-    }
 
-    // If there are large files, upload them to GCS first
-    const gcsPromise = largeFiles.length > 0
-        ? _uploadLargeFilesToGCS(largeFiles)
-        : Promise.resolve({});
+    // Step 1: Upload all files to GCS (if available), then submit metadata only
+    const gcsPromise = (_gcsAvailable && allFiles.length > 0)
+        ? _uploadFilesToGCS(allFiles)
+        : Promise.resolve(null);
 
     gcsPromise.then(gcsResults => {
         const formData = new FormData();
 
-        // Add all non-file form fields
+        // Add all non-file form fields (metadata only)
         const inputs = form.querySelectorAll('input:not([type=file]), select, textarea');
         inputs.forEach(inp => {
             if (inp.name) formData.append(inp.name, inp.value);
         });
 
-        // Add small files as multipart
-        for (const [inputName, files] of Object.entries(smallFiles)) {
-            files.forEach(f => formData.append(inputName, f, f.name));
-        }
-
-        // Add GCS file references as JSON hidden fields
-        for (const [inputName, gcsFileList] of Object.entries(gcsResults)) {
-            const idx = inputName.replace('payor_files_', '');
-            formData.append('gcs_files_' + idx, JSON.stringify(gcsFileList));
+        if (gcsResults) {
+            // GCS path: add gcs_files_N JSON references — no file bytes in the request
+            for (const [inputName, gcsFileList] of Object.entries(gcsResults)) {
+                const idx = inputName.replace('payor_files_', '');
+                formData.append('gcs_files_' + idx, JSON.stringify(gcsFileList));
+            }
+        } else {
+            // Fallback: no GCS — send files as multipart (only works for small uploads)
+            for (const af of allFiles) {
+                formData.append(af.inputName, af.file, af.file.name);
+            }
         }
 
         btn.textContent = 'Processing...';
@@ -3158,14 +3140,14 @@ function _submitViaFetch() {
     });
 }
 
-/* ---- Ingest Form: GCS upload for large single files ---- */
+/* ---- Ingest Form: GCS upload ---- */
 (function() {
     const form = document.getElementById('ingestForm');
     if (!form) return;
     form.addEventListener('submit', function(e) {
         const fileInput = form.querySelector('input[name="statement_file"]');
         const file = fileInput && fileInput.files[0];
-        if (!file || !_gcsAvailable || file.size < GCS_THRESHOLD) return; // let normal submit proceed
+        if (!file || !_gcsAvailable) return; // no GCS — let normal submit proceed
 
         e.preventDefault();
         const btn = document.getElementById('ingestBtn');
