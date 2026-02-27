@@ -202,9 +202,11 @@ def save_deal_to_db(slug, deal_name, payor_results, analytics,
 
             pc_id = cur.fetchone()[0]
 
-            # Bulk insert statement_rows from detail DataFrame
-            if pr.detail is not None and not pr.detail.empty:
-                _bulk_insert_statement_rows(conn, deal_id, pc_id, pr.detail)
+            # Skip bulk statement_rows insert — detail data is already in CSV/GCS exports.
+            # The COPY + keep_to_json serialization takes 10+ min for large datasets.
+            # Uncomment if row-level DB queries are ever needed:
+            # if pr.detail is not None and not pr.detail.empty:
+            #     _bulk_insert_statement_rows(conn, deal_id, pc_id, pr.detail)
 
             # Insert ISRC meta
             if pr.isrc_meta is not None and not pr.isrc_meta.empty:
