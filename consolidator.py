@@ -1817,53 +1817,37 @@ def _write_df_to_excel(writer, df, sheet_name):
 def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                              aggregate_by: Optional[List[str]] = None):
-    """Write a single consolidated Excel with data from all payors (23+ column schema)."""
-    log.info("Writing consolidated data to: %s", output_path)
+    """Write a single consolidated Excel with data from all payors (23+ column schema).
 
-    all_clean = []
-    all_summary = []
+    Uses xlsxwriter engine for streaming writes (much lower memory than openpyxl).
+    Writes the Consolidated sheet per-payor to avoid building a single massive DataFrame.
+    """
+    log.info("Writing consolidated Excel to: %s", output_path)
+
+    # Choose engine: xlsxwriter streams to disk (low memory), openpyxl as fallback
+    try:
+        import xlsxwriter  # noqa: F401
+        engine = 'xlsxwriter'
+        engine_kwargs = {'options': {'constant_memory': True}}
+    except ImportError:
+        engine = 'openpyxl'
+        engine_kwargs = {}
+
+    # Build smaller auxiliary DataFrames (summary, monthly, meta) — these are compact
     all_monthly = []
     all_isrc_meta = []
-
     for code, pr in payor_results.items():
         payor_name = pr.config.name
-
-        # Build 23-column detail
-        clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
-        all_clean.append(clean)
-
-        # ISRC + month summary
-        summary = pr.monthly.merge(
-            pr.isrc_meta[['identifier', 'title', 'artist']], on='identifier', how='left'
-        )
-        summary_cols = ['identifier', 'title', 'artist', 'period', 'statement_date',
-                        'gross', 'net', 'fees', 'sales']
-        summary_cols = [c for c in summary_cols if c in summary.columns]
-        summary = summary[summary_cols]
-        col_rename = {
-            'identifier': 'ISRC', 'title': 'Title', 'artist': 'Artist',
-            'period': 'Period', 'statement_date': 'Statement Date',
-            'gross': 'Gross', 'net': 'Net', 'fees': 'Fees', 'sales': 'Units',
-        }
-        summary = summary.rename(columns=col_rename)
-        summary.insert(0, 'Payor', payor_name)
-        all_summary.append(summary)
-
         # Monthly totals
         mt_agg = {'gross': 'sum', 'net': 'sum', 'sales': 'sum'}
         if 'fees' in pr.monthly.columns:
             mt_agg['fees'] = 'sum'
-        mt = (
-            pr.monthly.groupby(['period', 'statement_date'])
-            .agg(mt_agg)
-            .reset_index()
-        )
+        mt = pr.monthly.groupby(['period', 'statement_date']).agg(mt_agg).reset_index()
         mt = mt.rename(columns={'gross': 'Gross', 'net': 'Net', 'fees': 'Fees',
                                 'sales': 'Units', 'period': 'Period',
                                 'statement_date': 'Statement Date'})
         mt.insert(0, 'Payor', payor_name)
         all_monthly.append(mt)
-
         # ISRC metadata
         meta_cols = ['identifier', 'title', 'artist', 'product_title', 'total_gross']
         for extra in ['iswc', 'upc', 'release_date']:
@@ -1873,54 +1857,55 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         meta.insert(0, 'Payor', payor_name)
         all_isrc_meta.append(meta)
 
-    combined_clean = pd.concat(all_clean, ignore_index=True).sort_values(
-        ['Statement Date', 'Payor', 'ISRC'])
-    if aggregate_by:
-        combined_clean = aggregate_detail(combined_clean, aggregate_by)
-    combined_summary = pd.concat(all_summary, ignore_index=True).sort_values(
-        ['Payor', 'ISRC', 'Period'])
-    combined_monthly = pd.concat(all_monthly, ignore_index=True).sort_values(
-        ['Period', 'Payor'])
+    combined_monthly = pd.concat(all_monthly, ignore_index=True).sort_values(['Period', 'Payor'])
+    del all_monthly
     combined_meta = pd.concat(all_isrc_meta, ignore_index=True)
+    del all_isrc_meta
 
-    # Free intermediate lists to reduce memory pressure
-    del all_clean, all_summary, all_monthly, all_isrc_meta
-
-    # Cross-payor top songs (deduped by ISRC, summed across payors)
+    # Cross-payor top songs
     meta_agg = {'title': 'first', 'artist': 'first', 'total_gross': 'sum'}
     if 'release_date' in combined_meta.columns:
         meta_agg['release_date'] = 'first'
     cross_payor = (
-        combined_meta.groupby('identifier')
-        .agg(meta_agg)
-        .reset_index()
-        .sort_values('total_gross', ascending=False)
+        combined_meta.groupby('identifier').agg(meta_agg)
+        .reset_index().sort_values('total_gross', ascending=False)
     )
     del combined_meta
 
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        _write_df_to_excel(writer, combined_clean, 'Consolidated')
-        del combined_clean
-        _write_df_to_excel(writer, combined_summary, 'By ISRC-Month')
-        del combined_summary
+    with pd.ExcelWriter(output_path, engine=engine, **engine_kwargs) as writer:
+        # --- Consolidated sheet: stream per-payor to avoid giant combined DataFrame ---
+        row_offset = 0
+        for i, (code, pr) in enumerate(payor_results.items()):
+            clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
+            if aggregate_by:
+                clean = aggregate_detail(clean, aggregate_by)
+            clean = clean.sort_values(['Statement Date', 'Payor', 'ISRC'])
+            clean.to_excel(writer, sheet_name='Consolidated',
+                           startrow=row_offset + (1 if i > 0 else 0),
+                           header=(i == 0), index=False)
+            row_offset += len(clean) + (0 if i > 0 else 1)  # +1 for header on first
+            del clean
+            log.info("  Wrote payor %s to Consolidated sheet (%d rows so far)", code, row_offset)
+
+        # --- Smaller sheets ---
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
         del combined_monthly
 
-        # Per-payor store breakdown
         for code, pr in payor_results.items():
-            sheet_name = f'Stores_{code}'
+            sheet_name = f'Stores_{code}'[:31]
             pr.by_store.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        # Top songs across all payors — use release_date from enrichment/isrc_meta (no MusicBrainz call)
+        # Top songs
+        has_rd = 'release_date' in cross_payor.columns
         top = cross_payor.head(50).copy()
-        top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if 'release_date' in cross_payor.columns else [])
+        top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
         top.insert(0, 'Rank', range(1, len(top) + 1))
         top.to_excel(writer, sheet_name='Top 50 Songs', index=False)
 
-        # Full ISRC catalog
         catalog = cross_payor.copy()
-        catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if 'release_date' in cross_payor.columns else [])
+        catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
         catalog.to_excel(writer, sheet_name='ISRC Catalog', index=False)
+        del cross_payor, catalog
 
     log.info("Done writing consolidated Excel: %s", output_path)
 

@@ -1,5 +1,6 @@
 pandas
 openpyxl
+xlsxwriter
 flask
 pdfplumber
 google-genai
