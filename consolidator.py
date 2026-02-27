@@ -1883,46 +1883,46 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         ['Period', 'Payor'])
     combined_meta = pd.concat(all_isrc_meta, ignore_index=True)
 
+    # Free intermediate lists to reduce memory pressure
+    del all_clean, all_summary, all_monthly, all_isrc_meta
+
     # Cross-payor top songs (deduped by ISRC, summed across payors)
+    meta_agg = {'title': 'first', 'artist': 'first', 'total_gross': 'sum'}
+    if 'release_date' in combined_meta.columns:
+        meta_agg['release_date'] = 'first'
     cross_payor = (
         combined_meta.groupby('identifier')
-        .agg({'title': 'first', 'artist': 'first', 'total_gross': 'sum'})
+        .agg(meta_agg)
         .reset_index()
         .sort_values('total_gross', ascending=False)
     )
-
-    # MusicBrainz ISRC lookup for release dates (free, no credentials needed)
-    all_isrcs = cross_payor['identifier'].unique().tolist()
-    log.info("Looking up %d ISRCs on MusicBrainz...", len(all_isrcs))
-    isrc_data = lookup_isrcs_batch(all_isrcs, progress_callback=lambda done, total: log.info("  %d/%d ISRCs looked up...", done, total))
-    found = sum(1 for v in isrc_data.values() if v.get('release_date'))
-    log.info("MusicBrainz lookup complete: %d/%d ISRCs matched", found, len(all_isrcs))
+    del combined_meta
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         _write_df_to_excel(writer, combined_clean, 'Consolidated')
+        del combined_clean
         _write_df_to_excel(writer, combined_summary, 'By ISRC-Month')
+        del combined_summary
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
+        del combined_monthly
 
         # Per-payor store breakdown
         for code, pr in payor_results.items():
             sheet_name = f'Stores_{code}'
             pr.by_store.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        # Top songs across all payors with release date
+        # Top songs across all payors — use release_date from enrichment/isrc_meta (no MusicBrainz call)
         top = cross_payor.head(50).copy()
-        top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross']
+        top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if 'release_date' in cross_payor.columns else [])
         top.insert(0, 'Rank', range(1, len(top) + 1))
-        top['Release Date'] = top['ISRC'].apply(lambda x: isrc_data.get(x, {}).get('release_date', ''))
         top.to_excel(writer, sheet_name='Top 50 Songs', index=False)
 
-        # Full ISRC catalog with release dates
+        # Full ISRC catalog
         catalog = cross_payor.copy()
-        catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross']
-        catalog['Release Date'] = catalog['ISRC'].apply(lambda x: isrc_data.get(x, {}).get('release_date', ''))
+        catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if 'release_date' in cross_payor.columns else [])
         catalog.to_excel(writer, sheet_name='ISRC Catalog', index=False)
 
-    log.info("Done. %s rows in 'Consolidated'", f"{len(combined_clean):,}")
-    return combined_clean
+    log.info("Done writing consolidated Excel: %s", output_path)
 
 
 def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path,
@@ -2679,7 +2679,7 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
             'currency_code': pr.config.source_currency,
             'fee': f"{pr.config.fee:.0%}",
             'fx': pr.config.source_currency,
-            'currency_symbol': _CURRENCY_SYMBOLS.get(pr.config.source_currency, '$'),
+            'currency_symbol': _CURRENCY_SYMBOLS.get(_resolve_currency(pr), '$'),
             'detected_currency': ', '.join(getattr(pr, 'detected_currencies', [])),
             'statement_type': STATEMENT_TYPES.get(pr.config.statement_type, pr.config.statement_type),
             'deal_type': getattr(pr.config, 'deal_type', 'artist'),
@@ -3315,12 +3315,26 @@ def _compute_catalog_age_distribution(payor_results, ltm_monthly, ltm_gross_tota
 _CURRENCY_SYMBOLS = {'USD': '$', 'EUR': '\u20ac', 'GBP': '\u00a3', 'CAD': 'C$', 'AUD': 'A$', 'JPY': '\u00a5'}
 
 
+def _resolve_currency(pr):
+    """Resolve a payor's effective currency code ('auto' -> detected or USD)."""
+    cur = pr.config.source_currency
+    if cur and cur.lower() != 'auto':
+        return cur
+    # Use first detected currency from file parsing
+    detected = getattr(pr, 'detected_currencies', [])
+    if detected:
+        # Filter out 'auto' from detected list
+        real = [c for c in detected if c.lower() != 'auto']
+        if real:
+            return real[0]
+    return 'USD'
+
+
 def _currency_symbol(payor_results):
     """Determine display currency symbol from payor configs."""
-    currencies = [pr.config.source_currency for pr in payor_results.values()]
+    currencies = [_resolve_currency(pr) for pr in payor_results.values()]
     if not currencies:
         return '$'
-    # Use most common currency
     from collections import Counter
     most_common = Counter(currencies).most_common(1)[0][0]
     return _CURRENCY_SYMBOLS.get(most_common, most_common + ' ')
@@ -3328,7 +3342,7 @@ def _currency_symbol(payor_results):
 
 def _currency_code(payor_results):
     """Determine the primary ISO currency code from payor configs."""
-    currencies = [pr.config.source_currency for pr in payor_results.values()]
+    currencies = [_resolve_currency(pr) for pr in payor_results.values()]
     if not currencies:
         return 'USD'
     from collections import Counter
@@ -3338,7 +3352,7 @@ def _currency_code(payor_results):
 def _payor_currency_symbols(payor_results):
     """Return a dict mapping payor code -> currency symbol."""
     return {
-        code: _CURRENCY_SYMBOLS.get(pr.config.source_currency, pr.config.source_currency + ' ')
+        code: _CURRENCY_SYMBOLS.get(_resolve_currency(pr), _resolve_currency(pr) + ' ')
         for code, pr in payor_results.items()
     }
 
