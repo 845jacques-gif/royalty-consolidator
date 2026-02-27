@@ -1817,23 +1817,15 @@ def _write_df_to_excel(writer, df, sheet_name):
 def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                              aggregate_by: Optional[List[str]] = None):
-    """Write a single consolidated Excel with data from all payors (23+ column schema).
+    """Write a consolidated Excel with summary sheets from all payors.
 
-    Uses xlsxwriter engine for streaming writes (much lower memory than openpyxl).
-    Writes the Consolidated sheet per-payor to avoid building a single massive DataFrame.
+    The full transaction-level detail is in the CSV export. The Excel contains
+    summary/analytics sheets: Monthly Totals, Top Songs, ISRC Catalog, per-payor stores.
+    This keeps the Excel fast to write and small enough to open easily.
     """
     log.info("Writing consolidated Excel to: %s", output_path)
 
-    # Choose engine: xlsxwriter streams to disk (low memory), openpyxl as fallback
-    try:
-        import xlsxwriter  # noqa: F401
-        engine = 'xlsxwriter'
-        engine_kwargs = {'options': {'constant_memory': True}}
-    except ImportError:
-        engine = 'openpyxl'
-        engine_kwargs = {}
-
-    # Build smaller auxiliary DataFrames (summary, monthly, meta) — these are compact
+    # Build compact auxiliary DataFrames
     all_monthly = []
     all_isrc_meta = []
     for code, pr in payor_results.items():
@@ -1872,36 +1864,24 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     )
     del combined_meta
 
-    with pd.ExcelWriter(output_path, engine=engine, **engine_kwargs) as writer:
-        # --- Consolidated sheet: stream per-payor to avoid giant combined DataFrame ---
-        row_offset = 0
-        for i, (code, pr) in enumerate(payor_results.items()):
-            clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
-            if aggregate_by:
-                clean = aggregate_detail(clean, aggregate_by)
-            clean = clean.sort_values(['Statement Date', 'Payor', 'ISRC'])
-            clean.to_excel(writer, sheet_name='Consolidated',
-                           startrow=row_offset + (1 if i > 0 else 0),
-                           header=(i == 0), index=False)
-            row_offset += len(clean) + (0 if i > 0 else 1)  # +1 for header on first
-            del clean
-            log.info("  Wrote payor %s to Consolidated sheet (%d rows so far)", code, row_offset)
-
-        # --- Smaller sheets ---
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        # Monthly totals — compact, always fits
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
         del combined_monthly
 
+        # Per-payor store breakdowns
         for code, pr in payor_results.items():
             sheet_name = f'Stores_{code}'[:31]
             pr.by_store.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        # Top songs
+        # Top 50 songs
         has_rd = 'release_date' in cross_payor.columns
         top = cross_payor.head(50).copy()
         top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
         top.insert(0, 'Rank', range(1, len(top) + 1))
         top.to_excel(writer, sheet_name='Top 50 Songs', index=False)
 
+        # Full ISRC catalog
         catalog = cross_payor.copy()
         catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
         catalog.to_excel(writer, sheet_name='ISRC Catalog', index=False)

@@ -8603,16 +8603,64 @@ def custom_finalize():
 
             # Save deal if named (DB + GCS + local disk)
             if deal_name:
+                _xlsx = xlsx_path if 'Combined Excel' not in str(write_warnings) else None
+                _csv = csv_path if 'Combined CSV' not in str(write_warnings) else None
+                # DB save
                 with _state_lock:
-                    _set_processing_status(progress='Saving deal...')
+                    _set_processing_status(progress='Saving to database...')
+                if db.is_available():
+                    try:
+                        csym = analytics.get('currency_symbol', '$')
+                        db.save_deal_to_db(deal_slug, deal_name, payor_results, analytics,
+                                           currency_symbol=csym)
+                        log.info("Deal '%s' saved to PostgreSQL", deal_slug)
+                    except Exception as db_err:
+                        log.error("DB save failed: %s", db_err, exc_info=True)
+                        write_warnings.append(f"DB save failed: {db_err}")
+                # GCS upload
+                if storage.is_available():
+                    with _state_lock:
+                        _set_processing_status(progress='Uploading exports to GCS...')
+                    try:
+                        if _xlsx and os.path.exists(_xlsx):
+                            storage.upload_export(deal_slug, os.path.basename(_xlsx), _xlsx)
+                        if _csv and os.path.exists(_csv):
+                            storage.upload_export(deal_slug, os.path.basename(_csv), _csv)
+                        for pp_code, pp_path in per_payor_paths.items():
+                            if pp_path and os.path.exists(pp_path):
+                                storage.upload_per_payor_export(deal_slug, os.path.basename(pp_path), pp_path)
+                        log.info("Deal '%s' exports uploaded to GCS", deal_slug)
+                    except Exception as gcs_err:
+                        log.error("GCS upload failed: %s", gcs_err, exc_info=True)
+                        write_warnings.append(f"GCS upload failed: {gcs_err}")
+                # Local disk save (metadata + analytics JSON)
+                with _state_lock:
+                    _set_processing_status(progress='Saving deal files...')
                 try:
-                    save_deal(deal_slug, deal_name, payor_results, analytics,
-                              xlsx_path if 'Combined Excel' not in str(write_warnings) else None,
-                              csv_path if 'Combined CSV' not in str(write_warnings) else None,
-                              per_payor_paths)
-                except Exception as save_err:
-                    log.error("Failed to save deal: %s", save_err, exc_info=True)
-                    write_warnings.append(f"Deal save failed: {save_err}")
+                    deal_dir = os.path.join(DEALS_DIR, deal_slug)
+                    os.makedirs(deal_dir, exist_ok=True)
+                    deal_meta = {
+                        'name': deal_name, 'slug': deal_slug,
+                        'timestamp': datetime.now().isoformat(),
+                        'payor_codes': [pr.config.code for pr in payor_results.values()],
+                        'payor_names': [pr.config.name for pr in payor_results.values()],
+                        'total_gross': analytics.get('total_gross', '0'),
+                        'isrc_count': analytics.get('isrc_count', '0'),
+                        'total_files': analytics.get('total_files', 0),
+                        'currency_symbol': analytics.get('currency_symbol', '$'),
+                        'ltm_gross': analytics.get('ltm_gross_total_fmt', '0'),
+                        'ltm_net': analytics.get('ltm_net_total_fmt', '0'),
+                    }
+                    with open(os.path.join(deal_dir, 'deal_meta.json'), 'w') as f:
+                        json.dump(deal_meta, f, indent=2)
+                    with open(os.path.join(deal_dir, 'analytics.json'), 'w') as f:
+                        json.dump(analytics, f, indent=2, default=str)
+                    # Skip pickle dump — it's very slow for large datasets and not needed
+                    # (deal can be reconstructed from DB + GCS files)
+                    log.info("Deal '%s' metadata saved to disk", deal_slug)
+                except Exception as disk_err:
+                    log.error("Disk save failed: %s", disk_err, exc_info=True)
+                    write_warnings.append(f"Disk save failed: {disk_err}")
 
             with _state_lock:
                 if write_warnings:
