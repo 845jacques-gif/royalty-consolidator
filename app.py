@@ -6633,6 +6633,10 @@ function pollStatus() {
                 } else if (data.done) {
                     clearInterval(interval);
                     window.location.href = '/?loaded=1';
+                } else if (!data.running && !data.done && !data.error) {
+                    // Instance restarted — processing state was lost
+                    clearInterval(interval);
+                    window.location.href = '/';
                 }
             })
             .catch(() => {});
