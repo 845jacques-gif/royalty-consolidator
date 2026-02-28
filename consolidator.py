@@ -1827,6 +1827,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
 
     # Build compact auxiliary DataFrames
     all_monthly = []
+    all_isrc_summary = []
     all_isrc_meta = []
     for code, pr in payor_results.items():
         payor_name = pr.config.name
@@ -1840,6 +1841,20 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                                 'statement_date': 'Statement Date'})
         mt.insert(0, 'Payor', payor_name)
         all_monthly.append(mt)
+        # ISRC × month summary (compact: one row per ISRC per month, not per transaction)
+        summary = pr.monthly.merge(
+            pr.isrc_meta[['identifier', 'title', 'artist']], on='identifier', how='left'
+        )
+        summary_cols = ['identifier', 'title', 'artist', 'period', 'statement_date',
+                        'gross', 'net', 'fees', 'sales']
+        summary_cols = [c for c in summary_cols if c in summary.columns]
+        summary = summary[summary_cols].rename(columns={
+            'identifier': 'ISRC', 'title': 'Title', 'artist': 'Artist',
+            'period': 'Period', 'statement_date': 'Statement Date',
+            'gross': 'Gross', 'net': 'Net', 'fees': 'Fees', 'sales': 'Units',
+        })
+        summary.insert(0, 'Payor', payor_name)
+        all_isrc_summary.append(summary)
         # ISRC metadata
         meta_cols = ['identifier', 'title', 'artist', 'product_title', 'total_gross']
         for extra in ['iswc', 'upc', 'release_date']:
@@ -1851,6 +1866,8 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
 
     combined_monthly = pd.concat(all_monthly, ignore_index=True).sort_values(['Period', 'Payor'])
     del all_monthly
+    combined_isrc = pd.concat(all_isrc_summary, ignore_index=True).sort_values(['Payor', 'ISRC', 'Period'])
+    del all_isrc_summary
     combined_meta = pd.concat(all_isrc_meta, ignore_index=True)
     del all_isrc_meta
 
@@ -1865,6 +1882,10 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     del combined_meta
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        # ISRC × month breakdown (one row per ISRC per period per payor)
+        _write_df_to_excel(writer, combined_isrc, 'By ISRC-Month')
+        del combined_isrc
+
         # Monthly totals — compact, always fits
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
         del combined_monthly
