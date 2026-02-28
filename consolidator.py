@@ -1881,12 +1881,35 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     )
     del combined_meta
 
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        # ISRC × month breakdown (one row per ISRC per period per payor)
+    # Build full detail — one payor at a time to manage memory
+    all_clean = []
+    for code, pr in payor_results.items():
+        clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
+        all_clean.append(clean)
+    combined_clean = pd.concat(all_clean, ignore_index=True).sort_values(
+        ['Statement Date', 'Payor', 'ISRC'])
+    del all_clean
+    if aggregate_by:
+        combined_clean = aggregate_detail(combined_clean, aggregate_by)
+    log.info("  Combined detail: %s rows", f"{len(combined_clean):,}")
+
+    # Use xlsxwriter — 5-10x less memory than openpyxl for large sheets
+    try:
+        import xlsxwriter  # noqa: F401
+        engine = 'xlsxwriter'
+    except ImportError:
+        engine = 'openpyxl'
+
+    with pd.ExcelWriter(output_path, engine=engine) as writer:
+        # Full transaction-level detail
+        _write_df_to_excel(writer, combined_clean, 'Consolidated')
+        del combined_clean
+
+        # ISRC × month breakdown
         _write_df_to_excel(writer, combined_isrc, 'By ISRC-Month')
         del combined_isrc
 
-        # Monthly totals — compact, always fits
+        # Monthly totals
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
         del combined_monthly
 
