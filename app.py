@@ -452,15 +452,33 @@ def load_deal(slug):
         try:
             deal_name, analytics = db.load_deal_from_db(slug)
             log.info("Loaded deal '%s' from database", slug)
-            return deal_name, {}, analytics, None, None, {}
+            # Download exports from GCS to temp dir so download routes work
+            xlsx_path = None
+            csv_path = None
+            per_payor_paths = {}
+            if storage.is_available():
+                try:
+                    tmp_dir = os.path.join(tempfile.gettempdir(), f'rc_exports_{slug}')
+                    exports = storage.download_exports_to_dir(slug, tmp_dir)
+                    xlsx_path = exports.get('xlsx')
+                    csv_path = exports.get('csv')
+                    per_payor_paths = exports.get('per_payor', {})
+                    log.info("Downloaded GCS exports for '%s': xlsx=%s csv=%s pp=%d",
+                             slug, bool(xlsx_path), bool(csv_path), len(per_payor_paths))
+                except Exception as e:
+                    log.warning("GCS export download failed for %s: %s", slug, e)
+            return deal_name, {}, analytics, xlsx_path, csv_path, per_payor_paths
         except FileNotFoundError:
             pass  # Not in DB, fall through to local
         except Exception as e:
             log.warning("DB load failed for %s, trying local: %s", slug, e)
 
     deal_dir = os.path.join(DEALS_DIR, slug)
+    meta_path = os.path.join(deal_dir, 'deal_meta.json')
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Deal '{slug}' not found in database or on disk")
 
-    with open(os.path.join(deal_dir, 'deal_meta.json'), 'r') as f:
+    with open(meta_path, 'r') as f:
         meta = json.load(f)
 
     with open(os.path.join(deal_dir, 'payor_results.pkl'), 'rb') as f:
@@ -9380,10 +9398,23 @@ def rerun_quick_route(slug):
     """One-click re-run: load deal config, re-run consolidation with same PayorConfigs."""
     global _cached_deal_name, _processing_status
     try:
-        deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
-        payor_configs = [pr.config for pr in payor_results.values()]
+        # Try loading deal name from DB first (Cloud Run has no local files)
+        deal_name = None
+        payor_configs = []
+        if db.is_available():
+            try:
+                deal_name, _ = db.load_deal_from_db(slug)
+            except Exception as e:
+                log.warning("DB load for deal name failed: %s", e)
+        if not deal_name:
+            # Fallback to local disk
+            try:
+                deal_name, payor_results, _, _, _, _ = load_deal(slug)
+                payor_configs = [pr.config for pr in payor_results.values()]
+            except Exception:
+                pass
 
-        # On Cloud Run, payor_results is empty (no pickle). Reconstruct from DB.
+        # Reconstruct PayorConfigs from DB
         if not payor_configs and db.is_available():
             try:
                 pc_dicts = db.load_payor_configs_from_db(slug)

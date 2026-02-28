@@ -212,6 +212,55 @@ def download_to_file(gcs_path: str, local_path: str) -> str:
     return local_path
 
 
+def list_deal_exports(deal_slug: str) -> list:
+    """List all export GCS paths for a deal. Returns list of gcs_path strings."""
+    if _bucket is None:
+        return []
+    prefix = f"exports/{deal_slug}/"
+    return [blob.name for blob in _bucket.list_blobs(prefix=prefix)]
+
+
+def download_exports_to_dir(deal_slug: str, local_dir: str) -> dict:
+    """Download all deal exports from GCS to a local directory.
+    Returns {filename: local_path} for consolidated files found.
+    """
+    result = {'xlsx': None, 'csv': None, 'per_payor': {}}
+    paths = list_deal_exports(deal_slug)
+    if not paths:
+        return result
+
+    os.makedirs(local_dir, exist_ok=True)
+    pp_dir = os.path.join(local_dir, 'per_payor')
+
+    for gcs_path in paths:
+        filename = os.path.basename(gcs_path)
+        if not filename:
+            continue
+        is_per_payor = '/per_payor/' in gcs_path
+        if is_per_payor:
+            os.makedirs(pp_dir, exist_ok=True)
+            local_path = os.path.join(pp_dir, filename)
+        else:
+            local_path = os.path.join(local_dir, filename)
+
+        try:
+            download_to_file(gcs_path, local_path)
+        except Exception as e:
+            log.warning("Failed to download %s: %s", gcs_path, e)
+            continue
+
+        fl = filename.lower()
+        if is_per_payor:
+            code = filename.split('_')[0] if '_' in filename else filename.rsplit('.', 1)[0]
+            result['per_payor'][code] = local_path
+        elif fl.endswith('.xlsx') and ('consolidated' in fl or fl.startswith('consolidated')):
+            result['xlsx'] = local_path
+        elif fl.endswith('.csv') and ('consolidated' in fl or fl.startswith('consolidated')):
+            result['csv'] = local_path
+
+    return result
+
+
 def _guess_content_type(filename: str) -> str:
     """Guess content type from file extension."""
     ext = os.path.splitext(filename)[1].lower()
