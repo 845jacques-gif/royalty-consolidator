@@ -1816,7 +1816,8 @@ def _write_df_to_excel(writer, df, sheet_name):
 
 def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
-                             aggregate_by: Optional[List[str]] = None):
+                             aggregate_by: Optional[List[str]] = None,
+                             progress_cb=None):
     """Write a consolidated Excel with summary sheets from all payors.
 
     The full transaction-level detail is in the CSV export. The Excel contains
@@ -1886,26 +1887,14 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     import xlsxwriter as _xlsxw
 
     def _df_to_ws(ws, df, start_row=0, write_header=True):
-        """Write DataFrame to xlsxwriter worksheet row-by-row. Returns next row."""
+        """Write DataFrame to xlsxwriter worksheet using write_row (batch). Returns next row."""
         r = start_row
         if write_header:
-            for c, col_name in enumerate(df.columns):
-                ws.write(r, c, col_name)
+            ws.write_row(r, 0, list(df.columns))
             r += 1
-        # Use .values for speed (avoids iloc overhead per row)
-        vals = df.values
-        cols = df.columns
-        for i in range(len(vals)):
-            for c in range(len(cols)):
-                v = vals[i][c]
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    pass  # leave blank
-                elif isinstance(v, (int, float)):
-                    ws.write_number(r, c, v)
-                else:
-                    s = str(v)
-                    if s:
-                        ws.write_string(r, c, s)
+        # Convert to Python lists for write_row (much faster than per-cell writes)
+        for row in df.itertuples(index=False, name=None):
+            ws.write_row(r, 0, ['' if (v is None or (isinstance(v, float) and v != v)) else v for v in row])
             r += 1
         return r
 
@@ -1923,6 +1912,11 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         detail_df = pr.detail
         n_rows = len(detail_df)
         log.info("  Writing detail for %s: %s rows", code, f"{n_rows:,}")
+        if progress_cb:
+            try:
+                progress_cb(f'Writing Excel detail for {pr.config.name} ({n_rows:,} rows)...')
+            except Exception:
+                pass
 
         for chunk_start in range(0, n_rows, CHUNK_SIZE):
             chunk_end = min(chunk_start + CHUNK_SIZE, n_rows)

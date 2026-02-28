@@ -179,7 +179,7 @@ _processing_status = {
     'error': None,
     '_updated_at': 0.0,  # monotonic timestamp for staleness detection
 }
-_STALE_TIMEOUT = 600  # 10 minutes — if no status update, consider dead
+_STALE_TIMEOUT = 1800  # 30 minutes — if no status update, consider dead
 
 def _set_processing_status(**kwargs):
     """Update _processing_status with staleness timestamp."""
@@ -6767,7 +6767,12 @@ def run_consolidation(payor_configs, output_dir=None, deal_name=None, file_dates
 
     consolidated_xlsx = os.path.join(output_dir, 'Consolidated_All_Payors.xlsx')
     consolidated_csv = os.path.join(output_dir, 'Consolidated_All_Payors.csv')
-    write_consolidated_excel(payor_results, consolidated_xlsx, deal_name=deal_name or '')
+    def _export_progress(msg):
+        with _state_lock:
+            _set_processing_status(progress=msg)
+    write_consolidated_excel(payor_results, consolidated_xlsx, deal_name=deal_name or '',
+                             progress_cb=_export_progress)
+    _export_progress('Writing CSV...')
     write_consolidated_csv(payor_results, consolidated_csv, deal_name=deal_name or '')
 
     # Per-payor individual exports
