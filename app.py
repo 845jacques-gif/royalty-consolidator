@@ -469,14 +469,17 @@ def load_deal(slug):
                     log.warning("GCS export download failed for %s: %s", slug, e)
             return deal_name, {}, analytics, xlsx_path, csv_path, per_payor_paths
         except FileNotFoundError:
-            pass  # Not in DB, fall through to local
+            db_error = 'not found in DB'
         except Exception as e:
+            db_error = str(e)
             log.warning("DB load failed for %s, trying local: %s", slug, e)
+    else:
+        db_error = 'DB not available'
 
     deal_dir = os.path.join(DEALS_DIR, slug)
     meta_path = os.path.join(deal_dir, 'deal_meta.json')
     if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"Deal '{slug}' not found in database or on disk")
+        raise FileNotFoundError(f"Deal '{slug}' not found (DB: {db_error}, no local files)")
 
     with open(meta_path, 'r') as f:
         meta = json.load(f)
@@ -6792,39 +6795,51 @@ def run_consolidation(payor_configs, output_dir=None, deal_name=None, file_dates
 
 def _run_in_background(payor_configs, output_dir=None, deal_name=None, file_dates=None):
     """Background worker for consolidation."""
-    global _processing_status
     log.info("Background consolidation started: %d payor(s), deal=%s", len(payor_configs), deal_name)
     _log_memory()
     with _state_lock:
-        _processing_status = {'running': True, 'progress': 'Loading payor data...', 'done': False, 'error': None}
+        _set_processing_status(running=True, progress='Loading payor data...', done=False, error=None)
     try:
         with _state_lock:
-            _processing_status['progress'] = f'Processing {len(payor_configs)} payor(s)...'
+            _set_processing_status(progress=f'Processing {len(payor_configs)} payor(s)...')
         payor_results, analytics, consolidated_path = run_consolidation(
             payor_configs, output_dir=output_dir, deal_name=deal_name, file_dates=file_dates)
         with _state_lock:
             if not payor_results:
                 log.warning("Background consolidation finished with no data")
-                _processing_status.update({'running': False, 'done': True, 'error': 'No data found.'})
+                _set_processing_status(running=False, done=True, error='No data found.')
             else:
                 log.info("Background consolidation done: %s files, %s ISRCs",
                          analytics["total_files"], analytics["isrc_count"])
                 _log_memory()
-                _processing_status.update({
-                    'running': False,
-                    'progress': f'Done: {analytics["total_files"]} files, {analytics["isrc_count"]} ISRCs.',
-                    'done': True,
-                    'error': None,
-                })
+                _set_processing_status(
+                    running=False,
+                    progress=f'Done: {analytics["total_files"]} files, {analytics["isrc_count"]} ISRCs.',
+                    done=True, error=None)
     except Exception as e:
         log.error("Background consolidation FAILED: %s", e, exc_info=True)
         with _state_lock:
-            _processing_status.update({'running': False, 'done': True, 'error': str(e)})
+            _set_processing_status(running=False, done=True, error=str(e))
 
 
 @app.route('/')
 def index():
     with _state_lock:
+        # Auto-reset stuck processing status (e.g. thread crashed on Cloud Run)
+        import time as _t_idx
+        if _processing_status.get('running'):
+            updated = _processing_status.get('_updated_at', 0)
+            if updated > 0 and (_t_idx.monotonic() - updated) > _STALE_TIMEOUT:
+                log.warning("Processing status stale (%.0fs), auto-resetting",
+                            _t_idx.monotonic() - updated)
+                _processing_status.update({'running': False, 'done': True,
+                                           'error': 'Processing timed out. Please try again.'})
+            elif updated == 0 and _processing_status.get('running'):
+                # _updated_at was never set — legacy/crashed state, reset immediately
+                log.warning("Processing status has no timestamp, auto-resetting")
+                _processing_status.update({'running': False, 'done': True,
+                                           'error': 'Processing timed out. Please try again.'})
+
         analytics_copy = dict(_cached_analytics) if _cached_analytics else None
         payor_names = [pr.config.name for pr in _cached_results.values()] if _cached_results else []
         payor_codes = list(_cached_results.keys()) if _cached_results else []
@@ -9488,14 +9503,14 @@ def _run_in_background_with_delta(payor_configs, slug, deal_name):
     log.info("Quick re-run started: slug=%s, deal=%s", slug, deal_name)
     _log_memory()
     with _state_lock:
-        _processing_status = {'running': True, 'progress': 'Re-running consolidation...', 'done': False, 'error': None}
+        _set_processing_status(running=True, progress='Re-running consolidation...', done=False, error=None)
     try:
         payor_results, analytics, consolidated_path = run_consolidation(
             payor_configs, deal_name=deal_name)
 
         if not payor_results:
             with _state_lock:
-                _processing_status.update({'running': False, 'done': True, 'error': 'No data found.'})
+                _set_processing_status(running=False, done=True, error='No data found.')
             return
 
         # Compute delta report if previous analytics exist
@@ -9517,15 +9532,24 @@ def _run_in_background_with_delta(payor_configs, slug, deal_name):
                 log.warning("Delta report failed: %s", e)
 
         with _state_lock:
-            _processing_status.update({
-                'running': False,
-                'progress': f'Done: {analytics["total_files"]} files, {analytics["isrc_count"]} ISRCs.',
-                'done': True, 'error': None,
-            })
+            _set_processing_status(
+                running=False,
+                progress=f'Done: {analytics["total_files"]} files, {analytics["isrc_count"]} ISRCs.',
+                done=True, error=None)
     except Exception as e:
         log.error("Quick re-run FAILED: %s", e, exc_info=True)
         with _state_lock:
-            _processing_status.update({'running': False, 'done': True, 'error': str(e)})
+            _set_processing_status(running=False, done=True, error=str(e))
+
+
+@app.route('/api/reset-status', methods=['POST'])
+def reset_processing_status():
+    """Emergency reset for stuck processing status."""
+    with _state_lock:
+        _set_processing_status(running=False, done=False, error=None, progress='')
+    log.info("Processing status manually reset")
+    flash('Processing status reset.', 'success')
+    return redirect(url_for('index'))
 
 
 # ---------------------------------------------------------------------------
