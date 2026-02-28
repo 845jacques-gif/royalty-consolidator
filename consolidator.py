@@ -1818,21 +1818,15 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                              aggregate_by: Optional[List[str]] = None,
                              progress_cb=None):
-    """Write a consolidated Excel with full detail + summary sheets.
+    """Write a consolidated Excel with summary/analytics sheets.
 
-    Uses xlsxwriter constant_memory mode and streams detail in 100K-row chunks.
-    Detail is split across numbered sheets when it exceeds the Excel row limit.
+    Full row-level detail goes in the per-payor Excel exports instead.
+    This file has: By ISRC-Month, Monthly Totals, Distributors, Top 50 Songs, ISRC Catalog.
     """
     import gc
-    import types
     import xlsxwriter as _xlsxw
 
     log.info("Writing consolidated Excel to: %s", output_path)
-
-    total_detail = sum(len(pr.detail) for pr in payor_results.values())
-    log.info("  Total detail rows: %s", f"{total_detail:,}")
-
-    CHUNK = 100_000
 
     def _ws_write_row(ws, r, values):
         ws.write_row(r, 0, ['' if (v is None or (isinstance(v, float) and v != v)) else v for v in values])
@@ -1842,7 +1836,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         for i, row in enumerate(df.itertuples(index=False, name=None)):
             _ws_write_row(ws, i + 1, row)
 
-    # Build compact auxiliary DataFrames first (small — no memory concern)
+    # Build compact auxiliary DataFrames (small — no memory concern)
     all_monthly = []
     all_isrc_summary = []
     all_isrc_meta = []
@@ -1901,54 +1895,14 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
 
     if progress_cb:
         try:
-            progress_cb('Writing Excel detail sheets...')
+            progress_cb('Writing Excel summary sheets...')
         except Exception:
             pass
-
-    # ---- Detail sheet(s): full 23-col rows, chunked ----
-    sheet_num = 1
-    ws = wb.add_worksheet('Detail')
-    header_written = False
-    row_in_sheet = 0
-    rows_written = 0
-
-    for code, pr in payor_results.items():
-        n_rows = len(pr.detail)
-        for chunk_start in range(0, n_rows, CHUNK):
-            chunk_end = min(chunk_start + CHUNK, n_rows)
-            chunk_detail = pr.detail.iloc[chunk_start:chunk_end]
-            mini_pr = types.SimpleNamespace(detail=chunk_detail, config=pr.config)
-            clean = _build_detail_23col(mini_pr, deal_name=deal_name, formulas=formulas)
-
-            if not header_written:
-                _ws_write_row(ws, 0, list(clean.columns))
-                row_in_sheet = 1
-                header_written = True
-
-            for row_vals in clean.itertuples(index=False, name=None):
-                if row_in_sheet >= EXCEL_MAX_ROWS + 1:
-                    sheet_num += 1
-                    ws = wb.add_worksheet(f'Detail_{sheet_num}')
-                    _ws_write_row(ws, 0, list(clean.columns))
-                    row_in_sheet = 1
-                _ws_write_row(ws, row_in_sheet, row_vals)
-                row_in_sheet += 1
-
-            rows_written += len(clean)
-            del clean, chunk_detail, mini_pr
-
-            if progress_cb and rows_written % (CHUNK * 5) == 0:
-                try:
-                    progress_cb(f'Writing Excel detail ({rows_written:,}/{total_detail:,})...')
-                except Exception:
-                    pass
-
-    gc.collect()
-    log.info("  Detail: %s rows across %d sheet(s)", f"{rows_written:,}", sheet_num)
 
     # ---- By ISRC-Month ----
     ws_i = wb.add_worksheet('By ISRC-Month')
     _df_to_ws(ws_i, combined_isrc)
+    log.info("  By ISRC-Month: %s rows", f"{len(combined_isrc):,}")
     del combined_isrc
 
     # ---- Monthly Totals ----
@@ -1956,7 +1910,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     _df_to_ws(ws_m, combined_monthly)
     del combined_monthly
 
-    # ---- Distributors (per-payor store sheets) ----
+    # ---- Distributors ----
     for code, pr in payor_results.items():
         sname = f'Distributors_{code}' if len(payor_results) > 1 else 'Distributors'
         store_df = pr.by_store.rename(columns={'Store': 'Distributor'})

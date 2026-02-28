@@ -51,7 +51,7 @@ jobs:
             --project=ma-royalty-consolidator \
             --platform=managed \
             --image=docker.io/845jacques/royalty-consolidator:${{ github.sha }} \
-            --memory=8Gi \
+            --memory=16Gi \
             --cpu=4 \
             --timeout=900 \
             --concurrency=80 \

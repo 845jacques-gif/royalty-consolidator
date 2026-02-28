@@ -6770,19 +6770,24 @@ def run_consolidation(payor_configs, output_dir=None, deal_name=None, file_dates
     def _export_progress(msg):
         with _state_lock:
             _set_processing_status(progress=msg)
+    # Compute analytics first (needs pr.detail before any memory pressure)
+    _export_progress('Computing analytics...')
+    analytics = compute_analytics(payor_results)
+
+    # Write consolidated Excel (summary only — fast, low memory)
     write_consolidated_excel(payor_results, consolidated_xlsx, deal_name=deal_name or '',
                              progress_cb=_export_progress)
-    _export_progress('Writing CSV...')
-    write_consolidated_csv(payor_results, consolidated_csv, deal_name=deal_name or '',
-                           progress_cb=_export_progress)
 
-    # Per-payor individual exports
+    # Per-payor Excel with full detail rows (main export for modeling)
     per_payor_dir = os.path.join(output_dir, 'per_payor')
     _export_progress('Writing per-payor Excel exports...')
     per_payor_paths = write_per_payor_exports(payor_results, per_payor_dir, deal_name=deal_name or '',
                                                progress_cb=_export_progress)
 
-    analytics = compute_analytics(payor_results)
+    # CSV with full detail (streamed in chunks)
+    _export_progress('Writing CSV...')
+    write_consolidated_csv(payor_results, consolidated_csv, deal_name=deal_name or '',
+                           progress_cb=_export_progress)
 
     with _state_lock:
         _cached_results = payor_results
