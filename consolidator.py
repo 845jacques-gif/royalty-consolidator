@@ -1818,21 +1818,36 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                              deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                              aggregate_by: Optional[List[str]] = None,
                              progress_cb=None):
-    """Write a consolidated Excel with summary sheets from all payors.
+    """Write a consolidated Excel with full detail + summary sheets.
 
-    The full transaction-level detail is in the CSV export. The Excel contains
-    summary/analytics sheets: Monthly Totals, Top Songs, ISRC Catalog, per-payor stores.
-    This keeps the Excel fast to write and small enough to open easily.
+    Uses xlsxwriter constant_memory mode and streams detail in 100K-row chunks.
+    Detail is split across numbered sheets when it exceeds the Excel row limit.
     """
+    import gc
+    import types
+    import xlsxwriter as _xlsxw
+
     log.info("Writing consolidated Excel to: %s", output_path)
 
-    # Build compact auxiliary DataFrames
+    total_detail = sum(len(pr.detail) for pr in payor_results.values())
+    log.info("  Total detail rows: %s", f"{total_detail:,}")
+
+    CHUNK = 100_000
+
+    def _ws_write_row(ws, r, values):
+        ws.write_row(r, 0, ['' if (v is None or (isinstance(v, float) and v != v)) else v for v in values])
+
+    def _df_to_ws(ws, df):
+        ws.write_row(0, 0, list(df.columns))
+        for i, row in enumerate(df.itertuples(index=False, name=None)):
+            _ws_write_row(ws, i + 1, row)
+
+    # Build compact auxiliary DataFrames first (small — no memory concern)
     all_monthly = []
     all_isrc_summary = []
     all_isrc_meta = []
     for code, pr in payor_results.items():
         payor_name = pr.config.name
-        # Monthly totals
         mt_agg = {'gross': 'sum', 'net': 'sum', 'sales': 'sum'}
         if 'fees' in pr.monthly.columns:
             mt_agg['fees'] = 'sum'
@@ -1842,7 +1857,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
                                 'statement_date': 'Statement Date'})
         mt.insert(0, 'Payor', payor_name)
         all_monthly.append(mt)
-        # ISRC × month summary (compact: one row per ISRC per month, not per transaction)
+
         summary = pr.monthly.merge(
             pr.isrc_meta[['identifier', 'title', 'artist']], on='identifier', how='left'
         )
@@ -1856,7 +1871,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         })
         summary.insert(0, 'Payor', payor_name)
         all_isrc_summary.append(summary)
-        # ISRC metadata
+
         meta_cols = ['identifier', 'title', 'artist', 'product_title', 'total_gross']
         for extra in ['iswc', 'upc', 'release_date']:
             if extra in pr.isrc_meta.columns:
@@ -1872,7 +1887,6 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     combined_meta = pd.concat(all_isrc_meta, ignore_index=True)
     del all_isrc_meta
 
-    # Cross-payor top songs
     meta_agg = {'title': 'first', 'artist': 'first', 'total_gross': 'sum'}
     if 'release_date' in combined_meta.columns:
         meta_agg['release_date'] = 'first'
@@ -1882,62 +1896,86 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     )
     del combined_meta
 
-    import gc
-    import types
-    import xlsxwriter as _xlsxw
-
-    def _df_to_ws(ws, df, start_row=0, write_header=True):
-        """Write DataFrame to xlsxwriter worksheet using write_row (batch). Returns next row."""
-        r = start_row
-        if write_header:
-            ws.write_row(r, 0, list(df.columns))
-            r += 1
-        # Convert to Python lists for write_row (much faster than per-cell writes)
-        for row in df.itertuples(index=False, name=None):
-            ws.write_row(r, 0, ['' if (v is None or (isinstance(v, float) and v != v)) else v for v in row])
-            r += 1
-        return r
-
-    log.info("Writing Excel with xlsxwriter constant_memory mode...")
-    log.info("  Detail rows too large for Excel — full detail in CSV only, Excel gets ISRC×Month summary")
+    # ---- Write workbook ----
     wb = _xlsxw.Workbook(output_path, {'constant_memory': True})
 
     if progress_cb:
         try:
-            progress_cb('Writing Excel summary sheets...')
+            progress_cb('Writing Excel detail sheets...')
         except Exception:
             pass
 
-    # ---- Sheet 1: Consolidated (ISRC × Month summary — manageable size) ----
-    ws = wb.add_worksheet('Consolidated')
-    _df_to_ws(ws, combined_isrc)
-    log.info("  Consolidated (ISRC×Month): %s rows", f"{len(combined_isrc):,}")
-    del combined_isrc
-    gc.collect()
+    # ---- Detail sheet(s): full 23-col rows, chunked ----
+    sheet_num = 1
+    ws = wb.add_worksheet('Detail')
+    header_written = False
+    row_in_sheet = 0
+    rows_written = 0
 
-    # ---- Sheet 3: Monthly Totals ----
-    ws3 = wb.add_worksheet('Monthly Totals')
-    _df_to_ws(ws3, combined_monthly)
+    for code, pr in payor_results.items():
+        n_rows = len(pr.detail)
+        for chunk_start in range(0, n_rows, CHUNK):
+            chunk_end = min(chunk_start + CHUNK, n_rows)
+            chunk_detail = pr.detail.iloc[chunk_start:chunk_end]
+            mini_pr = types.SimpleNamespace(detail=chunk_detail, config=pr.config)
+            clean = _build_detail_23col(mini_pr, deal_name=deal_name, formulas=formulas)
+
+            if not header_written:
+                _ws_write_row(ws, 0, list(clean.columns))
+                row_in_sheet = 1
+                header_written = True
+
+            for row_vals in clean.itertuples(index=False, name=None):
+                if row_in_sheet >= EXCEL_MAX_ROWS + 1:
+                    sheet_num += 1
+                    ws = wb.add_worksheet(f'Detail_{sheet_num}')
+                    _ws_write_row(ws, 0, list(clean.columns))
+                    row_in_sheet = 1
+                _ws_write_row(ws, row_in_sheet, row_vals)
+                row_in_sheet += 1
+
+            rows_written += len(clean)
+            del clean, chunk_detail, mini_pr
+
+            if progress_cb and rows_written % (CHUNK * 5) == 0:
+                try:
+                    progress_cb(f'Writing Excel detail ({rows_written:,}/{total_detail:,})...')
+                except Exception:
+                    pass
+
+    gc.collect()
+    log.info("  Detail: %s rows across %d sheet(s)", f"{rows_written:,}", sheet_num)
+
+    # ---- By ISRC-Month ----
+    ws_i = wb.add_worksheet('By ISRC-Month')
+    _df_to_ws(ws_i, combined_isrc)
+    del combined_isrc
+
+    # ---- Monthly Totals ----
+    ws_m = wb.add_worksheet('Monthly Totals')
+    _df_to_ws(ws_m, combined_monthly)
     del combined_monthly
 
-    # ---- Per-payor store sheets ----
+    # ---- Distributors (per-payor store sheets) ----
     for code, pr in payor_results.items():
-        ws_s = wb.add_worksheet(f'Stores_{code}'[:31])
-        _df_to_ws(ws_s, pr.by_store)
+        sname = f'Distributors_{code}' if len(payor_results) > 1 else 'Distributors'
+        store_df = pr.by_store.rename(columns={'Store': 'Distributor'})
+        ws_d = wb.add_worksheet(sname[:31])
+        _df_to_ws(ws_d, store_df)
 
     # ---- Top 50 Songs ----
     has_rd = 'release_date' in cross_payor.columns
     top = cross_payor.head(50).copy()
     top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
     top.insert(0, 'Rank', range(1, len(top) + 1))
-    ws4 = wb.add_worksheet('Top 50 Songs')
-    _df_to_ws(ws4, top)
+    ws_t = wb.add_worksheet('Top 50 Songs')
+    _df_to_ws(ws_t, top)
 
     # ---- ISRC Catalog ----
     catalog = cross_payor.copy()
     catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
-    ws5 = wb.add_worksheet('ISRC Catalog')
-    _df_to_ws(ws5, catalog)
+    ws_c = wb.add_worksheet('ISRC Catalog')
+    _df_to_ws(ws_c, catalog)
     del cross_payor, catalog
 
     wb.close()
