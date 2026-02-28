@@ -59,6 +59,7 @@ jobs:
             --set-env-vars=DB_HOST=/cloudsql/ma-royalty-consolidator:us-central1:royaltyconsolidator,DB_PORT=5432,DB_NAME=royalty_consolidator,DB_USER=postgres,GCS_BUCKET=royalty_consolidator_uploaded_files \
             --set-secrets=DB_PASSWORD=postgres-db-password:latest \
             --add-cloudsql-instances=ma-royalty-consolidator:us-central1:royaltyconsolidator \
+            --no-cpu-throttling \
             --labels=managed-by=github-actions,commit-sha=${{ github.sha }}
 
       - name: Set max request body size
