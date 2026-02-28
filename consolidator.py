@@ -1881,97 +1881,101 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     )
     del combined_meta
 
-    # Use xlsxwriter — 5-10x less memory than openpyxl for large sheets
-    try:
-        import xlsxwriter  # noqa: F401
-        engine = 'xlsxwriter'
-    except ImportError:
-        engine = 'openpyxl'
-
     import gc
+    import types
+    import xlsxwriter as _xlsxw
 
-    with pd.ExcelWriter(output_path, engine=engine) as writer:
-        # Full transaction-level detail — stream per-payor to avoid holding all in memory
-        detail_row_count = 0
-        sheet_num = 1
-        sheet_row = 0  # rows written to current sheet (excl header)
-        headers_written = False
-        current_sheet_name = 'Consolidated'
+    def _df_to_ws(ws, df, start_row=0, write_header=True):
+        """Write DataFrame to xlsxwriter worksheet row-by-row. Returns next row."""
+        r = start_row
+        if write_header:
+            for c, col_name in enumerate(df.columns):
+                ws.write(r, c, col_name)
+            r += 1
+        # Use .values for speed (avoids iloc overhead per row)
+        vals = df.values
+        cols = df.columns
+        for i in range(len(vals)):
+            for c in range(len(cols)):
+                v = vals[i][c]
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    pass  # leave blank
+                elif isinstance(v, (int, float)):
+                    ws.write_number(r, c, v)
+                else:
+                    s = str(v)
+                    if s:
+                        ws.write_string(r, c, s)
+            r += 1
+        return r
 
-        for code, pr in payor_results.items():
-            clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
+    log.info("Writing Excel with xlsxwriter constant_memory mode...")
+    wb = _xlsxw.Workbook(output_path, {'constant_memory': True})
+
+    # ---- Sheet 1: Consolidated (full detail, chunked row-by-row) ----
+    detail_row_count = 0
+    CHUNK_SIZE = 25_000  # rows per chunk to limit DataFrame memory
+    ws = wb.add_worksheet('Consolidated')
+    header_written = False
+    xl_row = 0
+
+    for code, pr in payor_results.items():
+        detail_df = pr.detail
+        n_rows = len(detail_df)
+        log.info("  Writing detail for %s: %s rows", code, f"{n_rows:,}")
+
+        for chunk_start in range(0, n_rows, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, n_rows)
+            chunk_detail = detail_df.iloc[chunk_start:chunk_end]
+            mini_pr = types.SimpleNamespace(detail=chunk_detail, config=pr.config)
+            clean = _build_detail_23col(mini_pr, deal_name=deal_name, formulas=formulas)
             if aggregate_by:
                 clean = aggregate_detail(clean, aggregate_by)
-            # Sort within this payor's chunk
-            sort_cols = [c for c in ['Statement Date', 'ISRC'] if c in clean.columns]
-            if sort_cols:
-                clean = clean.sort_values(sort_cols)
 
-            if not headers_written:
-                # Write first chunk (creates sheet + headers)
-                _write_df_to_excel(writer, clean, current_sheet_name)
-                sheet_row = len(clean)
-                headers_written = True
-            else:
-                # Append rows to existing sheet(s), respecting EXCEL_MAX_ROWS
-                remaining = clean
-                while len(remaining) > 0:
-                    space = EXCEL_MAX_ROWS - sheet_row
-                    if space <= 0:
-                        # Start a new sheet
-                        sheet_num += 1
-                        current_sheet_name = f'Consolidated_{sheet_num}'
-                        chunk = remaining.iloc[:EXCEL_MAX_ROWS]
-                        remaining = remaining.iloc[EXCEL_MAX_ROWS:]
-                        chunk.to_excel(writer, sheet_name=current_sheet_name[:31], index=False)
-                        sheet_row = len(chunk)
-                    elif space >= len(remaining):
-                        # All fits in current sheet
-                        remaining.to_excel(writer, sheet_name=current_sheet_name[:31],
-                                           index=False, header=False, startrow=sheet_row + 1)
-                        sheet_row += len(remaining)
-                        remaining = remaining.iloc[0:0]  # empty
-                    else:
-                        # Partial fit
-                        chunk = remaining.iloc[:space]
-                        remaining = remaining.iloc[space:]
-                        chunk.to_excel(writer, sheet_name=current_sheet_name[:31],
-                                       index=False, header=False, startrow=sheet_row + 1)
-                        sheet_row += len(chunk)
-
+            xl_row = _df_to_ws(ws, clean, start_row=xl_row, write_header=not header_written)
+            header_written = True
             detail_row_count += len(clean)
-            del clean
-            gc.collect()
+            del clean, chunk_detail, mini_pr
 
-        log.info("  Combined detail: %s rows (streamed per-payor)", f"{detail_row_count:,}")
-
-        # ISRC × month breakdown
-        _write_df_to_excel(writer, combined_isrc, 'By ISRC-Month')
-        del combined_isrc
+        # Free detail memory after writing this payor
+        pr.detail = pd.DataFrame()
         gc.collect()
+        log.info("  Freed detail for %s, gc done", code)
 
-        # Monthly totals
-        combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
-        del combined_monthly
+    log.info("  Combined detail: %s rows (streamed row-by-row)", f"{detail_row_count:,}")
 
-        # Per-payor store breakdowns
-        for code, pr in payor_results.items():
-            sheet_name = f'Stores_{code}'[:31]
-            pr.by_store.to_excel(writer, sheet_name=sheet_name, index=False)
+    # ---- Sheet 2: By ISRC-Month ----
+    ws2 = wb.add_worksheet('By ISRC-Month')
+    _df_to_ws(ws2, combined_isrc)
+    del combined_isrc
+    gc.collect()
 
-        # Top 50 songs
-        has_rd = 'release_date' in cross_payor.columns
-        top = cross_payor.head(50).copy()
-        top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
-        top.insert(0, 'Rank', range(1, len(top) + 1))
-        top.to_excel(writer, sheet_name='Top 50 Songs', index=False)
+    # ---- Sheet 3: Monthly Totals ----
+    ws3 = wb.add_worksheet('Monthly Totals')
+    _df_to_ws(ws3, combined_monthly)
+    del combined_monthly
 
-        # Full ISRC catalog
-        catalog = cross_payor.copy()
-        catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
-        catalog.to_excel(writer, sheet_name='ISRC Catalog', index=False)
-        del cross_payor, catalog
+    # ---- Per-payor store sheets ----
+    for code, pr in payor_results.items():
+        ws_s = wb.add_worksheet(f'Stores_{code}'[:31])
+        _df_to_ws(ws_s, pr.by_store)
 
+    # ---- Top 50 Songs ----
+    has_rd = 'release_date' in cross_payor.columns
+    top = cross_payor.head(50).copy()
+    top.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
+    top.insert(0, 'Rank', range(1, len(top) + 1))
+    ws4 = wb.add_worksheet('Top 50 Songs')
+    _df_to_ws(ws4, top)
+
+    # ---- ISRC Catalog ----
+    catalog = cross_payor.copy()
+    catalog.columns = ['ISRC', 'Title', 'Artist', 'Total Gross'] + (['Release Date'] if has_rd else [])
+    ws5 = wb.add_worksheet('ISRC Catalog')
+    _df_to_ws(ws5, catalog)
+    del cross_payor, catalog
+
+    wb.close()
     log.info("Done writing consolidated Excel: %s", output_path)
 
 
