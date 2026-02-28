@@ -1937,10 +1937,7 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
             detail_row_count += len(clean)
             del clean, chunk_detail, mini_pr
 
-        # Free detail memory after writing this payor
-        pr.detail = pd.DataFrame()
         gc.collect()
-        log.info("  Freed detail for %s, gc done", code)
 
     log.info("  Combined detail: %s rows (streamed row-by-row)", f"{detail_row_count:,}")
 
