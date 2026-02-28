@@ -1711,7 +1711,7 @@ def _build_detail_23col(pr: 'PayorResult', deal_name: str = '',
 
     formulas: optional {field: "=expression"} from Phase 2 waterfall calc step.
     """
-    d = pr.detail.copy()
+    d = pr.detail
     cfg = pr.config
     n = len(d)
 
@@ -1881,18 +1881,6 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     )
     del combined_meta
 
-    # Build full detail — one payor at a time to manage memory
-    all_clean = []
-    for code, pr in payor_results.items():
-        clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
-        all_clean.append(clean)
-    combined_clean = pd.concat(all_clean, ignore_index=True).sort_values(
-        ['Statement Date', 'Payor', 'ISRC'])
-    del all_clean
-    if aggregate_by:
-        combined_clean = aggregate_detail(combined_clean, aggregate_by)
-    log.info("  Combined detail: %s rows", f"{len(combined_clean):,}")
-
     # Use xlsxwriter — 5-10x less memory than openpyxl for large sheets
     try:
         import xlsxwriter  # noqa: F401
@@ -1900,14 +1888,67 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
     except ImportError:
         engine = 'openpyxl'
 
+    import gc
+
     with pd.ExcelWriter(output_path, engine=engine) as writer:
-        # Full transaction-level detail
-        _write_df_to_excel(writer, combined_clean, 'Consolidated')
-        del combined_clean
+        # Full transaction-level detail — stream per-payor to avoid holding all in memory
+        detail_row_count = 0
+        sheet_num = 1
+        sheet_row = 0  # rows written to current sheet (excl header)
+        headers_written = False
+        current_sheet_name = 'Consolidated'
+
+        for code, pr in payor_results.items():
+            clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
+            if aggregate_by:
+                clean = aggregate_detail(clean, aggregate_by)
+            # Sort within this payor's chunk
+            sort_cols = [c for c in ['Statement Date', 'ISRC'] if c in clean.columns]
+            if sort_cols:
+                clean = clean.sort_values(sort_cols)
+
+            if not headers_written:
+                # Write first chunk (creates sheet + headers)
+                _write_df_to_excel(writer, clean, current_sheet_name)
+                sheet_row = len(clean)
+                headers_written = True
+            else:
+                # Append rows to existing sheet(s), respecting EXCEL_MAX_ROWS
+                remaining = clean
+                while len(remaining) > 0:
+                    space = EXCEL_MAX_ROWS - sheet_row
+                    if space <= 0:
+                        # Start a new sheet
+                        sheet_num += 1
+                        current_sheet_name = f'Consolidated_{sheet_num}'
+                        chunk = remaining.iloc[:EXCEL_MAX_ROWS]
+                        remaining = remaining.iloc[EXCEL_MAX_ROWS:]
+                        chunk.to_excel(writer, sheet_name=current_sheet_name[:31], index=False)
+                        sheet_row = len(chunk)
+                    elif space >= len(remaining):
+                        # All fits in current sheet
+                        remaining.to_excel(writer, sheet_name=current_sheet_name[:31],
+                                           index=False, header=False, startrow=sheet_row + 1)
+                        sheet_row += len(remaining)
+                        remaining = remaining.iloc[0:0]  # empty
+                    else:
+                        # Partial fit
+                        chunk = remaining.iloc[:space]
+                        remaining = remaining.iloc[space:]
+                        chunk.to_excel(writer, sheet_name=current_sheet_name[:31],
+                                       index=False, header=False, startrow=sheet_row + 1)
+                        sheet_row += len(chunk)
+
+            detail_row_count += len(clean)
+            del clean
+            gc.collect()
+
+        log.info("  Combined detail: %s rows (streamed per-payor)", f"{detail_row_count:,}")
 
         # ISRC × month breakdown
         _write_df_to_excel(writer, combined_isrc, 'By ISRC-Month')
         del combined_isrc
+        gc.collect()
 
         # Monthly totals
         combined_monthly.to_excel(writer, sheet_name='Monthly Totals', index=False)
@@ -1937,21 +1978,26 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
 def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path,
                            deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
                            aggregate_by: Optional[List[str]] = None):
-    """Write consolidated detail as a single CSV file (23+ column schema)."""
+    """Write consolidated detail as a single CSV file (23+ column schema).
+    Streams per-payor to avoid holding all detail in memory at once.
+    """
     log.info("Writing consolidated CSV to: %s", output_path)
-
-    all_clean = []
+    import gc
+    total_rows = 0
+    first = True
     for code, pr in payor_results.items():
         clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
-        all_clean.append(clean)
-
-    combined = pd.concat(all_clean, ignore_index=True).sort_values(
-        ['Statement Date', 'Payor', 'ISRC'])
-    if aggregate_by:
-        combined = aggregate_detail(combined, aggregate_by)
-    combined.to_csv(output_path, index=False)
-    log.info("Done. %s rows", f"{len(combined):,}")
-    return combined
+        if aggregate_by:
+            clean = aggregate_detail(clean, aggregate_by)
+        sort_cols = [c for c in ['Statement Date', 'ISRC'] if c in clean.columns]
+        if sort_cols:
+            clean = clean.sort_values(sort_cols)
+        clean.to_csv(output_path, index=False, mode='w' if first else 'a', header=first)
+        total_rows += len(clean)
+        first = False
+        del clean
+        gc.collect()
+    log.info("Done. %s rows (streamed per-payor)", f"{total_rows:,}")
 
 
 def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: str,
