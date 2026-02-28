@@ -1899,45 +1899,19 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
         return r
 
     log.info("Writing Excel with xlsxwriter constant_memory mode...")
+    log.info("  Detail rows too large for Excel — full detail in CSV only, Excel gets ISRC×Month summary")
     wb = _xlsxw.Workbook(output_path, {'constant_memory': True})
 
-    # ---- Sheet 1: Consolidated (full detail, chunked row-by-row) ----
-    detail_row_count = 0
-    CHUNK_SIZE = 25_000  # rows per chunk to limit DataFrame memory
+    if progress_cb:
+        try:
+            progress_cb('Writing Excel summary sheets...')
+        except Exception:
+            pass
+
+    # ---- Sheet 1: Consolidated (ISRC × Month summary — manageable size) ----
     ws = wb.add_worksheet('Consolidated')
-    header_written = False
-    xl_row = 0
-
-    for code, pr in payor_results.items():
-        detail_df = pr.detail
-        n_rows = len(detail_df)
-        log.info("  Writing detail for %s: %s rows", code, f"{n_rows:,}")
-        if progress_cb:
-            try:
-                progress_cb(f'Writing Excel detail for {pr.config.name} ({n_rows:,} rows)...')
-            except Exception:
-                pass
-
-        for chunk_start in range(0, n_rows, CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, n_rows)
-            chunk_detail = detail_df.iloc[chunk_start:chunk_end]
-            mini_pr = types.SimpleNamespace(detail=chunk_detail, config=pr.config)
-            clean = _build_detail_23col(mini_pr, deal_name=deal_name, formulas=formulas)
-            if aggregate_by:
-                clean = aggregate_detail(clean, aggregate_by)
-
-            xl_row = _df_to_ws(ws, clean, start_row=xl_row, write_header=not header_written)
-            header_written = True
-            detail_row_count += len(clean)
-            del clean, chunk_detail, mini_pr
-
-        gc.collect()
-
-    log.info("  Combined detail: %s rows (streamed row-by-row)", f"{detail_row_count:,}")
-
-    # ---- Sheet 2: By ISRC-Month ----
-    ws2 = wb.add_worksheet('By ISRC-Month')
-    _df_to_ws(ws2, combined_isrc)
+    _df_to_ws(ws, combined_isrc)
+    log.info("  Consolidated (ISRC×Month): %s rows", f"{len(combined_isrc):,}")
     del combined_isrc
     gc.collect()
 
@@ -1972,27 +1946,38 @@ def write_consolidated_excel(payor_results: Dict[str, PayorResult], output_path,
 
 def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path,
                            deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
-                           aggregate_by: Optional[List[str]] = None):
+                           aggregate_by: Optional[List[str]] = None,
+                           progress_cb=None):
     """Write consolidated detail as a single CSV file (23+ column schema).
-    Streams per-payor to avoid holding all detail in memory at once.
+    Streams per-payor in chunks to avoid holding all detail in memory.
     """
     log.info("Writing consolidated CSV to: %s", output_path)
     import gc
+    import types
+    CHUNK_SIZE = 100_000
     total_rows = 0
     first = True
     for code, pr in payor_results.items():
-        clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
-        if aggregate_by:
-            clean = aggregate_detail(clean, aggregate_by)
-        sort_cols = [c for c in ['Statement Date', 'ISRC'] if c in clean.columns]
-        if sort_cols:
-            clean = clean.sort_values(sort_cols)
-        clean.to_csv(output_path, index=False, mode='w' if first else 'a', header=first)
-        total_rows += len(clean)
-        first = False
-        del clean
+        n_rows = len(pr.detail)
+        log.info("  CSV: writing %s (%s rows)", code, f"{n_rows:,}")
+        if progress_cb:
+            try:
+                progress_cb(f'Writing CSV for {pr.config.name} ({n_rows:,} rows)...')
+            except Exception:
+                pass
+        for chunk_start in range(0, n_rows, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, n_rows)
+            chunk_detail = pr.detail.iloc[chunk_start:chunk_end]
+            mini_pr = types.SimpleNamespace(detail=chunk_detail, config=pr.config)
+            clean = _build_detail_23col(mini_pr, deal_name=deal_name, formulas=formulas)
+            if aggregate_by:
+                clean = aggregate_detail(clean, aggregate_by)
+            clean.to_csv(output_path, index=False, mode='w' if first else 'a', header=first)
+            total_rows += len(clean)
+            first = False
+            del clean, chunk_detail, mini_pr
         gc.collect()
-    log.info("Done. %s rows (streamed per-payor)", f"{total_rows:,}")
+    log.info("Done. %s rows (streamed in chunks)", f"{total_rows:,}")
 
 
 def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: str,
@@ -2006,10 +1991,7 @@ def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: s
         path = os.path.join(output_dir, f'{safe_name}_consolidated.xlsx')
         log.info("Writing %s -> %s", pr.config.name, path)
 
-        clean = _build_detail_23col(pr, deal_name=deal_name, formulas=formulas)
-        if aggregate_by:
-            clean = aggregate_detail(clean, aggregate_by)
-
+        # ISRC × Month summary (full detail is in CSV export)
         summary = pr.monthly.merge(
             pr.isrc_meta[['identifier', 'title', 'artist']], on='identifier', how='left'
         )
@@ -2038,13 +2020,12 @@ def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: s
         })
 
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
-            _write_df_to_excel(writer, clean, 'Detail')
             _write_df_to_excel(writer, summary, 'By ISRC-Month')
             monthly_totals.to_excel(writer, sheet_name='Monthly Totals', index=False)
             pr.by_store.to_excel(writer, sheet_name='Stores', index=False)
 
         paths[code] = path
-        log.info("%s: %s rows", pr.config.name, f"{len(clean):,}")
+        log.info("%s: %s summary rows", pr.config.name, f"{len(summary):,}")
 
     return paths
 

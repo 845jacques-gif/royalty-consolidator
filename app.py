@@ -6773,7 +6773,8 @@ def run_consolidation(payor_configs, output_dir=None, deal_name=None, file_dates
     write_consolidated_excel(payor_results, consolidated_xlsx, deal_name=deal_name or '',
                              progress_cb=_export_progress)
     _export_progress('Writing CSV...')
-    write_consolidated_csv(payor_results, consolidated_csv, deal_name=deal_name or '')
+    write_consolidated_csv(payor_results, consolidated_csv, deal_name=deal_name or '',
+                           progress_cb=_export_progress)
 
     # Per-payor individual exports
     per_payor_dir = os.path.join(output_dir, 'per_payor')
