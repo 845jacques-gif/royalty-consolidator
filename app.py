@@ -8867,19 +8867,51 @@ def refresh():
     return redirect(url_for('index'))
 
 
+def _try_gcs_download(local_path, gcs_fallback_path, download_name):
+    """Serve a file locally if small enough, otherwise redirect to GCS signed URL."""
+    # If local file exists and is under 30MB, serve directly
+    if local_path and os.path.exists(local_path):
+        size = os.path.getsize(local_path)
+        if size < 30 * 1024 * 1024:
+            return send_file(local_path, as_attachment=True, download_name=download_name)
+
+    # For large files or missing local files, use GCS signed URL
+    if storage.is_available() and gcs_fallback_path:
+        try:
+            if storage.blob_exists(gcs_fallback_path):
+                url = storage.generate_signed_url(gcs_fallback_path, download_filename=download_name)
+                return redirect(url)
+        except Exception as e:
+            log.warning("GCS signed URL failed for %s: %s", gcs_fallback_path, e)
+
+    # Last resort: try serving locally regardless of size
+    if local_path and os.path.exists(local_path):
+        return send_file(local_path, as_attachment=True, download_name=download_name)
+
+    return None
+
+
 @app.route('/download/<filetype>')
 def download(filetype):
+    slug = _make_slug(_cached_deal_name) if _cached_deal_name else ''
     if filetype == 'consolidated':
         path = app.config.get('CONSOLIDATED_PATH')
+        gcs_path = storage.get_export_gcs_path(slug, 'Consolidated_All_Payors.xlsx') if slug else ''
+        fname = 'Consolidated_All_Payors.xlsx'
     elif filetype == 'csv':
         path = app.config.get('CONSOLIDATED_CSV_PATH')
+        gcs_path = storage.get_export_gcs_path(slug, 'Consolidated_All_Payors.csv') if slug else ''
+        fname = 'Consolidated_All_Payors.csv'
     elif filetype == 'model':
         path = app.config.get('MODEL_PATH')
+        gcs_path = ''
+        fname = os.path.basename(path) if path else 'model.xlsx'
     else:
         return 'Not found', 404
 
-    if path and os.path.exists(path):
-        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+    result = _try_gcs_download(path, gcs_path, fname)
+    if result:
+        return result
     return 'File not found. Run consolidation first.', 404
 
 
@@ -8888,8 +8920,15 @@ def download_payor(code):
     """Download a single payor's consolidated export."""
     per_payor = app.config.get('PER_PAYOR_PATHS', {})
     path = per_payor.get(code)
-    if path and os.path.exists(path):
-        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+    fname = os.path.basename(path) if path else f'{code}_consolidated.xlsx'
+
+    # Try GCS signed URL for large per-payor exports
+    slug = _make_slug(_cached_deal_name) if _cached_deal_name else ''
+    gcs_path = storage.get_export_gcs_path(slug, fname, per_payor=True) if slug else ''
+
+    result = _try_gcs_download(path, gcs_path, fname)
+    if result:
+        return result
     return 'File not found. Run consolidation first.', 404
 
 

@@ -261,6 +261,35 @@ def download_exports_to_dir(deal_slug: str, local_dir: str) -> dict:
     return result
 
 
+def generate_signed_url(gcs_path: str, expiration_minutes: int = 60,
+                        download_filename: str = '') -> str:
+    """Generate a signed URL for direct GCS download (bypasses Cloud Run response limits)."""
+    if _bucket is None:
+        raise RuntimeError("GCS not initialised")
+
+    import datetime
+    blob = _bucket.blob(gcs_path)
+
+    disposition = ''
+    if download_filename:
+        disposition = f'attachment; filename="{download_filename}"'
+
+    url = blob.generate_signed_url(
+        version='v4',
+        expiration=datetime.timedelta(minutes=expiration_minutes),
+        method='GET',
+        response_disposition=disposition or None,
+    )
+    return url
+
+
+def get_export_gcs_path(deal_slug: str, filename: str, per_payor: bool = False) -> str:
+    """Get the GCS path for a deal export file."""
+    if per_payor:
+        return f"exports/{deal_slug}/per_payor/{filename}"
+    return f"exports/{deal_slug}/{filename}"
+
+
 def _guess_content_type(filename: str) -> str:
     """Guess content type from file extension."""
     ext = os.path.splitext(filename)[1].lower()
