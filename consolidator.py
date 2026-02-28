@@ -1750,7 +1750,7 @@ def _build_detail_23col(pr: 'PayorResult', deal_name: str = '',
         'Release Date Source': _col('release_date_source') if 'release_date_source' in d.columns else '',
         'Source': _col('store'),
         'Deal': deal_name or '',
-        'Media Type': _col('media_type'),
+        'Delivery Type': _col('media_type'),
         'Territory': d['country'] if 'country' in d.columns and d['country'].astype(str).str.strip().ne('').any()
                      else (cfg.territory or ''),
         'FX Original': d['gross_original'] if 'gross_original' in d.columns else d.get('gross', 0),
@@ -1982,50 +1982,119 @@ def write_consolidated_csv(payor_results: Dict[str, PayorResult], output_path,
 
 def write_per_payor_exports(payor_results: Dict[str, PayorResult], output_dir: str,
                             deal_name: str = '', formulas: Optional[Dict[str, str]] = None,
-                            aggregate_by: Optional[List[str]] = None):
-    """Write one consolidated Excel file per payor. Returns dict of code -> path."""
+                            aggregate_by: Optional[List[str]] = None,
+                            progress_cb=None):
+    """Write one consolidated Excel file per payor with full detail rows.
+
+    Uses xlsxwriter constant_memory mode + chunked _build_detail_23col to stay
+    within Cloud Run's 8 GB RAM.  Detail is split across numbered sheets when
+    it exceeds the Excel row limit (1 048 575).
+    """
+    import gc
+    import types
+    import xlsxwriter as _xlsxw
+
     os.makedirs(output_dir, exist_ok=True)
     paths = {}
+    CHUNK = 100_000
+
+    def _ws_write_row(ws, r, values):
+        ws.write_row(r, 0, ['' if (v is None or (isinstance(v, float) and v != v)) else v for v in values])
+
     for code, pr in payor_results.items():
         safe_name = pr.config.name.replace(' ', '_').replace('/', '_')
         path = os.path.join(output_dir, f'{safe_name}_consolidated.xlsx')
-        log.info("Writing %s -> %s", pr.config.name, path)
+        n_detail = len(pr.detail)
+        log.info("Writing %s -> %s (%s detail rows)", pr.config.name, path, f"{n_detail:,}")
 
-        # ISRC × Month summary (full detail is in CSV export)
+        wb = _xlsxw.Workbook(path, {'constant_memory': True})
+
+        # ---- Detail sheet(s): full 23-col rows in chunks ----
+        sheet_num = 1
+        sheet_name = 'Detail'
+        ws = wb.add_worksheet(sheet_name)
+        header_written = False
+        row_in_sheet = 0
+
+        for chunk_start in range(0, n_detail, CHUNK):
+            chunk_end = min(chunk_start + CHUNK, n_detail)
+            chunk_detail = pr.detail.iloc[chunk_start:chunk_end]
+            mini_pr = types.SimpleNamespace(detail=chunk_detail, config=pr.config)
+            clean = _build_detail_23col(mini_pr, deal_name=deal_name, formulas=formulas)
+
+            if not header_written:
+                _ws_write_row(ws, 0, list(clean.columns))
+                row_in_sheet = 1
+                header_written = True
+
+            for row_vals in clean.itertuples(index=False, name=None):
+                if row_in_sheet >= EXCEL_MAX_ROWS + 1:  # +1 for header
+                    # Start a new sheet
+                    sheet_num += 1
+                    sheet_name = f'Detail_{sheet_num}'
+                    ws = wb.add_worksheet(sheet_name)
+                    _ws_write_row(ws, 0, list(clean.columns))
+                    row_in_sheet = 1
+                _ws_write_row(ws, row_in_sheet, row_vals)
+                row_in_sheet += 1
+
+            del clean, chunk_detail, mini_pr
+
+            if progress_cb and chunk_end % (CHUNK * 5) == 0:
+                try:
+                    progress_cb(f'Writing {pr.config.name} Excel detail ({chunk_end:,}/{n_detail:,})...')
+                except Exception:
+                    pass
+
+        gc.collect()
+        log.info("  Detail: %s rows across %d sheet(s)", f"{n_detail:,}", sheet_num)
+
+        # ---- By ISRC-Month ----
         summary = pr.monthly.merge(
             pr.isrc_meta[['identifier', 'title', 'artist']], on='identifier', how='left'
         )
         summary_cols = ['identifier', 'title', 'artist', 'period', 'statement_date',
                         'gross', 'net', 'fees', 'sales']
         summary_cols = [c for c in summary_cols if c in summary.columns]
-        summary = summary[summary_cols]
-        summary = summary.rename(columns={
+        summary = summary[summary_cols].rename(columns={
             'identifier': 'ISRC', 'title': 'Title', 'artist': 'Artist',
             'period': 'Period', 'statement_date': 'Statement Date',
             'gross': 'Gross', 'net': 'Net', 'fees': 'Fees', 'sales': 'Units',
         })
+        ws_s = wb.add_worksheet('By ISRC-Month')
+        _ws_write_row(ws_s, 0, list(summary.columns))
+        for i, row_vals in enumerate(summary.itertuples(index=False, name=None)):
+            _ws_write_row(ws_s, i + 1, row_vals)
+        del summary
 
+        # ---- Monthly Totals ----
         mt_agg = {'gross': 'sum', 'net': 'sum', 'sales': 'sum'}
         if 'fees' in pr.monthly.columns:
             mt_agg['fees'] = 'sum'
         monthly_totals = (
             pr.monthly.groupby(['period', 'statement_date'])
-            .agg(mt_agg)
-            .reset_index()
+            .agg(mt_agg).reset_index()
+            .rename(columns={'gross': 'Gross', 'net': 'Net', 'fees': 'Fees',
+                              'sales': 'Units', 'period': 'Period',
+                              'statement_date': 'Statement Date'})
         )
-        monthly_totals = monthly_totals.rename(columns={
-            'gross': 'Gross', 'net': 'Net', 'fees': 'Fees',
-            'sales': 'Units', 'period': 'Period',
-            'statement_date': 'Statement Date',
-        })
+        ws_m = wb.add_worksheet('Monthly Totals')
+        _ws_write_row(ws_m, 0, list(monthly_totals.columns))
+        for i, row_vals in enumerate(monthly_totals.itertuples(index=False, name=None)):
+            _ws_write_row(ws_m, i + 1, row_vals)
+        del monthly_totals
 
-        with pd.ExcelWriter(path, engine='openpyxl') as writer:
-            _write_df_to_excel(writer, summary, 'By ISRC-Month')
-            monthly_totals.to_excel(writer, sheet_name='Monthly Totals', index=False)
-            pr.by_store.to_excel(writer, sheet_name='Stores', index=False)
+        # ---- Distributors ----
+        store_df = pr.by_store.rename(columns={'Store': 'Distributor'})
+        ws_d = wb.add_worksheet('Distributors')
+        _ws_write_row(ws_d, 0, list(store_df.columns))
+        for i, row_vals in enumerate(store_df.itertuples(index=False, name=None)):
+            _ws_write_row(ws_d, i + 1, row_vals)
 
+        wb.close()
+        gc.collect()
         paths[code] = path
-        log.info("%s: %s summary rows", pr.config.name, f"{len(summary):,}")
+        log.info("%s: done (%s detail + summary sheets)", pr.config.name, f"{n_detail:,}")
 
     return paths
 
@@ -2916,8 +2985,9 @@ def compute_analytics(payor_results: Dict[str, PayorResult],
     for code, pr in payor_results.items():
         if not hasattr(pr, 'detail') or pr.detail is None:
             continue
-        d = pr.detail.copy()
-        d = d[d['period'] >= ltm_start_period]
+        if 'period' not in pr.detail.columns:
+            continue
+        d = pr.detail[pr.detail['period'] >= ltm_start_period]
         all_ltm_detail.append(d)
     ltm_dist_list = []
     ltm_media_types = []

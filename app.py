@@ -6778,7 +6778,9 @@ def run_consolidation(payor_configs, output_dir=None, deal_name=None, file_dates
 
     # Per-payor individual exports
     per_payor_dir = os.path.join(output_dir, 'per_payor')
-    per_payor_paths = write_per_payor_exports(payor_results, per_payor_dir, deal_name=deal_name or '')
+    _export_progress('Writing per-payor Excel exports...')
+    per_payor_paths = write_per_payor_exports(payor_results, per_payor_dir, deal_name=deal_name or '',
+                                               progress_cb=_export_progress)
 
     analytics = compute_analytics(payor_results)
 
@@ -6830,6 +6832,7 @@ def _run_in_background(payor_configs, output_dir=None, deal_name=None, file_date
 
 @app.route('/')
 def index():
+    global _cached_results, _cached_analytics, _cached_deal_name
     with _state_lock:
         # Auto-reset stuck processing status (e.g. thread crashed on Cloud Run)
         import time as _t_idx
@@ -6852,19 +6855,41 @@ def index():
         deal_name_copy = _cached_deal_name
         processing_copy = dict(_processing_status)
 
-        # Inject per-payor currency symbols into cached analytics
-        if analytics_copy and _cached_results:
-            from consolidator import _payor_currency_symbols
-            pcsyms = _payor_currency_symbols(_cached_results)
-            for item in analytics_copy.get('ltm_by_payor', []):
-                if 'currency_symbol' not in item:
-                    item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
-            for item in analytics_copy.get('payor_summaries', []):
-                if 'currency_symbol' not in item:
-                    item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
-            for item in analytics_copy.get('earnings_matrix', []):
-                if 'currency_symbol' not in item:
-                    item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
+    # Auto-load from DB if in-memory cache is empty but a re-run just completed
+    # (Cloud Run may recycle the instance between background completion and page refresh)
+    if not analytics_copy and not processing_copy.get('running'):
+        _auto_slug = processing_copy.get('_deal_slug')
+        if _auto_slug and db.is_available():
+            log.info("Auto-loading deal '%s' from DB (instance cache empty after re-run)", _auto_slug)
+            try:
+                _dn, _pr, _an, _xp, _cp, _pp = load_deal(_auto_slug)
+                with _state_lock:
+                    _cached_results = _pr
+                    _cached_analytics = _an
+                    _cached_deal_name = _dn
+                app.config['CONSOLIDATED_PATH'] = _xp
+                app.config['CONSOLIDATED_CSV_PATH'] = _cp
+                app.config['PER_PAYOR_PATHS'] = _pp
+                analytics_copy = _an
+                deal_name_copy = _dn
+                payor_names = [pr.config.name for pr in _pr.values()] if _pr else []
+                payor_codes = list(_pr.keys()) if _pr else []
+            except Exception as _e:
+                log.warning("Auto-load from DB failed for %s: %s", _auto_slug, _e)
+
+    # Inject per-payor currency symbols into cached analytics
+    if analytics_copy and _cached_results:
+        from consolidator import _payor_currency_symbols
+        pcsyms = _payor_currency_symbols(_cached_results)
+        for item in analytics_copy.get('ltm_by_payor', []):
+            if 'currency_symbol' not in item:
+                item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
+        for item in analytics_copy.get('payor_summaries', []):
+            if 'currency_symbol' not in item:
+                item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
+        for item in analytics_copy.get('earnings_matrix', []):
+            if 'currency_symbol' not in item:
+                item['currency_symbol'] = pcsyms.get(item.get('code'), '$')
 
     # Check for recent delta report
     delta_summary = None
@@ -8417,7 +8442,7 @@ def custom_export():
     raw_to_agg = [
         ('statement_date', 'Statement Date'), ('identifier', 'ISRC'),
         ('title', 'Title'), ('artist', 'Artist'), ('store', 'Source'),
-        ('media_type', 'Media Type'), ('country', 'Territory'),
+        ('media_type', 'Delivery Type'), ('country', 'Territory'),
     ]
     # Payor and Royalty Type are always available (set by config, not mapping)
     available_agg_fields = ['Statement Date', 'Royalty Type', 'Payor']
@@ -9509,7 +9534,8 @@ def _run_in_background_with_delta(payor_configs, slug, deal_name):
     log.info("Quick re-run started: slug=%s, deal=%s", slug, deal_name)
     _log_memory()
     with _state_lock:
-        _set_processing_status(running=True, progress='Re-running consolidation...', done=False, error=None)
+        _set_processing_status(running=True, progress='Re-running consolidation...', done=False, error=None,
+                               _deal_slug=slug)
     try:
         payor_results, analytics, consolidated_path = run_consolidation(
             payor_configs, deal_name=deal_name)
