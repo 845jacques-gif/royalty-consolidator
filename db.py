@@ -233,8 +233,13 @@ def load_deal_from_db(slug):
         if not row:
             raise FileNotFoundError(f"Deal '{slug}' not found in database")
 
-        deal_id, deal_name, analytics_json = row
-        analytics = json.loads(analytics_json) if analytics_json else {}
+        deal_id, deal_name, analytics_raw = row
+        if isinstance(analytics_raw, dict):
+            analytics = analytics_raw
+        elif analytics_raw:
+            analytics = json.loads(analytics_raw)
+        else:
+            analytics = {}
 
         return deal_name, analytics
 
