@@ -377,6 +377,16 @@ def save_deal(slug, deal_name, payor_results, analytics, xlsx_path, csv_path, pe
                     storage.upload_contract(slug, pr.config.code,
                                             os.path.basename(pr.config.contract_pdf_path),
                                             pr.config.contract_pdf_path)
+            # Upload payor_results pickle for forecast (needed after instance recycle)
+            try:
+                pkl_tmp = os.path.join(tempfile.gettempdir(), f'{slug}_payor_results.pkl')
+                with open(pkl_tmp, 'wb') as pf:
+                    pickle.dump(payor_results, pf)
+                storage.upload_export(slug, 'payor_results.pkl', pkl_tmp)
+                os.remove(pkl_tmp)
+                log.info("Uploaded payor_results.pkl to GCS for %s", slug)
+            except Exception as e:
+                log.warning("Failed to upload payor_results.pkl for %s: %s", slug, e)
             log.info("Deal '%s' exports uploaded to GCS", slug)
         except Exception as e:
             log.error("GCS upload failed for %s: %s", slug, e)
@@ -453,11 +463,24 @@ def load_deal(slug):
             deal_name, analytics = db.load_deal_from_db(slug)
             log.info("Loaded deal '%s' from database", slug)
             # Don't download large exports — download routes use GCS signed URLs directly.
-            # Just record that the paths exist in GCS for the download route to find.
             xlsx_path = None
             csv_path = None
             per_payor_paths = {}
-            return deal_name, {}, analytics, xlsx_path, csv_path, per_payor_paths
+            # Try to load payor_results from GCS pickle (needed for forecast)
+            payor_results = {}
+            if storage.is_available():
+                try:
+                    gcs_pkl = storage.get_export_gcs_path(slug, 'payor_results.pkl')
+                    if storage.blob_exists(gcs_pkl):
+                        pkl_tmp = os.path.join(tempfile.gettempdir(), f'{slug}_payor_results.pkl')
+                        storage.download_to_file(gcs_pkl, pkl_tmp)
+                        with open(pkl_tmp, 'rb') as pf:
+                            payor_results = pickle.load(pf)
+                        os.remove(pkl_tmp)
+                        log.info("Loaded payor_results from GCS for %s (%d payors)", slug, len(payor_results))
+                except Exception as e:
+                    log.warning("Could not load payor_results.pkl from GCS for %s: %s", slug, e)
+            return deal_name, payor_results, analytics, xlsx_path, csv_path, per_payor_paths
         except FileNotFoundError:
             db_error = 'not found in DB'
         except Exception as e:
@@ -9953,7 +9976,16 @@ def forecast_page(slug):
 def forecast_run(slug):
     """Run forecast projection (called from forecast_page POST handler)."""
     try:
-        deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
+        # Use in-memory cache if available (avoids downloading large pickle from GCS)
+        if _cached_results and _cached_deal_name:
+            deal_name = _cached_deal_name
+            payor_results = _cached_results
+            analytics = _cached_analytics or {}
+        else:
+            deal_name, payor_results, analytics, _, _, _ = load_deal(slug)
+        if not payor_results:
+            flash('Forecast requires payor data. Please re-run consolidation first.', 'error')
+            return redirect(url_for('forecast_page', slug=slug))
 
         # Parse config from form
         purchase_price = float(request.form.get('purchase_price', 0) or 0)
