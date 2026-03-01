@@ -291,6 +291,27 @@ def generate_download_url(gcs_path: str, expiration_minutes: int = 60,
     return url
 
 
+def stream_blob(gcs_path: str):
+    """Return a generator that streams a GCS blob in 2MB chunks + its size.
+    Fallback for when signed URLs aren't available."""
+    if _bucket is None:
+        raise RuntimeError("GCS not initialised")
+
+    blob = _bucket.blob(gcs_path)
+    blob.reload()  # get metadata (size)
+    size = blob.size or 0
+
+    def _chunks():
+        with blob.open('rb') as f:
+            while True:
+                chunk = f.read(2 * 1024 * 1024)  # 2MB
+                if not chunk:
+                    break
+                yield chunk
+
+    return _chunks(), size
+
+
 def get_export_gcs_path(deal_slug: str, filename: str, per_payor: bool = False) -> str:
     """Get the GCS path for a deal export file."""
     if per_payor:
