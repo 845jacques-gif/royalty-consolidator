@@ -44,6 +44,29 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      - name: Store GCS signing key in Secret Manager
+        run: |
+          # Create or update the signing key secret so Cloud Run can sign GCS URLs
+          if gcloud secrets describe gcs-signing-key --project=ma-royalty-consolidator >/dev/null 2>&1; then
+            echo '${{ secrets.GCP_SA_KEY }}' | gcloud secrets versions add gcs-signing-key \
+              --data-file=- --project=ma-royalty-consolidator 2>/dev/null && \
+              echo "Updated gcs-signing-key secret" || echo "Secret update skipped (may already be current)"
+          else
+            echo '${{ secrets.GCP_SA_KEY }}' | gcloud secrets create gcs-signing-key \
+              --data-file=- --project=ma-royalty-consolidator 2>/dev/null && \
+              echo "Created gcs-signing-key secret" || echo "Warning: could not create secret (permission denied)"
+          fi
+          # Grant the compute SA access to read the secret
+          SA_EMAIL=$(gcloud run services describe royalty-consolidator \
+            --region=us-west1 --project=ma-royalty-consolidator \
+            --format="value(spec.template.spec.serviceAccountName)" 2>/dev/null || echo "")
+          if [ -n "$SA_EMAIL" ]; then
+            gcloud secrets add-iam-policy-binding gcs-signing-key \
+              --member="serviceAccount:$SA_EMAIL" \
+              --role="roles/secretmanager.secretAccessor" \
+              --project=ma-royalty-consolidator 2>/dev/null || true
+          fi
+
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy royalty-consolidator \
@@ -57,28 +80,7 @@ jobs:
             --concurrency=80 \
             --execution-environment=gen2 \
             --set-env-vars=DB_HOST=/cloudsql/ma-royalty-consolidator:us-central1:royaltyconsolidator,DB_PORT=5432,DB_NAME=royalty_consolidator,DB_USER=postgres,GCS_BUCKET=royalty_consolidator_uploaded_files \
-            --set-secrets=DB_PASSWORD=postgres-db-password:latest \
+            --set-secrets=DB_PASSWORD=postgres-db-password:latest,GCS_SIGNING_KEY=gcs-signing-key:latest \
             --add-cloudsql-instances=ma-royalty-consolidator:us-central1:royaltyconsolidator \
             --no-cpu-throttling \
             --labels=managed-by=github-actions,commit-sha=${{ github.sha }}
-
-      - name: Set max response body size (Knative v1 API)
-        run: |
-          TOKEN=$(gcloud auth print-access-token)
-          # Use Knative v1 API with merge-patch to set system annotations
-          echo "Setting maxResponseBodySize and maxRequestBodySize annotations..."
-          RESULT=$(curl -s -w "\n%{http_code}" -X PATCH \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/merge-patch+json" \
-            "https://us-west1-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/ma-royalty-consolidator/services/royalty-consolidator" \
-            -d '{"metadata":{"annotations":{"run.googleapis.com/maxResponseBodySize":"2Gi","run.googleapis.com/maxRequestBodySize":"2Gi"}}}')
-          HTTP_CODE=$(echo "$RESULT" | tail -1)
-          BODY=$(echo "$RESULT" | head -n -1)
-          echo "HTTP $HTTP_CODE"
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "Verifying..."
-            echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('metadata',{}).get('annotations',{}); print('maxResponseBodySize:', a.get('run.googleapis.com/maxResponseBodySize','NOT SET')); print('maxRequestBodySize:', a.get('run.googleapis.com/maxRequestBodySize','NOT SET'))" || true
-          else
-            echo "Response: $BODY"
-            echo "Warning: annotation update failed, downloads >32MB will use streaming fallback"
-          fi

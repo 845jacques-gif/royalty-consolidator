@@ -14,6 +14,7 @@ log = logging.getLogger('royalty')
 _client = None
 _bucket = None
 _bucket_name = ''
+_signing_credentials = None  # SA credentials for URL signing (loaded from GCS_SIGNING_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +23,7 @@ _bucket_name = ''
 
 def init_gcs() -> bool:
     """Initialise GCS client and bucket. Returns True on success."""
-    global _client, _bucket, _bucket_name
+    global _client, _bucket, _bucket_name, _signing_credentials
 
     bucket_name = os.getenv('GCS_BUCKET', '')
     if not bucket_name:
@@ -44,6 +45,21 @@ def init_gcs() -> bool:
         _bucket.reload()
         _bucket_name = bucket_name
         log.info("GCS initialised: bucket=%s", bucket_name)
+
+        # Load signing credentials from GCS_SIGNING_KEY env var (SA JSON key)
+        signing_key = os.getenv('GCS_SIGNING_KEY', '')
+        if signing_key:
+            try:
+                import json
+                from google.oauth2 import service_account
+                key_info = json.loads(signing_key)
+                _signing_credentials = service_account.Credentials.from_service_account_info(key_info)
+                log.info("GCS signing credentials loaded (SA: %s)", key_info.get('client_email', '?'))
+            except Exception as e:
+                log.warning("Failed to load GCS signing key: %s", e)
+        else:
+            log.info("GCS_SIGNING_KEY not set — signed URL generation will use IAM fallback")
+
         return True
     except Exception as e:
         log.warning("GCS unavailable: %s", e)
@@ -263,23 +279,37 @@ def download_exports_to_dir(deal_slug: str, local_dir: str) -> dict:
 
 def generate_download_url(gcs_path: str, expiration_minutes: int = 60,
                           download_filename: str = '') -> str:
-    """Generate a download URL. Tries signed URL (IAM signBlob), falls back to public URL."""
+    """Generate a download URL. Tries SA key signing, IAM signBlob, then public URL."""
     if _bucket is None:
         raise RuntimeError("GCS not initialised")
 
+    import datetime
     blob = _bucket.blob(gcs_path)
+    disposition = f'attachment; filename="{download_filename}"' if download_filename else None
 
-    # Strategy 1: Signed URL via IAM signBlob (needs serviceAccountTokenCreator role)
+    # Strategy 1: Sign with SA private key from GCS_SIGNING_KEY (most reliable)
+    if _signing_credentials is not None:
+        try:
+            url = blob.generate_signed_url(
+                version='v4',
+                expiration=datetime.timedelta(minutes=expiration_minutes),
+                method='GET',
+                credentials=_signing_credentials,
+                response_disposition=disposition,
+            )
+            log.info("Generated signed URL (SA key) for %s", gcs_path)
+            return url
+        except Exception as e:
+            log.warning("SA key signed URL failed for %s: %s", gcs_path, e)
+
+    # Strategy 2: Sign via IAM signBlob (needs serviceAccountTokenCreator role)
     try:
-        import datetime
         from google.auth import default
         from google.auth.transport import requests as auth_requests
 
         credentials, _ = default()
         auth_request = auth_requests.Request()
         credentials.refresh(auth_request)
-
-        disposition = f'attachment; filename="{download_filename}"' if download_filename else None
 
         url = blob.generate_signed_url(
             version='v4',
@@ -289,12 +319,12 @@ def generate_download_url(gcs_path: str, expiration_minutes: int = 60,
             access_token=credentials.token,
             response_disposition=disposition,
         )
-        log.info("Generated signed URL for %s", gcs_path)
+        log.info("Generated signed URL (IAM) for %s", gcs_path)
         return url
     except Exception as e:
-        log.warning("Signed URL failed for %s: %s — trying public URL", gcs_path, e)
+        log.warning("IAM signed URL failed for %s: %s", gcs_path, e)
 
-    # Strategy 2: Make blob temporarily public and return public URL
+    # Strategy 3: Make blob temporarily public
     try:
         blob.make_public()
         url = blob.public_url
