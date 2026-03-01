@@ -261,24 +261,34 @@ def download_exports_to_dir(deal_slug: str, local_dir: str) -> dict:
     return result
 
 
-def stream_blob(gcs_path: str):
-    """Return a generator that streams a GCS blob in 2MB chunks + its size."""
+def generate_download_url(gcs_path: str, expiration_minutes: int = 60,
+                          download_filename: str = '') -> str:
+    """Generate a signed URL for direct download, works on Cloud Run (IAM signBlob)."""
     if _bucket is None:
         raise RuntimeError("GCS not initialised")
 
+    import datetime
+    from google.auth import default
+    from google.auth.transport import requests as auth_requests
+
     blob = _bucket.blob(gcs_path)
-    blob.reload()  # get metadata (size)
-    size = blob.size or 0
 
-    def _chunks():
-        with blob.open('rb') as f:
-            while True:
-                chunk = f.read(2 * 1024 * 1024)  # 2MB
-                if not chunk:
-                    break
-                yield chunk
+    # On Cloud Run, use IAM signBlob API (no private key needed)
+    credentials, _ = default()
+    auth_request = auth_requests.Request()
+    credentials.refresh(auth_request)
 
-    return _chunks(), size
+    disposition = f'attachment; filename="{download_filename}"' if download_filename else None
+
+    url = blob.generate_signed_url(
+        version='v4',
+        expiration=datetime.timedelta(minutes=expiration_minutes),
+        method='GET',
+        service_account_email=credentials.service_account_email,
+        access_token=credentials.token,
+        response_disposition=disposition,
+    )
+    return url
 
 
 def get_export_gcs_path(deal_slug: str, filename: str, per_payor: bool = False) -> str:

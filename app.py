@@ -452,21 +452,11 @@ def load_deal(slug):
         try:
             deal_name, analytics = db.load_deal_from_db(slug)
             log.info("Loaded deal '%s' from database", slug)
-            # Download exports from GCS to temp dir so download routes work
+            # Don't download large exports — download routes use GCS signed URLs directly.
+            # Just record that the paths exist in GCS for the download route to find.
             xlsx_path = None
             csv_path = None
             per_payor_paths = {}
-            if storage.is_available():
-                try:
-                    tmp_dir = os.path.join(tempfile.gettempdir(), f'rc_exports_{slug}')
-                    exports = storage.download_exports_to_dir(slug, tmp_dir)
-                    xlsx_path = exports.get('xlsx')
-                    csv_path = exports.get('csv')
-                    per_payor_paths = exports.get('per_payor', {})
-                    log.info("Downloaded GCS exports for '%s': xlsx=%s csv=%s pp=%d",
-                             slug, bool(xlsx_path), bool(csv_path), len(per_payor_paths))
-                except Exception as e:
-                    log.warning("GCS export download failed for %s: %s", slug, e)
             return deal_name, {}, analytics, xlsx_path, csv_path, per_payor_paths
         except FileNotFoundError:
             db_error = 'not found in DB'
@@ -8868,30 +8858,21 @@ def refresh():
 
 
 def _try_gcs_download(local_path, gcs_fallback_path, download_name):
-    """Serve a file: small files locally, large files streamed from GCS."""
-    from flask import Response
-
+    """Serve a file: small files locally, large files via GCS signed URL redirect."""
     # If local file exists and is under 30MB, serve directly
     if local_path and os.path.exists(local_path):
         size = os.path.getsize(local_path)
         if size < 30 * 1024 * 1024:
             return send_file(local_path, as_attachment=True, download_name=download_name)
 
-    # For large files or missing local files, stream from GCS
+    # For large files or missing local files, redirect to GCS signed URL
     if storage.is_available() and gcs_fallback_path:
         try:
-            if storage.blob_exists(gcs_fallback_path):
-                chunks, size = storage.stream_blob(gcs_fallback_path)
-                content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' \
-                    if download_name.endswith('.xlsx') else 'application/octet-stream'
-                headers = {
-                    'Content-Disposition': f'attachment; filename="{download_name}"',
-                }
-                if size:
-                    headers['Content-Length'] = str(size)
-                return Response(chunks, mimetype=content_type, headers=headers)
+            url = storage.generate_download_url(gcs_fallback_path, download_filename=download_name)
+            log.info("Redirecting download to GCS signed URL for %s", gcs_fallback_path)
+            return redirect(url)
         except Exception as e:
-            log.warning("GCS stream failed for %s: %s", gcs_fallback_path, e)
+            log.warning("GCS download URL failed for %s: %s", gcs_fallback_path, e)
 
     # Last resort: try serving locally regardless of size
     if local_path and os.path.exists(local_path):
