@@ -8953,14 +8953,24 @@ def download_payor(code):
             # Exact filename known
             gcs_path = storage.get_export_gcs_path(slug, fname, per_payor=True)
         else:
-            # Instance recycled — search GCS for any per-payor xlsx matching this code
+            # Instance recycled — search GCS for per-payor xlsx matching this code
             try:
                 exports = storage.list_deal_exports(slug)
+                code_lower = code.lower()
                 for ep in exports:
                     if '/per_payor/' in ep and ep.endswith('.xlsx'):
-                        gcs_path = ep
-                        fname = os.path.basename(ep)
-                        break
+                        ep_name = os.path.basename(ep).lower()
+                        if ep_name.startswith(code_lower + '_') or ep_name.startswith(code_lower + '.'):
+                            gcs_path = ep
+                            fname = os.path.basename(ep)
+                            break
+                # If no exact match, try any per-payor file containing the code
+                if not gcs_path:
+                    for ep in exports:
+                        if '/per_payor/' in ep and ep.endswith('.xlsx') and code_lower in os.path.basename(ep).lower():
+                            gcs_path = ep
+                            fname = os.path.basename(ep)
+                            break
             except Exception as e:
                 log.warning("GCS per-payor search failed for %s/%s: %s", slug, code, e)
 
