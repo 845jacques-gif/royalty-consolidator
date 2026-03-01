@@ -6860,10 +6860,10 @@ def index():
         deal_name_copy = _cached_deal_name
         processing_copy = dict(_processing_status)
 
-    # Auto-load from DB if in-memory cache is empty but a re-run just completed
+    # Auto-load from DB if in-memory cache is empty
     # (Cloud Run may recycle the instance between background completion and page refresh)
     if not analytics_copy and not processing_copy.get('running'):
-        _auto_slug = processing_copy.get('_deal_slug')
+        _auto_slug = processing_copy.get('_deal_slug') or session.get('deal_slug', '')
         if _auto_slug and db.is_available():
             log.info("Auto-loading deal '%s' from DB (instance cache empty after re-run)", _auto_slug)
             try:
@@ -8900,9 +8900,24 @@ def _try_gcs_download(local_path, gcs_fallback_path, download_name):
     return None
 
 
+def _get_deal_slug():
+    """Get the current deal slug from in-memory state, session, or processing status."""
+    if _cached_deal_name:
+        return _make_slug(_cached_deal_name)
+    # Try Flask session (persists across instance recycles via cookie)
+    try:
+        s = session.get('deal_slug', '')
+        if s:
+            return s
+    except RuntimeError:
+        pass  # outside request context
+    with _state_lock:
+        return _processing_status.get('_deal_slug', '')
+
+
 @app.route('/download/<filetype>')
 def download(filetype):
-    slug = _make_slug(_cached_deal_name) if _cached_deal_name else ''
+    slug = _get_deal_slug()
     if filetype == 'consolidated':
         path = app.config.get('CONSOLIDATED_PATH')
         gcs_path = storage.get_export_gcs_path(slug, 'Consolidated_All_Payors.xlsx') if slug else ''
@@ -8929,11 +8944,29 @@ def download_payor(code):
     """Download a single payor's consolidated export."""
     per_payor = app.config.get('PER_PAYOR_PATHS', {})
     path = per_payor.get(code)
-    fname = os.path.basename(path) if path else f'{code}_consolidated.xlsx'
+    fname = os.path.basename(path) if path else ''
 
-    # Try GCS signed URL for large per-payor exports
-    slug = _make_slug(_cached_deal_name) if _cached_deal_name else ''
-    gcs_path = storage.get_export_gcs_path(slug, fname, per_payor=True) if slug else ''
+    slug = _get_deal_slug()
+    gcs_path = ''
+
+    if slug and storage.is_available():
+        if fname:
+            # Exact filename known
+            gcs_path = storage.get_export_gcs_path(slug, fname, per_payor=True)
+        else:
+            # Instance recycled — search GCS for any per-payor xlsx matching this code
+            try:
+                exports = storage.list_deal_exports(slug)
+                for ep in exports:
+                    if '/per_payor/' in ep and ep.endswith('.xlsx'):
+                        gcs_path = ep
+                        fname = os.path.basename(ep)
+                        break
+            except Exception as e:
+                log.warning("GCS per-payor search failed for %s/%s: %s", slug, code, e)
+
+    if not fname:
+        fname = f'{code}_consolidated.xlsx'
 
     result = _try_gcs_download(path, gcs_path, fname)
     if result:
@@ -9221,6 +9254,7 @@ def load_deal_route(slug):
         app.config['CONSOLIDATED_PATH'] = xlsx_path
         app.config['CONSOLIDATED_CSV_PATH'] = csv_path
         app.config['PER_PAYOR_PATHS'] = per_payor_paths
+        session['deal_slug'] = slug
         flash(f'Loaded deal "{deal_name}".', 'success')
     except Exception as e:
         log.error("load_deal_route failed for %s: %s", slug, e, exc_info=True)
@@ -9562,6 +9596,8 @@ def rerun_quick_route(slug):
                 return redirect(url_for('deals_page'))
             _cached_deal_name = deal_name
             _processing_status = {'running': True, 'progress': 'Starting quick re-run...', 'done': False, 'error': None}
+
+        session['deal_slug'] = slug
 
         # Snapshot analytics before re-run for delta report
         deal_dir = os.path.join(DEALS_DIR, slug)
