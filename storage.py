@@ -46,19 +46,20 @@ def init_gcs() -> bool:
         _bucket_name = bucket_name
         log.info("GCS initialised: bucket=%s", bucket_name)
 
-        # Load signing credentials from GCS_SIGNING_KEY env var (SA JSON key)
-        signing_key = os.getenv('GCS_SIGNING_KEY', '')
-        if signing_key:
+        # Load signing credentials from GCS_SIGNING_KEY_B64 env var (base64-encoded SA JSON key)
+        signing_key_b64 = os.getenv('GCS_SIGNING_KEY_B64', '')
+        if signing_key_b64:
             try:
-                import json
+                import base64, json
                 from google.oauth2 import service_account
-                key_info = json.loads(signing_key)
+                key_json = base64.b64decode(signing_key_b64).decode('utf-8')
+                key_info = json.loads(key_json)
                 _signing_credentials = service_account.Credentials.from_service_account_info(key_info)
                 log.info("GCS signing credentials loaded (SA: %s)", key_info.get('client_email', '?'))
             except Exception as e:
                 log.warning("Failed to load GCS signing key: %s", e)
         else:
-            log.info("GCS_SIGNING_KEY not set — signed URL generation will use IAM fallback")
+            log.info("GCS_SIGNING_KEY_B64 not set — signed URL generation will use IAM fallback")
 
         return True
     except Exception as e:

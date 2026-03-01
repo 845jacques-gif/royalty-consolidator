@@ -44,31 +44,12 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Store GCS signing key in Secret Manager
-        run: |
-          # Create or update the signing key secret so Cloud Run can sign GCS URLs
-          if gcloud secrets describe gcs-signing-key --project=ma-royalty-consolidator >/dev/null 2>&1; then
-            echo '${{ secrets.GCP_SA_KEY }}' | gcloud secrets versions add gcs-signing-key \
-              --data-file=- --project=ma-royalty-consolidator 2>/dev/null && \
-              echo "Updated gcs-signing-key secret" || echo "Secret update skipped (may already be current)"
-          else
-            echo '${{ secrets.GCP_SA_KEY }}' | gcloud secrets create gcs-signing-key \
-              --data-file=- --project=ma-royalty-consolidator 2>/dev/null && \
-              echo "Created gcs-signing-key secret" || echo "Warning: could not create secret (permission denied)"
-          fi
-          # Grant the compute SA access to read the secret
-          SA_EMAIL=$(gcloud run services describe royalty-consolidator \
-            --region=us-west1 --project=ma-royalty-consolidator \
-            --format="value(spec.template.spec.serviceAccountName)" 2>/dev/null || echo "")
-          if [ -n "$SA_EMAIL" ]; then
-            gcloud secrets add-iam-policy-binding gcs-signing-key \
-              --member="serviceAccount:$SA_EMAIL" \
-              --role="roles/secretmanager.secretAccessor" \
-              --project=ma-royalty-consolidator 2>/dev/null || true
-          fi
-
       - name: Deploy to Cloud Run
+        env:
+          GCP_SA_KEY_RAW: ${{ secrets.GCP_SA_KEY }}
         run: |
+          # Encode SA key as base64 for safe env var transport
+          GCS_KEY_B64=$(echo "$GCP_SA_KEY_RAW" | base64 -w0)
           gcloud run deploy royalty-consolidator \
             --region=us-west1 \
             --project=ma-royalty-consolidator \
@@ -79,8 +60,8 @@ jobs:
             --timeout=900 \
             --concurrency=80 \
             --execution-environment=gen2 \
-            --set-env-vars=DB_HOST=/cloudsql/ma-royalty-consolidator:us-central1:royaltyconsolidator,DB_PORT=5432,DB_NAME=royalty_consolidator,DB_USER=postgres,GCS_BUCKET=royalty_consolidator_uploaded_files \
-            --set-secrets=DB_PASSWORD=postgres-db-password:latest,GCS_SIGNING_KEY=gcs-signing-key:latest \
+            --set-env-vars=DB_HOST=/cloudsql/ma-royalty-consolidator:us-central1:royaltyconsolidator,DB_PORT=5432,DB_NAME=royalty_consolidator,DB_USER=postgres,GCS_BUCKET=royalty_consolidator_uploaded_files,GCS_SIGNING_KEY_B64=$GCS_KEY_B64 \
+            --set-secrets=DB_PASSWORD=postgres-db-password:latest \
             --add-cloudsql-instances=ma-royalty-consolidator:us-central1:royaltyconsolidator \
             --no-cpu-throttling \
             --labels=managed-by=github-actions,commit-sha=${{ github.sha }}
