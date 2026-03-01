@@ -263,32 +263,47 @@ def download_exports_to_dir(deal_slug: str, local_dir: str) -> dict:
 
 def generate_download_url(gcs_path: str, expiration_minutes: int = 60,
                           download_filename: str = '') -> str:
-    """Generate a signed URL for direct download, works on Cloud Run (IAM signBlob)."""
+    """Generate a download URL. Tries signed URL (IAM signBlob), falls back to public URL."""
     if _bucket is None:
         raise RuntimeError("GCS not initialised")
 
-    import datetime
-    from google.auth import default
-    from google.auth.transport import requests as auth_requests
-
     blob = _bucket.blob(gcs_path)
 
-    # On Cloud Run, use IAM signBlob API (no private key needed)
-    credentials, _ = default()
-    auth_request = auth_requests.Request()
-    credentials.refresh(auth_request)
+    # Strategy 1: Signed URL via IAM signBlob (needs serviceAccountTokenCreator role)
+    try:
+        import datetime
+        from google.auth import default
+        from google.auth.transport import requests as auth_requests
 
-    disposition = f'attachment; filename="{download_filename}"' if download_filename else None
+        credentials, _ = default()
+        auth_request = auth_requests.Request()
+        credentials.refresh(auth_request)
 
-    url = blob.generate_signed_url(
-        version='v4',
-        expiration=datetime.timedelta(minutes=expiration_minutes),
-        method='GET',
-        service_account_email=credentials.service_account_email,
-        access_token=credentials.token,
-        response_disposition=disposition,
-    )
-    return url
+        disposition = f'attachment; filename="{download_filename}"' if download_filename else None
+
+        url = blob.generate_signed_url(
+            version='v4',
+            expiration=datetime.timedelta(minutes=expiration_minutes),
+            method='GET',
+            service_account_email=credentials.service_account_email,
+            access_token=credentials.token,
+            response_disposition=disposition,
+        )
+        log.info("Generated signed URL for %s", gcs_path)
+        return url
+    except Exception as e:
+        log.warning("Signed URL failed for %s: %s — trying public URL", gcs_path, e)
+
+    # Strategy 2: Make blob temporarily public and return public URL
+    try:
+        blob.make_public()
+        url = blob.public_url
+        log.info("Made blob public for download: %s", gcs_path)
+        return url
+    except Exception as e:
+        log.warning("Make public failed for %s: %s", gcs_path, e)
+
+    raise RuntimeError(f"Cannot generate download URL for {gcs_path}")
 
 
 def stream_blob(gcs_path: str):

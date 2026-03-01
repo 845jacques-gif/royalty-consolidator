@@ -62,29 +62,23 @@ jobs:
             --no-cpu-throttling \
             --labels=managed-by=github-actions,commit-sha=${{ github.sha }}
 
-      - name: Set max request/response body size (v2 REST API)
+      - name: Set max response body size (Knative v1 API)
         run: |
           TOKEN=$(gcloud auth print-access-token)
-          # Use Cloud Run v2 REST API directly — gcloud --update-annotations silently fails for these
-          curl -s -X PATCH \
+          # Use Knative v1 API with merge-patch to set system annotations
+          echo "Setting maxResponseBodySize and maxRequestBodySize annotations..."
+          RESULT=$(curl -s -w "\n%{http_code}" -X PATCH \
             -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://run.googleapis.com/v2/projects/ma-royalty-consolidator/locations/us-west1/services/royalty-consolidator?updateMask=annotations" \
-            -d '{"annotations":{"run.googleapis.com/maxResponseBodySize":"2Gi","run.googleapis.com/maxRequestBodySize":"2Gi"}}'
-          echo ""
-          echo "Verifying annotations..."
-          curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://run.googleapis.com/v2/projects/ma-royalty-consolidator/locations/us-west1/services/royalty-consolidator" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('annotations',{}); print('maxResponseBodySize:', a.get('run.googleapis.com/maxResponseBodySize','NOT SET')); print('maxRequestBodySize:', a.get('run.googleapis.com/maxRequestBodySize','NOT SET'))"
-
-      - name: Grant signBlob permission for GCS signed URLs
-        run: |
-          SA_EMAIL=$(gcloud run services describe royalty-consolidator \
-            --region=us-west1 --project=ma-royalty-consolidator \
-            --format="value(spec.template.spec.serviceAccountName)" 2>/dev/null || echo "")
-          if [ -n "$SA_EMAIL" ]; then
-            gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
-              --member="serviceAccount:$SA_EMAIL" \
-              --role="roles/iam.serviceAccountTokenCreator" \
-              --project=ma-royalty-consolidator || true
+            -H "Content-Type: application/merge-patch+json" \
+            "https://us-west1-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/ma-royalty-consolidator/services/royalty-consolidator" \
+            -d '{"metadata":{"annotations":{"run.googleapis.com/maxResponseBodySize":"2Gi","run.googleapis.com/maxRequestBodySize":"2Gi"}}}')
+          HTTP_CODE=$(echo "$RESULT" | tail -1)
+          BODY=$(echo "$RESULT" | head -n -1)
+          echo "HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Verifying..."
+            echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('metadata',{}).get('annotations',{}); print('maxResponseBodySize:', a.get('run.googleapis.com/maxResponseBodySize','NOT SET')); print('maxRequestBodySize:', a.get('run.googleapis.com/maxRequestBodySize','NOT SET'))" || true
+          else
+            echo "Response: $BODY"
+            echo "Warning: annotation update failed, downloads >32MB will use streaming fallback"
           fi
