@@ -62,9 +62,9 @@ jobs:
             --no-cpu-throttling \
             --labels=managed-by=github-actions,commit-sha=${{ github.sha }}
 
-      - name: Set max request body size
+      - name: Set max request/response body size
         run: |
           gcloud run services update royalty-consolidator \
             --region=us-west1 \
             --project=ma-royalty-consolidator \
-            --update-annotations=run.googleapis.com/maxRequestBodySize=2Gi
+            --update-annotations=run.googleapis.com/maxRequestBodySize=2Gi,run.googleapis.com/maxResponseBodySize=2Gi

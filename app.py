@@ -8868,21 +8868,30 @@ def refresh():
 
 
 def _try_gcs_download(local_path, gcs_fallback_path, download_name):
-    """Serve a file locally if small enough, otherwise redirect to GCS signed URL."""
+    """Serve a file: small files locally, large files streamed from GCS."""
+    from flask import Response
+
     # If local file exists and is under 30MB, serve directly
     if local_path and os.path.exists(local_path):
         size = os.path.getsize(local_path)
         if size < 30 * 1024 * 1024:
             return send_file(local_path, as_attachment=True, download_name=download_name)
 
-    # For large files or missing local files, use GCS signed URL
+    # For large files or missing local files, stream from GCS
     if storage.is_available() and gcs_fallback_path:
         try:
             if storage.blob_exists(gcs_fallback_path):
-                url = storage.generate_signed_url(gcs_fallback_path, download_filename=download_name)
-                return redirect(url)
+                chunks, size = storage.stream_blob(gcs_fallback_path)
+                content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' \
+                    if download_name.endswith('.xlsx') else 'application/octet-stream'
+                headers = {
+                    'Content-Disposition': f'attachment; filename="{download_name}"',
+                }
+                if size:
+                    headers['Content-Length'] = str(size)
+                return Response(chunks, mimetype=content_type, headers=headers)
         except Exception as e:
-            log.warning("GCS signed URL failed for %s: %s", gcs_fallback_path, e)
+            log.warning("GCS stream failed for %s: %s", gcs_fallback_path, e)
 
     # Last resort: try serving locally regardless of size
     if local_path and os.path.exists(local_path):

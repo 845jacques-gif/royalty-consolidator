@@ -261,26 +261,24 @@ def download_exports_to_dir(deal_slug: str, local_dir: str) -> dict:
     return result
 
 
-def generate_signed_url(gcs_path: str, expiration_minutes: int = 60,
-                        download_filename: str = '') -> str:
-    """Generate a signed URL for direct GCS download (bypasses Cloud Run response limits)."""
+def stream_blob(gcs_path: str):
+    """Return a generator that streams a GCS blob in 2MB chunks + its size."""
     if _bucket is None:
         raise RuntimeError("GCS not initialised")
 
-    import datetime
     blob = _bucket.blob(gcs_path)
+    blob.reload()  # get metadata (size)
+    size = blob.size or 0
 
-    disposition = ''
-    if download_filename:
-        disposition = f'attachment; filename="{download_filename}"'
+    def _chunks():
+        with blob.open('rb') as f:
+            while True:
+                chunk = f.read(2 * 1024 * 1024)  # 2MB
+                if not chunk:
+                    break
+                yield chunk
 
-    url = blob.generate_signed_url(
-        version='v4',
-        expiration=datetime.timedelta(minutes=expiration_minutes),
-        method='GET',
-        response_disposition=disposition or None,
-    )
-    return url
+    return _chunks(), size
 
 
 def get_export_gcs_path(deal_slug: str, filename: str, per_payor: bool = False) -> str:
